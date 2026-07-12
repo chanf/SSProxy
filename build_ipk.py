@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-81"
+PKG_VERSION = "1.0.0-93"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -74,6 +74,8 @@ USE_PROCD=1
 
 enable_tproxy() {
 	local tproxy_port="$1"
+	local acl_mode="$2"
+	local acl_ips="$3"
 	
 	# 1. Add routing table 100
 	ip rule add fwmark 1 table 100 2>/dev/null
@@ -83,9 +85,14 @@ enable_tproxy() {
 	nft create table inet mihomo 2>/dev/null
 	nft add chain inet mihomo prerouting { type filter hook prerouting priority mangle \\; }
 	nft add rule inet mihomo prerouting ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } return
+	
+	if [ "$acl_mode" = "whitelist" ] && [ -n "$acl_ips" ]; then
+		nft add rule inet mihomo prerouting ip saddr != { "$acl_ips" } return
+	fi
+	
 	nft add rule inet mihomo prerouting meta l4proto { tcp, udp } tproxy to :"$tproxy_port" meta mark set 1
 	
-	logger -t mihomo "TProxy redirect rules enabled on port $tproxy_port"
+	logger -t mihomo "TProxy redirect rules enabled on port $tproxy_port (acl_mode: $acl_mode)"
 }
 
 disable_tproxy() {
@@ -125,7 +132,7 @@ start_service() {
 	config_load mihomo
 	/usr/share/mihomo/helper.sh restore_subscription_url
 	
-	local core_path config_path work_dir dns_port dns_hijack tproxy_port tun_enabled
+	local core_path config_path work_dir dns_port dns_hijack tproxy_port tun_enabled acl_mode
 	
 	config_get core_path config core_path "/usr/bin/mihomo"
 	config_get config_path config config_path "/etc/mihomo/config.yaml"
@@ -183,7 +190,15 @@ EOF
 	
 	# Apply network redirections
 	if [ "$tun_enabled" -ne 1 ]; then
-		enable_tproxy "$tproxy_port"
+		local acl_ips=""
+		config_get acl_mode config acl_mode "all"
+		
+		append_acl_ip() {
+			[ -n "$1" ] && acl_ips="${acl_ips:+$acl_ips,}$1"
+		}
+		config_list_foreach config acl_ips append_acl_ip
+		
+		enable_tproxy "$tproxy_port" "$acl_mode" "$acl_ips"
 	fi
 	
 	if [ "$dns_hijack" -eq 1 ]; then
@@ -193,7 +208,7 @@ EOF
 	# Background collector: persist connections to /tmp/mihomo_access.log for the
 	# access-log history view. No-ops when the core controller is unreachable.
 	procd_open_instance
-	procd_set_param command /bin/sh -c "/usr/share/mihomo/helper.sh collect_connections; while true; do /usr/share/mihomo/helper.sh collect_connections; sleep 15; done"
+	procd_set_param command /usr/share/mihomo/helper.sh collect_loop
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_set_param respawn
@@ -203,7 +218,7 @@ EOF
 	# every 10 minutes; the actual download frequency is gated by auto_update_now
 	# according to the configured interval.
 	procd_open_instance
-	procd_set_param command /bin/sh -c "/usr/share/mihomo/helper.sh auto_update_loop"
+	procd_set_param command /usr/share/mihomo/helper.sh auto_update_loop
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_set_param respawn
@@ -240,6 +255,38 @@ service_triggers() {
 
     # Backend helper script to auto-detect architecture, download core, parse subscription, and merge config
     "root/usr/share/mihomo/helper.sh": """#!/bin/sh
+
+API_PORT="9090"
+API_SECRET=""
+get_api_config() {
+	local config_file="/tmp/mihomo_run.yaml"
+	[ ! -f "$config_file" ] && config_file=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
+	
+	API_PORT="9090"
+	API_SECRET=""
+	if [ -f "$config_file" ]; then
+		local controller
+		controller=$(grep '^external-controller:' "$config_file" | sed 's/external-controller://' | tr -d " '\\\"\\r" | head -n1)
+		if [ -n "$controller" ]; then
+			API_PORT=${controller##*:}
+		fi
+		[ -z "$API_PORT" ] && API_PORT="9090"
+		API_SECRET=$(grep '^secret:' "$config_file" | sed 's/secret://' | tr -d " '\\\"\\r" | head -n1)
+	fi
+}
+get_api_config
+
+mihomo_curl() {
+	local auth_header=""
+	if [ -n "$API_SECRET" ]; then
+		auth_header="Authorization: Bearer $API_SECRET"
+	fi
+	if [ -n "$auth_header" ]; then
+		curl -H "$auth_header" "$@"
+	else
+		curl "$@"
+	fi
+}
 
 cpu_amd64_v3() {
 	# Go GOAMD64=v3 需要 AVX2 + BMI1 + BMI2 + FMA + F16C 等指令集；
@@ -602,7 +649,7 @@ EOF
 }
 
 get_proxy_groups() {
-	if ! curl -s -m 2 "http://127.0.0.1:9090/proxies"; then
+	if ! mihomo_curl -s -m 2 "http://127.0.0.1:${API_PORT}/proxies"; then
 		echo "{\\"proxies\\":{}}"
 	fi
 }
@@ -614,10 +661,24 @@ select_node() {
 		echo "ERROR: Group and node name must be specified" >&2
 		return 1
 	fi
-	curl -s -X PUT \\
+	local group_enc node_esc
+	group_enc=$(urlencode "$group")
+	node_esc=$(printf '%s' "$node" | sed 's/"/\\\\"/g')
+	local resp
+	resp=$(mihomo_curl -sS -X PUT \\
 		-H "Content-Type: application/json" \\
-		-d "{\\"name\\":\\"${node}\\"}" \\
-		"http://127.0.0.1:9090/proxies/${group}"
+		-d "{\\"name\\":\\"${node_esc}\\"}" \\
+		"http://127.0.0.1:${API_PORT}/proxies/${group_enc}" 2>&1)
+	local code=$?
+	if [ $code -ne 0 ]; then
+		echo "Network error: $resp" >&2
+		return $code
+	fi
+	if [ -n "$resp" ]; then
+		echo "$resp" >&2
+		return 1
+	fi
+	return 0
 }
 
 get_proxies() {
@@ -702,7 +763,7 @@ resolve_host() {
 	local leases="/tmp/dhcp.leases"
 	[ -z "$ip" ] && return 0
 	[ -f "$leases" ] || return 0
-	ask -v ip="$ip" '$3==ip { print $4; exit }' "$leases"
+	awk -v ip="$ip" '$3==ip { print $4; exit }' "$leases"
 }
 
 flatten_connections() {
@@ -718,7 +779,7 @@ flatten_connections() {
 	up=$(echo "$raw" | jsonfilter -e '$.connections[@].upload' 2>/dev/null)
 	down=$(echo "$raw" | jsonfilter -e '$.connections[@].download' 2>/dev/null)
 	start=$(echo "$raw" | jsonfilter -e '$.connections[@].start' 2>/dev/null)
-	echo "$ids" | nl -ba | while read -r n id; do
+	echo "$ids" | awk '{print NR, $0}' | while read -r n id; do
 		[ -z "$id" ] && continue
 		local ip host d pol r u dn st
 		ip=$(echo "$ips" | sed -n "${n}p")
@@ -738,9 +799,15 @@ flatten_connections() {
 
 get_connections() {
 	local raw
-	raw=$(curl -s --connect-timeout 2 http://127.0.0.1:9090/connections 2>/dev/null)
+	raw=$(mihomo_curl -s --connect-timeout 2 "http://127.0.0.1:${API_PORT}/connections" 2>/dev/null)
 	if [ -z "$raw" ]; then
-		echo "{\\"error\\":\\"no_core\\", \\"msg\\":\\"无法连接 Mihomo 控制器 (9090)，请确认核心已启动。\\"}"
+		echo "{\\"error\\":\\"no_core\\", \\"msg\\":\\"无法连接 Mihomo 控制器 (${API_PORT})，请确认核心已启动。\\"}"
+		return 0
+	fi
+	local err_msg
+	err_msg=$(echo "$raw" | jsonfilter -e '$.message' 2>/dev/null)
+	if [ -n "$err_msg" ]; then
+		echo "{\\"error\\":\\"api_error\\", \\"msg\\":\\"Mihomo 控制器错误：${err_msg}\\"}"
 		return 0
 	fi
 	echo "["
@@ -758,7 +825,7 @@ collect_connections() {
 	local raw logf seenf
 	logf="/tmp/mihomo_access.log"
 	seenf="/tmp/mihomo_access.seen"
-	raw=$(curl -s --connect-timeout 2 http://127.0.0.1:9090/connections 2>/dev/null)
+	raw=$(mihomo_curl -s --connect-timeout 2 "http://127.0.0.1:${API_PORT}/connections" 2>/dev/null)
 	[ -z "$raw" ] && return 0
 	touch "$seenf"
 	flatten_connections "$raw" | while IFS='|' read -r id ip dev host d pol r u dn st; do
@@ -770,6 +837,14 @@ collect_connections() {
 		printf '{"ts":%s,"id":"%s","ip":"%s","device":"%s","domain":"%s","dst":"%s","policy":"%s","rule":"%s","up":%s,"down":%s,"start":"%s"}' "$ts" "$id" "$ip" "$dev" "$host" "$d" "$pol" "$r" "${u:-0}" "${dn:-0}" "$st" >> "$logf"
 	done
 	tail -n 2000 "$seenf" > "$seenf.tmp" && mv "$seenf.tmp" "$seenf"
+}
+
+collect_loop() {
+	sleep 5
+	while true; do
+		collect_connections
+		sleep 15
+	done
 }
 
 # URL-encode a string for use in an HTTP path (POSIX shell, no bashisms).
@@ -810,7 +885,7 @@ resolve_proxy_name() {
 	local norm_want
 	norm_want=$(printf '%s' "$want" | tr -d '\r' | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | tr -d ' ')
 	[ -z "$norm_want" ] && return 0
-	curl -s --connect-timeout 5 --max-time 8 "http://127.0.0.1:9090/proxies" 2>/dev/null \
+	mihomo_curl -s --connect-timeout 5 --max-time 8 "http://127.0.0.1:${API_PORT}/proxies" 2>/dev/null \
 		| grep -o -E '"name"[[:space:]]*:[[:space:]]*"[^"]*"' \
 		| sed -e 's/^"name"[[:space:]]*:[[:space:]]*//' -e 's/^"//' -e 's/"$//' \
 		| while read -r p; do
@@ -839,10 +914,10 @@ test_node_delay() {
 	url_enc=$(urlencode "$test_url")
 	local core_running=no core_proxies=-1
 	if pidof mihomo >/dev/null 2>&1; then core_running=yes; fi
-	core_proxies=$(curl -s --connect-timeout 3 --max-time 5 "http://127.0.0.1:9090/proxies" 2>/dev/null | grep -o -E '"name"[[:space:]]*:' | wc -l | tr -d ' ')
+	core_proxies=$(mihomo_curl -s --connect-timeout 3 --max-time 5 "http://127.0.0.1:${API_PORT}/proxies" 2>/dev/null | grep -o -E '"name"[[:space:]]*:' | wc -l | tr -d ' ')
 	logger -t mihomo "test_node_delay: name='$name' enc='$enc' test_url='$test_url' core_running=$core_running core_proxy_count=$core_proxies"
 	body=$(mktemp)
-	code=$(curl -s -o "$body" -w '%{http_code}' --connect-timeout 5 --max-time $((timeout / 1000 + 5)) "http://127.0.0.1:9090/proxies/${enc}/delay?url=${url_enc}&timeout=${timeout}" 2>/dev/null)
+	code=$(mihomo_curl -s -o "$body" -w '%{http_code}' --connect-timeout 5 --max-time $((timeout / 1000 + 5)) "http://127.0.0.1:${API_PORT}/proxies/${enc}/delay?url=${url_enc}&timeout=${timeout}" 2>/dev/null)
 	if [ -z "$code" ] || [ "$code" = "000" ]; then
 		echo '{"delay":-1,"msg":"controller_unreachable"}'
 		rm -f "$body"
@@ -854,12 +929,12 @@ test_node_delay() {
 		local real=""
 		real=$(resolve_proxy_name "$name")
 		local avail=""
-		avail=$(curl -s --connect-timeout 3 --max-time 5 "http://127.0.0.1:9090/proxies" 2>/dev/null | grep -o -E '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -e 's/^"name"[[:space:]]*:[[:space:]]*//' -e 's/^"//' -e 's/"$//' | head -n 20 | tr '\n' '|')
+		avail=$(mihomo_curl -s --connect-timeout 3 --max-time 5 "http://127.0.0.1:${API_PORT}/proxies" 2>/dev/null | grep -o -E '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -e 's/^"name"[[:space:]]*:[[:space:]]*//' -e 's/^"//' -e 's/"$//' | head -n 20 | tr '\n' '|')
 		logger -t mihomo "test_node_delay: '$name' -> $msg; resolved='$real'; core_has_proxies='$avail'"
 		if [ -n "$real" ] && [ "$real" != "$name" ]; then
 			name="$real"
 			enc=$(urlencode "$name")
-			code=$(curl -s -o "$body" -w '%{http_code}' --connect-timeout 5 --max-time $((timeout / 1000 + 5)) "http://127.0.0.1:9090/proxies/${enc}/delay?url=${url_enc}&timeout=${timeout}" 2>/dev/null)
+			code=$(mihomo_curl -s -o "$body" -w '%{http_code}' --connect-timeout 5 --max-time $((timeout / 1000 + 5)) "http://127.0.0.1:${API_PORT}/proxies/${enc}/delay?url=${url_enc}&timeout=${timeout}" 2>/dev/null)
 		fi
 	fi
 	cat "$body"
@@ -888,7 +963,7 @@ test_all_nodes() {
 		(
 			enc=$(urlencode "$name")
 			url_enc=$(urlencode "$test_url")
-			resp=$(curl -s -m $((timeout / 1000 + 5)) "http://127.0.0.1:9090/proxies/${enc}/delay?url=${url_enc}&timeout=${timeout}" 2>/dev/null)
+			resp=$(mihomo_curl -s -m $((timeout / 1000 + 5)) "http://127.0.0.1:${API_PORT}/proxies/${enc}/delay?url=${url_enc}&timeout=${timeout}" 2>/dev/null)
 			delay=$(printf '%s' "$resp" | grep -o '"delay"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
 			msg=$(printf '%s' "$resp" | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*:"//; s/"$//')
 			if [ -n "$delay" ] && [ "$delay" -ge 0 ] 2>/dev/null; then
@@ -916,7 +991,7 @@ get_history() {
 	[ -f "$logf" ] || { echo "[]"; return 0; }
 	echo "["
 	first=1
-	tail -n "$limit" "$logf" | tac | while read -r line; do
+	tail -n "$limit" "$logf" | awk '{a[i++]=$0} END {for (j=i-1; j>=0; j--) print a[j]}' | while read -r line; do
 		[ -z "$line" ] && continue
 		if [ $first -eq 0 ]; then printf ','; fi
 		first=0
@@ -990,6 +1065,9 @@ case "$1" in
 	save_subscription_url)
 		save_subscription_url "$2"
 		;;
+	restore_subscription_url)
+		restore_subscription_url
+		;;
 	auto_update_now)
 		auto_update_now
 		;;
@@ -1023,6 +1101,9 @@ case "$1" in
 	collect_connections)
 		collect_connections
 		;;
+	collect_loop)
+		collect_loop
+		;;
 	get_history)
 		get_history "$2"
 		;;
@@ -1036,7 +1117,7 @@ case "$1" in
 		del_access_rule "$2"
 		;;
 	*)
-		echo "Usage: $0 {get_arch|check_core|download_core|update_subscription|clear_subscription|save_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|get_history|get_access_rules|add_access_rule|del_access_rule|test_node_delay|test_all_nodes}"
+		echo "Usage: $0 {get_arch|check_core|download_core|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|add_access_rule|del_access_rule|test_node_delay|test_all_nodes}"
 		exit 1
 		;;
 esac
@@ -1073,6 +1154,14 @@ esac
         "action": {
             "type": "view",
             "path": "mihomo/accesslog"
+        }
+    },
+    "admin/services/mihomo/rules": {
+        "title": "规则管理",
+        "order": 4,
+        "action": {
+            "type": "view",
+            "path": "mihomo/rules"
         }
     }
 }
@@ -1139,7 +1228,6 @@ return view.extend({
 			return Promise.all([
 				fs.exec('/usr/share/mihomo/helper.sh', ['get_connections']).catch(function() { return { stdout: '[]' }; }),
 				fs.exec('/usr/share/mihomo/helper.sh', ['get_history', '300']).catch(function() { return { stdout: '[]' }; }),
-				fs.exec('/usr/share/mihomo/helper.sh', ['get_access_rules']).catch(function() { return { stdout: '[]' }; }),
 				fs.exec('/usr/share/mihomo/helper.sh', ['get_proxy_groups']).catch(function() { return { stdout: '{"proxies":{}}' }; })
 			]);
 		});
@@ -1151,8 +1239,7 @@ return view.extend({
 
 		var conn_raw = (results[0] && results[0].stdout) ? results[0].stdout.trim() : '[]';
 		var hist_raw = (results[1] && results[1].stdout) ? results[1].stdout.trim() : '[]';
-		var rules_raw = (results[2] && results[2].stdout) ? results[2].stdout.trim() : '[]';
-		var groups_raw = (results[3] && results[3].stdout) ? results[3].stdout.trim() : '{"proxies":{}}';
+		var groups_raw = (results[2] && results[2].stdout) ? results[2].stdout.trim() : '{"proxies":{}}';
 
 		var connections = [];
 		var conn_error = null;
@@ -1164,9 +1251,6 @@ return view.extend({
 
 		var history = [];
 		try { history = JSON.parse(hist_raw); } catch (e) { history = []; }
-
-		var rules = [];
-		try { rules = JSON.parse(rules_raw); } catch (e) { rules = []; }
 
 		var proxy_groups = {};
 		try { proxy_groups = JSON.parse(groups_raw).proxies || {}; } catch (e) { proxy_groups = {}; }
@@ -1182,8 +1266,7 @@ return view.extend({
 			ui.addNotification(null, E('p', _('正在添加规则：') + esc(domain) + ' -> ' + action), 'info');
 			return fs.exec('/usr/share/mihomo/helper.sh', args).then(function(res) {
 				if (res.code === 0) {
-					ui.addNotification(null, E('p', _('规则已保存（需重启核心后生效）。')), 'info');
-					render_rules();
+					ui.addNotification(null, E('p', _('规则已保存（请前往「规则管理」页面应用并重启核心后生效）。')), 'info');
 				} else {
 					ui.addNotification(null, E('p', _('添加失败：') + (res.stderr || res.stdout || '')), 'danger');
 				}
@@ -1192,11 +1275,244 @@ return view.extend({
 			});
 		}
 
+		function btn(label, cls, fn) {
+			return E('button', { 'class': 'cbi-button ' + cls, 'style': 'margin: 1px 2px; padding: 2px 8px;', 'click': function(ev) {
+				ev.preventDefault(); fn();
+			} }, label);
+		}
+
+		function render_connections() {
+			var box = document.getElementById('conn-body');
+			if (!box) return;
+			if (conn_error) {
+				box.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#ff4757;padding:15px;">' + esc(conn_error) + '</td></tr>';
+				return;
+			}
+			
+			box.innerHTML = '';
+			
+			var filter_el = document.getElementById('conn-filter');
+			var filter_val = filter_el ? filter_el.value.trim().toLowerCase() : '';
+			var filtered = connections;
+			if (filter_val) {
+				filtered = connections.filter(function(c) {
+					var dev = String(c.device || '').toLowerCase();
+					var ip = String(c.ip || '').toLowerCase();
+					var domain = String(c.domain || '').toLowerCase();
+					var dst = String(c.dst || '').toLowerCase();
+					var policy = String(c.policy || '').toLowerCase();
+					var rule = String(c.rule || '').toLowerCase();
+					return dev.indexOf(filter_val) !== -1 ||
+					       ip.indexOf(filter_val) !== -1 ||
+					       domain.indexOf(filter_val) !== -1 ||
+					       dst.indexOf(filter_val) !== -1 ||
+					       policy.indexOf(filter_val) !== -1 ||
+					       rule.indexOf(filter_val) !== -1;
+				});
+			}
+			
+			if (!filtered || !filtered.length) {
+				box.appendChild(E('tr', {}, [
+					E('td', { 'colspan': 5, 'style': 'text-align:center;color:#999;padding:15px;' }, _('暂无数据'))
+				]));
+				return;
+			}
+			
+			for (var i = 0; i < filtered.length; i++) {
+				var c = filtered[i];
+				var domain = c.domain || c.dst || '-';
+				var ip = c.ip || '';
+				var dev = c.device || '';
+				var policy = c.policy || (c.rule ? c.rule : '-');
+				var traffic = fmt_bytes(c.up) + ' / ' + fmt_bytes(c.down);
+				
+				var tr = E('tr', {}, [
+					E('td', {}, dev || ip || '-'),
+					E('td', {}, domain),
+					E('td', {}, policy),
+					E('td', {}, traffic),
+					E('td', {}, [
+						btn(_('代理'), 'cbi-button-action', (function(ip, d) {
+							return function() { add_rule(ip, d, 'proxy', group_names[0]); };
+						})(ip, c.domain || c.dst)),
+						btn(_('直连'), 'cbi-button-neutral', (function(ip, d) {
+							return function() { add_rule(ip, d, 'direct'); };
+						})(ip, c.domain || c.dst)),
+						btn(_('拦截'), 'cbi-button-reset', (function(ip, d) {
+							return function() { add_rule(ip, d, 'block'); };
+						})(ip, c.domain || c.dst))
+					])
+				]);
+				box.appendChild(tr);
+			}
+		}
+
+		function render_history() {
+			var box = document.getElementById('hist-body');
+			if (!box) return;
+			box.innerHTML = '';
+			if (!history.length) {
+				box.appendChild(E('tr', {}, [
+					E('td', { 'colspan': 5, 'style': 'text-align:center;color:#999;padding:15px;' }, _('暂无历史记录（核心运行时每 15 秒采集一次）'))
+				]));
+				return;
+			}
+			for (var i = 0; i < history.length; i++) {
+				var h = history[i];
+				var domain = h.domain || h.dst || '-';
+				var dev = h.device || '';
+				var ip = h.ip || '';
+				var time = fmt_time(h.ts);
+				var policy = h.policy || (h.rule ? h.rule : '-');
+				
+				var tr = E('tr', {}, [
+					E('td', {}, time),
+					E('td', {}, dev || ip || '-'),
+					E('td', {}, domain),
+					E('td', {}, policy),
+					E('td', {}, [
+						btn(_('拦截'), 'cbi-button-reset', (function(ip, d) {
+							return function() { add_rule(ip, d, 'block'); };
+						})(ip, h.domain || h.dst)),
+						btn(_('直连'), 'cbi-button-neutral', (function(ip, d) {
+							return function() { add_rule(ip, d, 'direct'); };
+						})(ip, h.domain || h.dst))
+					])
+				]);
+				box.appendChild(tr);
+			}
+		}
+
+		var view_html = E('div', { 'class': 'cbi-map' }, [
+			E('h2', {}, _('Mihomo 访问日志')),
+			E('p', {}, _('监控局域网设备实时连接与历史访问。您可以点击操作按钮快速针对特定域名创建规则。')),
+
+			// Real-time connections
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, _('实时连接（每 5 秒刷新）')),
+				E('div', { 'style': 'margin-bottom: 12px; display: flex; align-items: center;' }, [
+					E('span', { 'style': 'margin-right: 8px; font-weight: bold; font-size: 13px; color: #444;' }, _('搜索过滤：')),
+					E('input', {
+						'id': 'conn-filter',
+						'type': 'text',
+						'class': 'cbi-input-text',
+						'placeholder': _('输入设备名称、IP、域名或策略进行搜索过滤...'),
+						'style': 'width: 380px; padding: 4px 8px; border-radius: 4px; border: 1px solid #ccc;',
+						'keyup': function() { render_connections(); }
+					})
+				]),
+				E('div', { 'id': 'conn-wrap', 'style': 'max-height: 380px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px;' }, [
+					E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
+						E('thead', {}, [
+							E('tr', {}, [
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('设备')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('域名 / 目标')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('策略')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('流量 (↑/↓)')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('操作'))
+							])
+						]),
+						E('tbody', { 'id': 'conn-body' })
+					])
+				])
+			]),
+
+			// History
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, _('历史访问记录')),
+				E('div', { 'style': 'max-height: 380px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px;' }, [
+					E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
+						E('thead', {}, [
+							E('tr', {}, [
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('时间')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('设备')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('域名 / 目标')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('策略')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('操作'))
+							])
+						]),
+						E('tbody', { 'id': 'hist-body' })
+					])
+				])
+			])
+		]);
+
+		setTimeout(function() {
+			render_connections();
+			render_history();
+		}, 0);
+
+		self._timer = setInterval(function() {
+			fs.exec('/usr/share/mihomo/helper.sh', ['get_connections']).then(function(res) {
+				try {
+					var j = JSON.parse((res.stdout || '[]').trim());
+					if (j && !j.error) { connections = j; conn_error = null; render_connections(); }
+				} catch (e) {}
+			});
+			fs.exec('/usr/share/mihomo/helper.sh', ['get_history', '300']).then(function(res) {
+				try {
+					history = JSON.parse((res.stdout || '[]').trim());
+					render_history();
+				} catch (e) {}
+			});
+		}, 5000);
+
+		return view_html;
+	},
+
+	unload: function() {
+		if (this._timer) { clearInterval(this._timer); this._timer = null; }
+	}
+});
+""",
+
+    "root/www/luci-static/resources/view/mihomo/rules.js": """'use strict';
+'require view';
+'require ui';
+'require fs';
+'require uci';
+
+function esc(s) {
+	return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+		return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+	});
+}
+
+return view.extend({
+	load: function() {
+		return uci.load('mihomo').then(function() {
+			return Promise.all([
+				fs.exec('/usr/share/mihomo/helper.sh', ['get_access_rules']).catch(function() { return { stdout: '[]' }; }),
+				fs.exec('/usr/share/mihomo/helper.sh', ['get_proxy_groups']).catch(function() { return { stdout: '{"proxies":{}}' }; })
+			]);
+		});
+	},
+
+	render: function(results) {
+		var self = this;
+		var rules_raw = (results[0] && results[0].stdout) ? results[0].stdout.trim() : '[]';
+		var groups_raw = (results[1] && results[1].stdout) ? results[1].stdout.trim() : '{"proxies":{}}';
+
+		var rules = [];
+		try { rules = JSON.parse(rules_raw); } catch (e) { rules = []; }
+
+		var proxy_groups = {};
+		try { proxy_groups = JSON.parse(groups_raw).proxies || {}; } catch (e) { proxy_groups = {}; }
+
+		var group_names = [];
+		for (var gk in proxy_groups) {
+			if (proxy_groups[gk] && proxy_groups[gk].type === 'Selector') group_names.push(gk);
+		}
+
 		function del_rule(sid) {
 			return fs.exec('/usr/share/mihomo/helper.sh', ['del_access_rule', sid]).then(function(res) {
 				if (res.code === 0) {
 					ui.addNotification(null, E('p', _('规则已删除（需重启核心后生效）。')), 'info');
-					render_rules();
+					self.load().then(function(new_results) {
+						var nr_raw = (new_results[0] && new_results[0].stdout) ? new_results[0].stdout.trim() : '[]';
+						try { rules = JSON.parse(nr_raw); } catch (e) { rules = []; }
+						render_rules();
+					});
 				} else {
 					ui.addNotification(null, E('p', _('删除失败：') + (res.stderr || res.stdout || '')), 'danger');
 				}
@@ -1211,85 +1527,41 @@ return view.extend({
 			} }, label);
 		}
 
-		function conn_rows_html(list, with_ip) {
-			if (!list || !list.length) return '<tr><td colspan="5" style="text-align:center;color:#999;padding:15px;">' + _('暂无数据') + '</td></tr>';
-			var rows = '';
-			for (var i = 0; i < list.length; i++) {
-				var c = list[i];
-				var domain = esc(c.domain || c.dst || '-');
-				var ip = esc(c.ip || '');
-				var dev = esc(c.device || '');
-				var policy = esc(c.policy || (c.rule ? c.rule : '-'));
-				var traffic = fmt_bytes(c.up) + ' / ' + fmt_bytes(c.down);
-				rows += '<tr>';
-				if (with_ip) rows += '<td>' + (dev || ip || '-') + '</td>';
-				rows += '<td>' + domain + '</td>';
-				rows += '<td>' + policy + '</td>';
-				rows += '<td>' + traffic + '</td>';
-				rows += '<td>' + btn(_('代理'), 'cbi-button-action', function() { add_rule(ip, c.domain || c.dst, 'proxy', group_names[0]); }) + btn(_('直连'), 'cbi-button-neutral', function() { add_rule(ip, c.domain || c.dst, 'direct'); }) + btn(_('拦截'), 'cbi-button-reset', function() { add_rule(ip, c.domain || c.dst, 'block'); }) + '</td>';
-				rows += '</tr>';
-			}
-			return rows;
-		}
-
-		function render_connections() {
-			var box = document.getElementById('conn-body');
-			if (!box) return;
-			if (conn_error) {
-				box.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#ff4757;padding:15px;">' + esc(conn_error) + '</td></tr>';
-				return;
-			}
-			box.innerHTML = conn_rows_html(connections, true);
-		}
-
-		function render_history() {
-			var box = document.getElementById('hist-body');
-			if (!box) return;
-			if (!history.length) {
-				box.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999;padding:15px;">' + _('暂无历史记录（核心运行时每 15 秒采集一次）') + '</td></tr>';
-				return;
-			}
-			var rows = '';
-			for (var i = 0; i < history.length; i++) {
-				var h = history[i];
-				var domain = esc(h.domain || h.dst || '-');
-				var dev = esc(h.device || '');
-				var ip = esc(h.ip || '');
-				var time = fmt_time(h.ts);
-				var policy = esc(h.policy || (h.rule ? h.rule : '-'));
-				rows += '<tr>';
-				rows += '<td>' + time + '</td>';
-				rows += '<td>' + (dev || ip || '-') + '</td>';
-				rows += '<td>' + domain + '</td>';
-				rows += '<td>' + policy + '</td>';
-				rows += '<td>' + btn(_('拦截'), 'cbi-button-reset', function() { add_rule(ip, h.domain || h.dst, 'block'); }) + btn(_('直连'), 'cbi-button-neutral', function() { add_rule(ip, h.domain || h.dst, 'direct'); }) + '</td>';
-				rows += '</tr>';
-			}
-			box.innerHTML = rows;
-		}
-
 		function render_rules() {
 			var box = document.getElementById('rule-body');
 			if (!box) return;
+			box.innerHTML = '';
 			if (!rules.length) {
-				box.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#999;padding:15px;">' + _('暂无自定义规则') + '</td></tr>';
+				box.appendChild(E('tr', {}, [
+					E('td', { 'colspan': 6, 'style': 'text-align:center;color:#999;padding:15px;' }, _('暂无自定义规则'))
+				]));
 				return;
 			}
-			var rows = '';
 			for (var i = 0; i < rules.length; i++) {
 				var r = rules[i];
 				var action_label = r.action === 'block' ? _('拦截') : (r.action === 'direct' ? _('直连') : _('代理'));
 				var action_color = r.action === 'block' ? '#ff4757' : (r.action === 'direct' ? '#1e90ff' : '#2ed573');
-				rows += '<tr>';
-				rows += '<td>' + esc(r.ip || '*') + '</td>';
-				rows += '<td>' + esc(r.domain) + '</td>';
-				rows += '<td><span style="color:' + action_color + ';font-weight:bold;">' + action_label + '</span>' + (r.group ? ' (' + esc(r.group) + ')' : '') + '</td>';
-				rows += '<td>' + esc(r.comment || '') + '</td>';
-				rows += '<td>' + (r.enabled === '0' ? _('已禁用') : _('启用')) + '</td>';
-				rows += '<td>' + (r.sid ? btn(_('删除'), 'cbi-button-reset', (function(sid) { return function() { del_rule(sid); }; })(r.sid)) : '') + '</td>';
-				rows += '</tr>';
+				
+				var action_node = E('span', { 'style': 'color:' + action_color + ';font-weight:bold;' }, action_label);
+				var action_td = E('td', {}, [
+					action_node,
+					r.group ? ' (' + r.group + ')' : ''
+				]);
+
+				var tr = E('tr', {}, [
+					E('td', {}, r.ip || '*'),
+					E('td', {}, r.domain),
+					action_td,
+					E('td', {}, r.comment || ''),
+					E('td', {}, r.enabled === '0' ? _('已禁用') : _('启用')),
+					E('td', {}, [
+						r.sid ? btn(_('删除'), 'cbi-button-reset', (function(sid) {
+							return function() { del_rule(sid); };
+						})(r.sid)) : ''
+					])
+				]);
+				box.appendChild(tr);
 			}
-			box.innerHTML = rows;
 		}
 
 		var group_options = '';
@@ -1342,7 +1614,14 @@ return view.extend({
 						return fs.exec('/usr/share/mihomo/helper.sh', args).then(function(res) {
 							if (res.code === 0) {
 								ui.addNotification(null, E('p', _('规则已保存（需重启核心后生效）。')), 'info');
-								render_rules();
+								document.getElementById('rule_domain').value = '';
+								document.getElementById('rule_ip').value = '';
+								document.getElementById('rule_comment').value = '';
+								self.load().then(function(new_results) {
+									var nr_raw = (new_results[0] && new_results[0].stdout) ? new_results[0].stdout.trim() : '[]';
+									try { rules = JSON.parse(nr_raw); } catch (e) { rules = []; }
+									render_rules();
+								});
 							} else {
 								ui.addNotification(null, E('p', _('添加失败：') + (res.stderr || res.stdout || '')), 'danger');
 							}
@@ -1364,51 +1643,12 @@ return view.extend({
 		]);
 
 		var view_html = E('div', { 'class': 'cbi-map' }, [
-			E('h2', {}, _('Mihomo 访问日志')),
-			E('p', {}, _('监控局域网设备实时连接与历史访问，并按域名配置拦截 / 直连 / 代理规则。规则保存在 UCI，重启核心后生效。')),
+			E('h2', {}, _('Mihomo 访问规则管理')),
+			E('p', {}, _('配置并管理局域网设备的特定域名代理规则。用户规则会被注入到核心配置文件 rules 列表的最顶部以优先匹配。规则保存在 UCI，需重启核心后才能生效。')),
 
-			// Real-time connections
 			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, _('实时连接（每 5 秒刷新）')),
-				E('div', { 'id': 'conn-wrap', 'style': 'max-height: 380px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px;' }, [
-					E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
-						E('thead', {}, [
-							E('tr', {}, [
-								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('设备')),
-								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('域名 / 目标')),
-								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('策略')),
-								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('流量 (↑/↓)')),
-								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('操作'))
-							])
-						]),
-						E('tbody', { 'id': 'conn-body' })
-					])
-				])
-			]),
-
-			// History
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, _('历史访问记录')),
-				E('div', { 'style': 'max-height: 380px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px;' }, [
-					E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
-						E('thead', {}, [
-							E('tr', {}, [
-								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('时间')),
-								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('设备')),
-								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('域名 / 目标')),
-								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('策略')),
-								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('操作'))
-							])
-						]),
-						E('tbody', { 'id': 'hist-body' })
-					])
-				])
-			]),
-
-			// Rules
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, _('访问规则管理')),
-				E('div', { 'style': 'max-height: 320px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px; margin-bottom: 15px;' }, [
+				E('h3', {}, _('自定义规则列表')),
+				E('div', { 'style': 'max-height: 400px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px; margin-bottom: 15px;' }, [
 					E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
 						E('thead', {}, [
 							E('tr', {}, [
@@ -1429,31 +1669,10 @@ return view.extend({
 		]);
 
 		setTimeout(function() {
-			render_connections();
-			render_history();
 			render_rules();
 		}, 0);
 
-		self._timer = setInterval(function() {
-			fs.exec('/usr/share/mihomo/helper.sh', ['get_connections']).then(function(res) {
-				try {
-					var j = JSON.parse((res.stdout || '[]').trim());
-					if (j && !j.error) { connections = j; conn_error = null; render_connections(); }
-				} catch (e) {}
-			});
-			fs.exec('/usr/share/mihomo/helper.sh', ['get_history', '300']).then(function(res) {
-				try {
-					history = JSON.parse((res.stdout || '[]').trim());
-					render_history();
-				} catch (e) {}
-			});
-		}, 5000);
-
 		return view_html;
-	},
-
-	unload: function() {
-		if (this._timer) { clearInterval(this._timer); this._timer = null; }
 	}
 });
 """,
@@ -2116,6 +2335,15 @@ return view.extend({
 
 		o = s.option(form.Flag, 'dns_hijack', _('劫持系统 DNS'), _('将本地所有 DNS 请求劫持并转发给 Mihomo 内置的 DNS 服务。'));
 		o.rmempty = false;
+
+		o = s.option(form.ListValue, 'acl_mode', _('IP 转发控制模式'), _('选择走 Mihomo 代理转发的局域网设备范围。'));
+		o.value('all', _('所有设备'));
+		o.value('whitelist', _('仅允许列表中的设备'));
+		o.default = 'all';
+
+		o = s.option(form.DynamicList, 'acl_ips', _('受控 IP 列表'), _('填入需要走代理的设备 IP 地址或 CIDR 网段（如 192.168.1.100 或 192.168.1.0/24）。非列表中的设备流量将直接旁路，不走代理。'));
+		o.datatype = 'ipaddr';
+		o.depends('acl_mode', 'whitelist');
 
 		// Advanced Section
 		s = m.section(form.TypedSection, 'mihomo', _('高级设置'));
