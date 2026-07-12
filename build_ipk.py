@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-43"
+PKG_VERSION = "1.0.0-44"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -61,6 +61,7 @@ config mihomo 'config'
 	option dns_hijack '1'
 	option tun_enabled '0'
 	option subscription_url ''
+	option test_url ''
 """,
     # System Init Script managed by procd with TProxy/nftables/Dnsmasq redirection
     "root/etc/init.d/mihomo": """#!/bin/sh /etc/rc.common
@@ -649,17 +650,24 @@ urlencode() {
 test_node_delay() {
 \tlocal name="$1"
 \t[ -z "$name" ] && { echo '{"delay":-1,"msg":"name required"}'; return 0; }
-\tlocal test_url="${MIHOMO_TEST_URL:-https://www.gstatic.com/generate_204}"
+\t# 测试目标 URL：优先 UCI 配置，其次环境变量，最后默认。
+\t# 某些网络环境下默认地址不可达会导致所有节点都显示失败，故开放为可配置项。
+\tlocal test_url
+\ttest_url=$(uci -q get mihomo.config.test_url)
+\t[ -z "$test_url" ] && test_url="${MIHOMO_TEST_URL:-https://www.gstatic.com/generate_204}"
 \tlocal timeout=5000
-\tlocal enc
+\tlocal enc url_enc body code
 \tenc=$(urlencode "$name")
-\tlocal resp
-\tresp=$(curl -s --connect-timeout 5 --max-time "$timeout" "http://127.0.0.1:9090/proxies/${enc}/delay?url=${test_url}&timeout=${timeout}" 2>/dev/null)
-\tif [ -z "$resp" ]; then
-\t\techo '{"delay":-1,"msg":"no_response"}'
+\turl_enc=$(urlencode "$test_url")
+\tbody=$(mktemp)
+\tcode=$(curl -s -o "$body" -w '%{http_code}' --connect-timeout 5 --max-time $((timeout / 1000 + 5)) "http://127.0.0.1:9090/proxies/${enc}/delay?url=${url_enc}&timeout=${timeout}" 2>/dev/null)
+\tif [ -z "$code" ] || [ "$code" = "000" ]; then
+\t\techo '{"delay":-1,"msg":"controller_unreachable"}'
+\t\trm -f "$body"
 \t\treturn 0
 \tfi
-\techo "$resp"
+\tcat "$body"
+\trm -f "$body"
 }
 
 get_history() {
@@ -1487,16 +1495,24 @@ return view.extend({
 \t\t\t\t\tif (!p || !p.name || !p.type) return;
 \t\t\t\t\tvar el = delay_els[p.name];
 \t\t\t\t\tif (el) el.textContent = _('测试中...');
-\t\t\t\t\tfs.exec('/usr/share/mihomo/helper.sh', ['test_node_delay', p.name]).then(function(res) {
-\t\t\t\t\t\ttry {
-\t\t\t\t\t\t\tvar d = JSON.parse((res.stdout || '{}').trim());
-\t\t\t\t\t\t\tel.textContent = (typeof d.delay === 'number' && d.delay >= 0) ? (d.delay + ' ms') : _('超时/失败');
-\t\t\t\t\t\t} catch (e) {
-\t\t\t\t\t\t\tel.textContent = _('超时/失败');
-\t\t\t\t\t\t}
-\t\t\t\t\t}).catch(function() {
-\t\t\t\t\t\tif (el) el.textContent = _('超时/失败');
-\t\t\t\t\t});
+					fs.exec('/usr/share/mihomo/helper.sh', ['test_node_delay', p.name]).then(function(res) {
+						try {
+							var d = JSON.parse((res.stdout || '{}').trim());
+							if (typeof d.delay === 'number' && d.delay >= 0) {
+								el.textContent = d.delay + ' ms';
+							} else {
+								var reason = d.msg || d.message || '';
+								if (reason === 'controller_unreachable') el.textContent = _('控制器未连接');
+								else if (reason === 'name required') el.textContent = _('名称缺失');
+								else if (reason) el.textContent = _('失败') + ':' + String(reason).slice(0, 16);
+								else el.textContent = _('超时/失败');
+							}
+						} catch (e) {
+							el.textContent = _('超时/失败');
+						}
+					}).catch(function() {
+						if (el) el.textContent = _('超时/失败');
+					});
 \t\t\t\t})(proxies[i]);
 \t\t\t}
 \t\t};
@@ -1722,6 +1738,10 @@ return view.extend({
 \t\t\t
 \t\t\treturn E('div', {}, [update_btn]);
 \t\t};
+
+\t\to = s.option(form.Value, 'test_url', _('延时测试地址'), _('节点「测试」按钮用来探测延时的目标 URL。某些网络环境下默认地址不可达会导致所有节点都显示失败，可改为你网络中可正常访问的地址（如 https://www.google.com/generate_204）。留空使用默认。'));
+\t\to.rmempty = true;
+\t\to.placeholder = 'https://www.gstatic.com/generate_204';
 
 \t\to = s.option(form.Flag, 'tun_enabled', _('启用 TUN 模式'), _('使用虚拟网卡 (TUN) 接口进行全局流量接管。接管更彻底但会消耗略高 CPU。'));
 \t\to.rmempty = false;
