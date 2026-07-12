@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-36"
+PKG_VERSION = "1.0.0-39"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -629,6 +629,37 @@ collect_connections() {
 \ttail -n 2000 "$seenf" > "$seenf.tmp" && mv "$seenf.tmp" "$seenf"
 }
 
+# URL-encode a string for use in an HTTP path (POSIX shell, no bashisms).
+urlencode() {
+\tlocal s="$1" out=""
+\twhile [ -n "$s" ]; do
+\t\tlocal c="${s%"${s#?}"}"
+\t\tcase "$c" in
+\t\t\t[a-zA-Z0-9.~_-]) out="${out}${c}" ;;
+\t\t\t' ') out="${out}%20" ;;
+\t\t\t*) out="${out}$(printf '%%%02X' "'$c")" ;;
+\t\tesac
+\t\ts="${s#?}"
+\tdone
+\techo "$out"
+}
+
+test_node_delay() {
+\tlocal name="$1"
+\t[ -z "$name" ] && { echo '{"delay":-1,"msg":"name required"}'; return 0; }
+\tlocal test_url="${MIHOMO_TEST_URL:-https://www.gstatic.com/generate_204}"
+\tlocal timeout=5000
+\tlocal enc
+\tenc=$(urlencode "$name")
+\tlocal resp
+\tresp=$(curl -s --connect-timeout 5 --max-time "$timeout" "http://127.0.0.1:9090/proxies/${enc}/delay?url=${test_url}&timeout=${timeout}" 2>/dev/null)
+\tif [ -z "$resp" ]; then
+\t\techo '{"delay":-1,"msg":"no_response"}'
+\t\treturn 0
+\tfi
+\techo "$resp"
+}
+
 get_history() {
 \tlocal logf="/tmp/mihomo_access.log"
 \tlocal limit="${1:-200}"
@@ -709,6 +740,9 @@ case "$1" in
 \tget_proxies)
 \t\tget_proxies
 \t\t;;
+\ttest_node_delay)
+\t\ttest_node_delay "$2"
+\t\t;;
 \tget_proxy_groups)
 \t\tget_proxy_groups
 \t\t;;
@@ -734,7 +768,7 @@ case "$1" in
 \t\tdel_access_rule "$2"
 \t\t;;
 \t*)
-\t\techo "Usage: $0 {get_arch|check_core|download_core|update_subscription|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|get_history|get_access_rules|add_access_rule|del_access_rule}"
+\t\techo "Usage: $0 {get_arch|check_core|download_core|update_subscription|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|get_history|get_access_rules|add_access_rule|del_access_rule|test_node_delay}"
 \t\texit 1
 \t\t;;
 esac
@@ -1417,35 +1451,72 @@ return view.extend({
 \t\t\t]);
 \t\t}
 
-\t\tvar node_rows = [];
+\t\tvar node_cards = [];
+\t\tvar delay_els = {};
 \t\tvar valid_node_count = 0;
 \t\tfor (var i = 0; i < proxies.length; i++) {
 \t\t\tvar p = proxies[i];
 \t\t\tif (p && p.name && p.type) {
 \t\t\t\tvalid_node_count++;
-\t\t\t\tnode_rows.push(E('tr', {}, [
-\t\t\t\t\tE('td', {}, E('strong', {}, p.name)),
-\t\t\t\t\tE('td', {}, E('span', { 'class': 'label info', 'style': 'background-color: #17a2b8; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px;' }, p.type.toUpperCase())),
-\t\t\t\t\tE('td', {}, E('code', {}, p.server))
-\t\t\t\t]));
+\t\t\t\tvar card_tip = _('节点类型') + '：' + p.type + '\\n' + _('服务器地址') + '：' + (p.server || '-');
+\t\t\t\tvar delay_el = E('div', { 'style': 'font-size: 12px; color: #888; margin-top: 6px;' }, _('延时 —'));
+\t\t\t\tdelay_els[p.name] = delay_el;
+\t\t\t\tvar tip = E('div', { 'style': 'display:none; position:absolute; left:0; top:100%; z-index:50; margin-top:4px; background:#333; color:#fff; padding:6px 8px; border-radius:4px; font-size:11px; white-space:pre-line; max-width:240px; word-break:break-all;' }, card_tip);
+\t\t\t\tvar card = E('div', {
+\t\t\t\t\t'style': 'position:relative; border:1px solid rgba(0,0,0,0.08); border-radius:8px; padding:10px; background:#fff; cursor:default; min-height:60px; display:flex; flex-direction:column; justify-content:space-between;',
+\t\t\t\t\t'onmouseover': (function(t) { return function() { t.style.display = 'block'; }; })(tip),
+\t\t\t\t\t'onmouseout': (function(t) { return function() { t.style.display = 'none'; }; })(tip)
+\t\t\t\t}, [
+\t\t\t\t\tE('div', { 'style': 'font-weight:bold; font-size:13px; line-height:1.3; word-break:break-all;' }, p.name),
+\t\t\t\t\tdelay_el,
+\t\t\t\t\ttip
+\t\t\t\t]);
+\t\t\t\tnode_cards.push(card);
 \t\t\t}
 \t\t}
 
 \t\tvar sub_url = uci.get('mihomo', 'config', 'subscription_url') || '';
+
+\t\tvar run_delay_test = function() {
+\t\t\tif (!valid_node_count) return;
+\t\t\tui.addNotification(null, E('p', _('正在测试节点延时...')), 'info');
+\t\t\tfor (var i = 0; i < proxies.length; i++) {
+\t\t\t\t(function(p) {
+\t\t\t\t\tif (!p || !p.name || !p.type) return;
+\t\t\t\t\tvar el = delay_els[p.name];
+\t\t\t\t\tif (el) el.textContent = _('测试中...');
+\t\t\t\t\tfs.exec('/usr/share/mihomo/helper.sh', ['test_node_delay', p.name]).then(function(res) {
+\t\t\t\t\t\ttry {
+\t\t\t\t\t\t\tvar d = JSON.parse((res.stdout || '{}').trim());
+\t\t\t\t\t\t\tel.textContent = (typeof d.delay === 'number' && d.delay >= 0) ? (d.delay + ' ms') : _('超时/失败');
+\t\t\t\t\t\t} catch (e) {
+\t\t\t\t\t\t\tel.textContent = _('超时/失败');
+\t\t\t\t\t\t}
+\t\t\t\t\t}).catch(function() {
+\t\t\t\t\t\tif (el) el.textContent = _('超时/失败');
+\t\t\t\t\t});
+\t\t\t\t})(proxies[i]);
+\t\t\t}
+\t\t};
+
+\t\tvar node_test_btn = E('button', {
+\t\t\t'class': 'cbi-button cbi-button-action',
+\t\t\t'style': 'float: right; margin-top: -2px;',
+\t\t\t'click': function(ev) {
+\t\t\t\tev.preventDefault();
+\t\t\t\trun_delay_test();
+\t\t\t}
+\t\t}, _('测试'));
+
+\t\tvar node_list_header_children = [ E('h3', { 'style': 'margin-top: 0; margin-bottom: 0;' }, _('配置订阅节点列表')) ];
+\t\tif (valid_node_count > 0) {
+\t\t\tnode_list_header_children.push(node_test_btn);
+\t\t}
+\t\tvar node_list_header = E('div', { 'style': 'display: flex; align-items: center; justify-content: space-between;' }, node_list_header_children);
+
 \t\tvar node_list_body;
 \t\tif (valid_node_count > 0) {
-\t\t\tnode_list_body = E('div', { 'style': 'max-height: 300px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px; margin-top: 10px;' }, [
-\t\t\t\tE('table', { 'class': 'table', 'style': 'margin: 0;' }, [
-\t\t\t\t\tE('thead', {}, [
-\t\t\t\t\t\tE('tr', {}, [
-\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0; z-index: 1;' }, _('节点名称')),
-\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0; z-index: 1;' }, _('节点类型')),
-\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0; z-index: 1;' }, _('服务器地址'))
-\t\t\t\t\t\t])
-\t\t\t\t\t]),
-\t\t\t\t\tE('tbody', {}, node_rows)
-\t\t\t\t])
-\t\t\t]);
+\t\t\tnode_list_body = E('div', { 'style': 'display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 200px)); gap: 10px; margin-top: 12px;' }, node_cards);
 \t\t} else if (parse_error) {
 \t\t\tvar retry_update_btn = E('button', {
 \t\t\t\t'class': 'cbi-button cbi-button-action',
@@ -1560,7 +1631,7 @@ return view.extend({
 
 \t\t\t// Nodes list panel
 \t\t\tE('div', { 'class': 'cbi-section' }, [
-\t\t\t\tE('h3', {}, _('配置订阅节点列表')),
+\t\t\t\tnode_list_header,
 \t\t\t\tnode_list_body
 \t\t\t]),
 
