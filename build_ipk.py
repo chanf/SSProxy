@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-93"
+PKG_VERSION = "1.0.0-94"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 

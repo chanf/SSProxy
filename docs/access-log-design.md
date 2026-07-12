@@ -1,7 +1,7 @@
 # Mihomo 访问日志 产品设计文档
 
-> 状态：**已实现（v1.0.0-35 起随包发布）**
-> 模块：`luci-app-mihomo` → 「访问日志」页面（`admin/services/mihomo/accesslog`）
+> 状态：**已实现并重构（v1.0.0-90 拆分为独立页面）**
+> 模块：`luci-app-mihomo` → 「访问日志」页面（`admin/services/mihomo/accesslog`）与「规则管理」页面（`admin/services/mihomo/rules`）
 > 适用：OpenWrt + LuCI，依赖 Mihomo（Clash Meta）核心经 TProxy / TUN 透明接管流量
 
 ---
@@ -10,12 +10,12 @@
 
 | 项 | 内容 |
 |---|---|
-| 模块定位 | 与「运行状态」「服务设置」平级的第三个 LuCI 页面 |
-| 入口路径 | LuCI 左侧菜单 → 服务 → Mihomo 代理 → **访问日志** |
-| 核心能力 | ① 局域网设备实时连接可见性；② 历史访问记录落盘；③ 按域名配置代理/直连/拦截规则（UCI 持久化） |
-| 实现载体 | `helper.sh` 新增 6 个子命令 + 常驻采集进程 + `accesslog.js` 视图 + 菜单节点 + `prepare_config` 规则注入 |
+| 模块定位 | 访问日志与规则管理分离，形成平级独立的两个子页面 |
+| 入口路径 | ① **访问日志** (`/accesslog`)；② **规则管理** (`/rules`) |
+| 核心能力 | ① 局域网设备实时连接可见性（带全局模糊过滤搜索）；② 历史访问记录落盘；③ 独立配置与应用代理/直连/拦截规则（UCI 持久化） |
+| 实现载体 | `helper.sh` 子命令 + 常驻采集进程 + `accesslog.js`/`rules.js` 视图 + 菜单节点 + `prepare_config` 规则注入 |
 | 数据源 | Mihomo 外部控制器 `127.0.0.1:9090` 的 `GET /connections`；`/tmp/dhcp.leases` 设备名解析；UCI `mihomo` 规则段 |
-| 变更生效 | 规则写入 UCI 后**需手动重启核心**（`/etc/init.d/mihomo restart`）生效，重启有 1~2s 短暂断流 |
+| 变更生效 | 规则写入 UCI 后**需手动在规则页面点击重启核心**（`/etc/init.d/mihomo restart`）生效，重启有 1~2s 短暂断流 |
 
 ---
 
@@ -186,40 +186,44 @@ config mihomo_rule
 
 ---
 
-## 8. 前端设计（`accesslog.js`）
+## 8. 前端设计与重构（`accesslog.js` 与 `rules.js`）
 
-沿用 `dashboard.js` 的 `view.extend` + `fs.exec` + `uci` 模式，页面分三大区 + 新增规则表单。
+为提升用户体验并将“高频交互（日志查看）”与“低频配置（规则修改）”分离，系统重构为两个平级的子页面。
 
-### 8.1 菜单（`menu.d/luci-app-mihomo.json`）
+### 8.1 菜单定义（`menu.d/luci-app-mihomo.json`）
 ```json
 "admin/services/mihomo/accesslog": {
     "title": "访问日志",
     "order": 3,
     "action": { "type": "view", "path": "mihomo/accesslog" }
+},
+"admin/services/mihomo/rules": {
+    "title": "规则管理",
+    "order": 4,
+    "action": { "type": "view", "path": "mihomo/rules" }
 }
 ```
 
-### 8.2 页面结构（三大区）
-1. **实时连接区**（每 5s 自动刷新）
-   - 表格列：设备 / 域名·目标 / 策略 / 流量↑↓ / 操作（代理·直连·拦截）。
-   - 服务未运行或核心不可达时显示提示。
-   - 操作按钮调用 `add_access_rule <ip> <domain> <action>`（代理默认取首个 Selector 组）。
-2. **历史访问记录区**
-   - 表格列：时间 / 设备 / 域名·目标 / 策略 / 操作（拦截·直连）。
-   - 数据来自 `get_history 300`（读 `/tmp/mihomo_access.log`）。
-3. **访问规则管理区**
+### 8.2 访问日志页面（`accesslog.js`）
+1. **实时连接区**（每 5s 自动刷新，支持客户端全局模糊检索过滤）
+   - **过滤机制**：搜索框输入内容（大小写不敏感）会实时匹配设备名、IP、域名、策略和规则。
+   - **表格展示**：显示设备 / 域名·目标 / 策略 / 流量↑↓ / 快捷规则创建按钮。
+   - **快捷建规**：在每行点击“代理/直连/拦截”时，会通过 RPC 写入 UCI，并在前端弹窗提示用户前往「规则管理」页面应用生效。
+2. **历史访问记录区**（每 5s 自动刷新）
+   - 展示从 `/tmp/mihomo_access.log` 读取并逆序排序好的历史连接记录。
+   - 同样支持“直连/拦截”快捷建规。
+
+### 8.3 规则管理页面（`rules.js`）
+1. **自定义规则列表**：
    - 表格列：来源 IP / 域名 / 动作 / 备注 / 状态 / 操作（删除）。
-   - 明确标注「规则按域名对所有设备全局生效；来源 IP 仅用于溯源」。
-   - 行内删除调用 `del_access_rule <sid>`。
+   - 行内删除调用 `del_access_rule <sid>` 销毁 UCI 节点。
+   - 明确提示：“规则按域名对所有设备全局生效，来源 IP 仅供溯源管理”。
+2. **新增规则表单**：
+   - 字段：域名（必填）、来源 IP（选填）、动作（拦截/直连/走代理）、代理策略组（仅走代理有效）、备注。
+   - 提供「添加规则」按钮以及「应用并重启核心」按钮（调用 `/etc/init.d/mihomo restart` 热重启核心，重构后的 DOM 操作解决了原先拼接 DOM 元素的 `[object HTMLButtonElement]` 缺陷）。
 
-### 8.3 新增规则表单
-- 字段：域名（必填）、来源 IP（选填）、动作（拦截/直连/走代理下拉）、代理组（选填，仅走代理时有效）、备注。
-- 「添加规则」→ `add_access_rule` 写 UCI → 刷新规则表（不重启）。
-- 「应用并重启核心」→ `fs.exec('/etc/init.d/mihomo', ['restart'])` → 重启后规则生效，1.5s 后自动刷新页面。
-
-### 8.4 自动刷新与清理
-- `render()` 内 `setInterval` 每 5s 重新拉取 `get_connections` 与 `get_history` 并更新表格容器（保留滚动位置）。
-- `view` 定义 `unload()`，离开页面时 `clearInterval` 停止轮询。
+### 8.4 自动刷新与生命周期
+- 日志页面的定时器（5s 轮询）在 `unload()` 时会自动执行 `clearInterval` 销毁，防止后台无意义请求。
 
 ---
 
