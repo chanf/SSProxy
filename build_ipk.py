@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-52"
+PKG_VERSION = "1.0.0-55"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -1626,6 +1626,19 @@ return view.extend({
 \t\t\tnode_list_body = E('div', { 'style': 'padding: 15px; text-align: center; color: #999;' }, _('暂无可用节点信息，请先输入订阅链接并点击立即更新订阅。'));
 \t\t}
 
+\t\tvar logs_textarea = E('textarea', {
+\t\t\t'style': 'width: 100%; height: 250px; font-family: monospace; padding: 12px; border-radius: 6px; border: 1px solid rgba(0,0,0,0.12); background: rgba(0,0,0,0.02); resize: vertical; margin-bottom: 12px; font-size: 13px; line-height: 1.5;',
+\t\t\t'readonly': 'readonly'
+\t\t}, logs);
+\t\tvar clear_logs_btn = E('button', {
+\t\t\t'class': 'cbi-button cbi-button-neutral',
+\t\t\t'style': 'margin: 0;',
+\t\t\t'click': function(ev) {
+\t\t\t\tev.preventDefault();
+\t\t\t\tlogs_textarea.value = '';
+\t\t\t}
+\t\t}, _('清空'));
+
 \t\tvar view_html = E('div', { 'class': 'cbi-map' }, [
 \t\t\tE('h2', {}, _('Mihomo 代理仪表盘')),
 \t\t\tE('p', {}, _('管理 Mihomo 核心守护进程，监控运行状态并选择代理节点。')),
@@ -1695,11 +1708,11 @@ return view.extend({
 
 \t\t\t// Logs panel
 \t\t\tE('div', { 'class': 'cbi-section' }, [
-\t\t\t\tE('h3', {}, _('系统代理日志')),
-\t\t\t\tE('textarea', {
-\t\t\t\t\t'style': 'width: 100%; height: 250px; font-family: monospace; padding: 12px; border-radius: 6px; border: 1px solid rgba(0,0,0,0.12); background: rgba(0,0,0,0.02); resize: vertical; margin-bottom: 12px; font-size: 13px; line-height: 1.5;',
-\t\t\t\t\t'readonly': 'readonly'
-\t\t\t\t}, logs)
+\t\t\t\tE('div', { 'style': 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;' }, [
+\t\t\t\t\tE('h3', { 'style': 'margin: 0;' }, _('系统代理日志')),
+\t\t\t\t\tclear_logs_btn
+\t\t\t\t]),
+\t\t\t\tlogs_textarea
 \t\t\t])
 \t\t]);
 
