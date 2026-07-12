@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-42"
+PKG_VERSION = "1.0.0-43"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -41,6 +41,11 @@ if [ -z "$IPKG_INSTROOT" ]; then
     (sleep 3; /etc/init.d/rpcd restart) &
 fi
 exit 0
+""",
+
+    # Mark UCI config as a conffile so user settings (notably subscription_url)
+    # survive package upgrades instead of being overwritten by package defaults.
+    "CONTROL/conffiles": """/etc/config/mihomo
 """,
 
     # UCI Configuration
