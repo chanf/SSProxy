@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-55"
+PKG_VERSION = "1.0.0-81"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -62,6 +62,9 @@ config mihomo 'config'
 	option tun_enabled '0'
 	option subscription_url ''
 	option test_url ''
+	option auto_update '0'
+	option update_interval '24'
+	option last_update ''
 """,
     # System Init Script managed by procd with TProxy/nftables/Dnsmasq redirection
     "root/etc/init.d/mihomo": """#!/bin/sh /etc/rc.common
@@ -70,77 +73,78 @@ START=95
 USE_PROCD=1
 
 enable_tproxy() {
-\tlocal tproxy_port="$1"
-\t
-\t# 1. Add routing table 100
-\tip rule add fwmark 1 table 100 2>/dev/null
-\tip route add local default dev lo table 100 2>/dev/null
-\t
-\t# 2. Add nftables redirection rules
-\tnft create table inet mihomo 2>/dev/null
-\tnft add chain inet mihomo prerouting { type filter hook prerouting priority mangle \\; }
-\tnft add rule inet mihomo prerouting ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } return
-\tnft add rule inet mihomo prerouting meta l4proto { tcp, udp } tproxy to :"$tproxy_port" meta mark set 1
-\t
-\tlogger -t mihomo "TProxy redirect rules enabled on port $tproxy_port"
+	local tproxy_port="$1"
+	
+	# 1. Add routing table 100
+	ip rule add fwmark 1 table 100 2>/dev/null
+	ip route add local default dev lo table 100 2>/dev/null
+	
+	# 2. Add nftables redirection rules
+	nft create table inet mihomo 2>/dev/null
+	nft add chain inet mihomo prerouting { type filter hook prerouting priority mangle \\; }
+	nft add rule inet mihomo prerouting ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } return
+	nft add rule inet mihomo prerouting meta l4proto { tcp, udp } tproxy to :"$tproxy_port" meta mark set 1
+	
+	logger -t mihomo "TProxy redirect rules enabled on port $tproxy_port"
 }
 
 disable_tproxy() {
-\t# Remove nftables table and routing rules
-\tnft delete table inet mihomo 2>/dev/null
-\tip rule del fwmark 1 table 100 2>/dev/null
-\tip route del local default dev lo table 100 2>/dev/null
-\t
-\tlogger -t mihomo "TProxy redirect rules disabled"
+	# Remove nftables table and routing rules
+	nft delete table inet mihomo 2>/dev/null
+	ip rule del fwmark 1 table 100 2>/dev/null
+	ip route del local default dev lo table 100 2>/dev/null
+	
+	logger -t mihomo "TProxy redirect rules disabled"
 }
 
 enable_dns_hijack() {
-\tlocal dns_port="$1"
-\t
-\t# Configure Dnsmasq to forward external requests to Mihomo DNS
-\tuci add_list dhcp.@dnsmasq[0].server="127.0.0.1#$dns_port"
-\tuci set dhcp.@dnsmasq[0].noresolv="1"
-\tuci commit dhcp
-\t/etc/init.d/dnsmasq restart
-\t
-\tlogger -t mihomo "DNS hijack enabled: Dnsmasq forwarding to Mihomo DNS on port $dns_port"
+	local dns_port="$1"
+	
+	# Configure Dnsmasq to forward external requests to Mihomo DNS
+	uci add_list dhcp.@dnsmasq[0].server="127.0.0.1#$dns_port"
+	uci set dhcp.@dnsmasq[0].noresolv="1"
+	uci commit dhcp
+	/etc/init.d/dnsmasq restart
+	
+	logger -t mihomo "DNS hijack enabled: Dnsmasq forwarding to Mihomo DNS on port $dns_port"
 }
 
 disable_dns_hijack() {
-\tlocal dns_port="$1"
-\t
-\t# Revert Dnsmasq changes
-\tuci del_list dhcp.@dnsmasq[0].server="127.0.0.1#$dns_port" 2>/dev/null
-\tuci del dhcp.@dnsmasq[0].noresolv 2>/dev/null
-\tuci commit dhcp
-\t/etc/init.d/dnsmasq restart
-\t
-\tlogger -t mihomo "DNS hijack disabled"
+	local dns_port="$1"
+	
+	# Revert Dnsmasq changes
+	uci del_list dhcp.@dnsmasq[0].server="127.0.0.1#$dns_port" 2>/dev/null
+	uci del dhcp.@dnsmasq[0].noresolv 2>/dev/null
+	uci commit dhcp
+	/etc/init.d/dnsmasq restart
+	
+	logger -t mihomo "DNS hijack disabled"
 }
 
 start_service() {
-\tconfig_load mihomo
-\t
-\tlocal core_path config_path work_dir dns_port dns_hijack tproxy_port tun_enabled
+	config_load mihomo
+	/usr/share/mihomo/helper.sh restore_subscription_url
 	
-\tconfig_get core_path config core_path "/usr/bin/mihomo"
-\tconfig_get config_path config config_path "/etc/mihomo/config.yaml"
-\tconfig_get work_dir config work_dir "/etc/mihomo"
-\tconfig_get dns_port config dns_port "1053"
-\tconfig_get_bool dns_hijack config dns_hijack 1
-\tconfig_get tproxy_port config tproxy_port "7893"
-\tconfig_get_bool tun_enabled config tun_enabled 0
+	local core_path config_path work_dir dns_port dns_hijack tproxy_port tun_enabled
 	
-\tif [ ! -x "$core_path" ]; then
-\t\tlogger -t mihomo "ERROR: Core binary not found or not executable at $core_path"
-\t\treturn 1
-\tfi
-\t
-\tmkdir -p "$work_dir"
-\t
-\tif [ ! -f "$config_path" ]; then
-\t\tmkdir -p "$(dirname "$config_path")"
-\t\tcat <<EOF > "$config_path"
+	config_get core_path config core_path "/usr/bin/mihomo"
+	config_get config_path config config_path "/etc/mihomo/config.yaml"
+	config_get work_dir config work_dir "/etc/mihomo"
+	config_get dns_port config dns_port "1053"
+	config_get_bool dns_hijack config dns_hijack 1
+	config_get tproxy_port config tproxy_port "7893"
+	config_get_bool tun_enabled config tun_enabled 0
+	
+	if [ ! -x "$core_path" ]; then
+		logger -t mihomo "ERROR: Core binary not found or not executable at $core_path"
+		return 1
+	fi
+	
+	mkdir -p "$work_dir"
+	
+	if [ ! -f "$config_path" ]; then
+		mkdir -p "$(dirname "$config_path")"
+		cat <<EOF > "$config_path"
 port: 7890
 socks-port: 7891
 redir-port: 7892
@@ -160,67 +164,77 @@ dns:
     - 223.5.5.5
     - 114.114.114.114
 EOF
-\tfi
-\t
-\t# Prepare running configuration file in RAM
-\t/usr/share/mihomo/helper.sh prepare_config
-\tif [ $? -ne 0 ]; then
-\t\tlogger -t mihomo "ERROR: Failed to prepare running configuration"
-\t\treturn 1
-\tfi
-\t
-\t# Start Daemon
-\tprocd_open_instance
-\tprocd_set_param command "$core_path" -d "$work_dir" -f "/tmp/mihomo_run.yaml"
-\tprocd_set_param stdout 1
-\tprocd_set_param stderr 1
-\tprocd_set_param respawn
-\tprocd_close_instance
-\t
-\t# Apply network redirections
-\tif [ "$tun_enabled" -ne 1 ]; then
-\t\tenable_tproxy "$tproxy_port"
-\tfi
-\t
-\tif [ "$dns_hijack" -eq 1 ]; then
-\t\tenable_dns_hijack "$dns_port"
-\tfi
+	fi
+	
+	# Prepare running configuration file in RAM
+	/usr/share/mihomo/helper.sh prepare_config
+	if [ $? -ne 0 ]; then
+		logger -t mihomo "ERROR: Failed to prepare running configuration"
+		return 1
+	fi
+	
+	# Start Daemon
+	procd_open_instance
+	procd_set_param command "$core_path" -d "$work_dir" -f "/tmp/mihomo_run.yaml"
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param respawn
+	procd_close_instance
+	
+	# Apply network redirections
+	if [ "$tun_enabled" -ne 1 ]; then
+		enable_tproxy "$tproxy_port"
+	fi
+	
+	if [ "$dns_hijack" -eq 1 ]; then
+		enable_dns_hijack "$dns_port"
+	fi
 
-\t# Background collector: persist connections to /tmp/mihomo_access.log for the
-\t# access-log history view. No-ops when the core controller is unreachable.
-\tprocd_open_instance
-\tprocd_set_param command /bin/sh -c "/usr/share/mihomo/helper.sh collect_connections; while true; do /usr/share/mihomo/helper.sh collect_connections; sleep 15; done"
-\tprocd_set_param stdout 1
-\tprocd_set_param stderr 1
-\tprocd_set_param respawn
-\tprocd_close_instance
+	# Background collector: persist connections to /tmp/mihomo_access.log for the
+	# access-log history view. No-ops when the core controller is unreachable.
+	procd_open_instance
+	procd_set_param command /bin/sh -c "/usr/share/mihomo/helper.sh collect_connections; while true; do /usr/share/mihomo/helper.sh collect_connections; sleep 15; done"
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param respawn
+	procd_close_instance
 
-\tlogger -t mihomo "Mihomo service started successfully"
+	# Self-contained auto-update loop (no external cron dependency). It polls
+	# every 10 minutes; the actual download frequency is gated by auto_update_now
+	# according to the configured interval.
+	procd_open_instance
+	procd_set_param command /bin/sh -c "/usr/share/mihomo/helper.sh auto_update_loop"
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param respawn
+	procd_close_instance
+
+	logger -t mihomo "Mihomo service started successfully"
 }
 
 stop_service() {
-\tconfig_load mihomo
-\t
-\tlocal dns_port dns_hijack tun_enabled
-\tconfig_get dns_port config dns_port "1053"
-\tconfig_get_bool dns_hijack config dns_hijack 1
-\tconfig_get_bool tun_enabled config tun_enabled 0
-\t
-\t# Clean up redirect rules
-\tif [ "$tun_enabled" -ne 1 ]; then
-\t\tdisable_tproxy
-\tfi
-\t
-\tif [ "$dns_hijack" -eq 1 ]; then
-\t\tdisable_dns_hijack "$dns_port"
-\tfi
-\t
-\trm -f /tmp/mihomo_run.yaml
-\tlogger -t mihomo "Mihomo service stopped"
+	config_load mihomo
+	
+	local dns_port dns_hijack tun_enabled
+	config_get dns_port config dns_port "1053"
+	config_get_bool dns_hijack config dns_hijack 1
+	config_get_bool tun_enabled config tun_enabled 0
+	
+	# Clean up redirect rules
+	if [ "$tun_enabled" -ne 1 ]; then
+		disable_tproxy
+	fi
+	
+	if [ "$dns_hijack" -eq 1 ]; then
+		disable_dns_hijack "$dns_port"
+	fi
+	
+	rm -f /tmp/mihomo_run.yaml
+	logger -t mihomo "Mihomo service stopped"
 }
 
 service_triggers() {
-\tprocd_add_reload_trigger "mihomo"
+	procd_add_reload_trigger "mihomo"
 }
 """,
 
@@ -228,207 +242,316 @@ service_triggers() {
     "root/usr/share/mihomo/helper.sh": """#!/bin/sh
 
 cpu_amd64_v3() {
-\t# Go GOAMD64=v3 需要 AVX2 + BMI1 + BMI2 + FMA + F16C 等指令集；
-\t# 缺少任一关键标志即视为非 v3，退回 amd64-compatible 兼容构建。
-\tgrep -qw -m1 avx2 /proc/cpuinfo 2>/dev/null || return 1
-\tgrep -qw -m1 bmi2 /proc/cpuinfo 2>/dev/null || return 1
-\tgrep -qw -m1 bmi1 /proc/cpuinfo 2>/dev/null || return 1
-\tgrep -qw -m1 fma  /proc/cpuinfo 2>/dev/null || return 1
-\tgrep -qw -m1 f16c /proc/cpuinfo 2>/dev/null || return 1
-\treturn 0
+	# Go GOAMD64=v3 需要 AVX2 + BMI1 + BMI2 + FMA + F16C 等指令集；
+	# 缺少任一关键标志即视为非 v3，退回 amd64-compatible 兼容构建。
+	grep -qw -m1 avx2 /proc/cpuinfo 2>/dev/null || return 1
+	grep -qw -m1 bmi2 /proc/cpuinfo 2>/dev/null || return 1
+	grep -qw -m1 bmi1 /proc/cpuinfo 2>/dev/null || return 1
+	grep -qw -m1 fma  /proc/cpuinfo 2>/dev/null || return 1
+	grep -qw -m1 f16c /proc/cpuinfo 2>/dev/null || return 1
+	return 0
 }
 
 get_arch() {
-\tlocal raw_arch=$(uname -m)
-\tcase "$raw_arch" in
-\t\tx86_64)
-\t\t\tif cpu_amd64_v3; then
-\t\t\t\techo "amd64"
-\t\t\telse
-\t\t\t\techo "amd64-compatible"
-\t\t\tfi
-\t\t\t;;
-\t\taarch64)
-\t\t\techo "arm64"
-\t\t\t;;
-\t\tarmv7*)
-\t\t\techo "armv7"
-\t\t\t;;
-\t\tmips)
-\t\t\techo "mips-softfloat"
-\t\t\t;;
-\t\tmipsel)
-\t\t\techo "mipsle-softfloat"
-\t\t\t;;
-\t\t*)
-\t\t\tlocal opkg_arch=$(opkg print-architecture | awk '{print $2}' | grep -v 'all' | grep -v 'noarch' | head -n 1)
-\t\t\tcase "$opkg_arch" in
-\t\t\t\t*x86_64*) echo "amd64" ;;
-\t\t\t\t*aarch64*|*arm64*) echo "arm64" ;;
-\t\t\t\t*armv7*) echo "armv7" ;;
-\t\t\t\t*mipsel*) echo "mipsle-softfloat" ;;
-\t\t\t\t*mips*) echo "mips-softfloat" ;;
-\t\t\t\t*) echo "unknown" ;;
-\t\t\tesac
-\t\t\t;;
-\tesac
+	local raw_arch=$(uname -m)
+	case "$raw_arch" in
+		x86_64)
+			if cpu_amd64_v3; then
+				echo "amd64"
+			else
+				echo "amd64-compatible"
+			fi
+			;;
+		aarch64)
+			echo "arm64"
+			;;
+		armv7*)
+			echo "armv7"
+			;;
+		mips)
+			echo "mips-softfloat"
+			;;
+		mipsel)
+			echo "mipsle-softfloat"
+			;;
+		*)
+			local opkg_arch=$(opkg print-architecture | awk '{print $2}' | grep -v 'all' | grep -v 'noarch' | head -n 1)
+			case "$opkg_arch" in
+				*x86_64*) echo "amd64" ;;
+				*aarch64*|*arm64*) echo "arm64" ;;
+				*armv7*) echo "armv7" ;;
+				*mipsel*) echo "mipsle-softfloat" ;;
+				*mips*) echo "mips-softfloat" ;;
+				*) echo "unknown" ;;
+			esac
+			;;
+	esac
 }
 
 check_core() {
-\tlocal core_path=$(uci -q get mihomo.config.core_path || echo "/usr/bin/mihomo")
-\tif [ -x "$core_path" ]; then
-\t\tlocal version=$("$core_path" -v 2>/dev/null | awk '{print $3}')
-\t\techo "installed:$version"
-\telse
-\t\techo "not_installed"
-\tfi
+	local core_path=$(uci -q get mihomo.config.core_path || echo "/usr/bin/mihomo")
+	if [ -x "$core_path" ]; then
+		local version=$("$core_path" -v 2>/dev/null | awk '{print $3}')
+		echo "installed:$version"
+	else
+		echo "not_installed"
+	fi
 }
 
 download_core() {
-\tlocal arch=$(get_arch)
-\tif [ "$arch" = "unknown" ]; then
-\t\techo "ERROR: Unsupported architecture" >&2
-\t\treturn 1
-\tfi
+	local arch=$(get_arch)
+	if [ "$arch" = "unknown" ]; then
+		echo "ERROR: Unsupported architecture" >&2
+		return 1
+	fi
 
-\tlocal version="v1.19.28"
-\tlocal mirror="https://github.com/MetaCubeX/mihomo/releases/download/${version}"
-\tlocal filename="mihomo-linux-${arch}-${version}.gz"
-\tlocal url="${mirror}/${filename}"
+	local version="v1.19.28"
+	local mirror="https://github.com/MetaCubeX/mihomo/releases/download/${version}"
+	local filename="mihomo-linux-${arch}-${version}.gz"
+	local url="${mirror}/${filename}"
 
-\tif [ -n "$1" ]; then
-\t\turl="$1"
-\t\tfilename=$(basename "$url")
-\tfi
+	if [ -n "$1" ]; then
+		url="$1"
+		filename=$(basename "$url")
+	fi
 
-\tlocal core_path=$(uci -q get mihomo.config.core_path || echo "/usr/bin/mihomo")
-\tlocal core_dir=$(dirname "$core_path")
-\t
-\tmkdir -p "$core_dir"
-\tmkdir -p /tmp/mihomo_download
+	local core_path=$(uci -q get mihomo.config.core_path || echo "/usr/bin/mihomo")
+	local core_dir=$(dirname "$core_path")
+	
+	mkdir -p "$core_dir"
+	mkdir -p /tmp/mihomo_download
 
-\techo "Downloading Mihomo core from $url..."
-\tcurl -fsSL -k -o "/tmp/mihomo_download/$filename" "$url"
-\tif [ $? -ne 0 ]; then
-\t\techo "ERROR: Download failed" >&2
-\t\trm -rf /tmp/mihomo_download
-\t\treturn 1
-\tfi
+	echo "Downloading Mihomo core from $url..."
+	curl -fsSL -k -o "/tmp/mihomo_download/$filename" "$url"
+	if [ $? -ne 0 ]; then
+		echo "ERROR: Download failed" >&2
+		rm -rf /tmp/mihomo_download
+		return 1
+	fi
 
-\techo "Extracting binary..."
-\tif [ "${filename##*.}" = "gz" ] && [ "${filename#*.gz}" != "$filename" ]; then
-\t\tgunzip -f "/tmp/mihomo_download/$filename"
-\t\tlocal extracted_name=$(basename "$filename" .gz)
-\t\tmv "/tmp/mihomo_download/$extracted_name" "$core_path"
-\telif [ "${filename##*.}" = "tar.gz" ] || [ "${filename#*.tar.gz}" != "$filename" ]; then
-\t\ttar -zxf "/tmp/mihomo_download/$filename" -C /tmp/mihomo_download
-\t\tlocal bin_file=$(find /tmp/mihomo_download -type f -executable | head -n 1)
-\t\tif [ -n "$bin_file" ]; then
-\t\t\tmv "$bin_file" "$core_path"
-\t\telse
-\t\t\techo "ERROR: Could not find executable in tarball" >&2
-\t\t\trm -rf /tmp/mihomo_download
-\t\t\treturn 1
-\tfi
-\telse
-\t\tmv "/tmp/mihomo_download/$filename" "$core_path"
-\tfi
+	echo "Extracting binary..."
+	if [ "${filename##*.}" = "gz" ] && [ "${filename#*.gz}" != "$filename" ]; then
+		gunzip -f "/tmp/mihomo_download/$filename"
+		local extracted_name=$(basename "$filename" .gz)
+		mv "/tmp/mihomo_download/$extracted_name" "$core_path"
+	elif [ "${filename##*.}" = "tar.gz" ] || [ "${filename#*.tar.gz}" != "$filename" ]; then
+		tar -zxf "/tmp/mihomo_download/$filename" -C /tmp/mihomo_download
+		local bin_file=$(find /tmp/mihomo_download -type f -executable | head -n 1)
+		if [ -n "$bin_file" ]; then
+			mv "$bin_file" "$core_path"
+		else
+			echo "ERROR: Could not find executable in tarball" >&2
+			rm -rf /tmp/mihomo_download
+			return 1
+	fi
+	else
+		mv "/tmp/mihomo_download/$filename" "$core_path"
+	fi
 
-\tchmod +x "$core_path"
-\trm -rf /tmp/mihomo_download
-\techo "SUCCESS: Mihomo core installed to $core_path"
-\treturn 0
+	chmod +x "$core_path"
+	rm -rf /tmp/mihomo_download
+	echo "SUCCESS: Mihomo core installed to $core_path"
+	return 0
 }
 
 update_subscription() {
-\tlocal url="$1"
-\tif [ -z "$url" ]; then
-\t\techo "ERROR: No subscription URL specified" >&2
-\t\treturn 1
-\tfi
-\tlocal work_dir=$(uci -q get mihomo.config.work_dir || echo "/etc/mihomo")
-\tlocal config_path=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
+	local url="$1"
+	if [ -z "$url" ]; then
+		url=$(uci -q get mihomo.config.subscription_url)
+	fi
+	if [ -z "$url" ]; then
+		echo "ERROR: No subscription URL specified" >&2
+		return 1
+	fi
+	local work_dir=$(uci -q get mihomo.config.work_dir || echo "/etc/mihomo")
+	local config_path=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
 
-\tmkdir -p "$work_dir"
-\tlogger -t mihomo "Updating subscription from $url"
-\techo "Fetching subscription..."
-\tcurl -fsSL -k -A "ClashMeta" -o "/tmp/mihomo_sub.yaml" "$url"
-\tif [ $? -ne 0 ]; then
-\t\techo "ERROR: Failed to download subscription" >&2
-\t\tlogger -t mihomo 'Subscription update FAILED: download error'
-\t\trm -f /tmp/mihomo_sub.yaml
-\t\treturn 1
-\tfi
+	mkdir -p "$work_dir"
+	logger -t mihomo "Updating subscription from $url"
+	echo "Fetching subscription..."
+	curl -fsSL -k -A "ClashMeta" -o "/tmp/mihomo_sub.yaml" "$url"
+	if [ $? -ne 0 ]; then
+		echo "ERROR: Failed to download subscription" >&2
+		logger -t mihomo 'Subscription update FAILED: download error'
+		rm -f /tmp/mihomo_sub.yaml
+		return 1
+	fi
 
-\tmv "/tmp/mihomo_sub.yaml" "$config_path"
-\techo "SUCCESS: Subscription updated at $config_path"
-\tlogger -t mihomo "Subscription updated: $(wc -c < "$config_path") bytes at $config_path"
-\treturn 0
+	mv "/tmp/mihomo_sub.yaml" "$config_path"
+	uci -q set mihomo.config.last_update="$(date +%s)"
+	uci -q commit mihomo
+	save_subscription_url "$url"
+	# Restart the core so it loads the freshly downloaded config. Without this the
+	# running core keeps serving the previous (empty/stale) proxy set while the
+	# dashboard reads the new file, causing every node delay test to fail with
+	# "Resource not found".
+	if pidof mihomo >/dev/null 2>&1; then
+		/etc/init.d/mihomo restart
+	fi
+	echo "SUCCESS: Subscription updated at $config_path"
+	logger -t mihomo "Subscription updated: $(wc -c < "$config_path") bytes at $config_path"
+	return 0
+}
+
+# Remove all locally downloaded subscription nodes. The subscription_url is
+# preserved so the user can re-fetch later. If the core is running it is
+# restarted so the deletion takes effect immediately.
+clear_subscription() {
+	local config_path=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
+	rm -f "$config_path"
+	uci -q set mihomo.config.last_update=''
+	uci -q commit mihomo
+	logger -t mihomo "All subscription nodes cleared"
+	if pidof mihomo >/dev/null 2>&1; then
+		/etc/init.d/mihomo restart
+	fi
+	echo '{"success":true,"msg":"已清空所有订阅节点"}'
+}
+
+# Persist the subscription URL to a package-external store so it survives a full
+# reinstall (opkg remove + install), which would otherwise delete the conffile
+# /etc/config/mihomo. The file is not part of the package manifest, so opkg
+# never removes it.
+SUBSCRIPTION_URL_FILE="/etc/mihomo/.subscription_url"
+
+save_subscription_url() {
+	local url="$1"
+	[ -z "$url" ] && url=$(uci -q get mihomo.config.subscription_url)
+	[ -z "$url" ] && return 0
+	mkdir -p "$(uci -q get mihomo.config.work_dir || echo /etc/mihomo)"
+	printf '%s' "$url" > "$SUBSCRIPTION_URL_FILE"
+	uci -q set mihomo.config.subscription_url="$url"
+	uci -q commit mihomo
+}
+
+restore_subscription_url() {
+	local url=$(uci -q get mihomo.config.subscription_url)
+	if [ -z "$url" ] && [ -f "$SUBSCRIPTION_URL_FILE" ]; then
+		url=$(cat "$SUBSCRIPTION_URL_FILE" 2>/dev/null)
+		if [ -n "$url" ]; then
+			uci -q set mihomo.config.subscription_url="$url"
+			uci -q commit mihomo
+			logger -t mihomo "Restored subscription_url from persistent store"
+		fi
+	fi
+}
+
+# Background loop driven by the procd service instance. Polls every 10 minutes;
+# the real download cadence is enforced by auto_update_now based on the configured
+# interval. Self-contained: does not rely on the system cron daemon.
+auto_update_loop() {
+	while true; do
+		sleep 600
+		auto_update_now
+	done
+}
+
+# Called hourly by cron. Downloads a fresh subscription only when auto_update is
+# enabled, a URL is configured, and the configured interval has elapsed.
+auto_update_now() {
+	local enabled=$(uci -q get mihomo.config.auto_update)
+	[ "$enabled" = "1" ] || exit 0
+	local url=$(uci -q get mihomo.config.subscription_url)
+	[ -z "$url" ] && { logger -t mihomo "auto_update: no subscription_url configured"; exit 0; }
+	local interval=$(uci -q get mihomo.config.update_interval || echo 24)
+	case "$interval" in ''|*[!0-9]*) interval=24 ;; esac
+	[ "$interval" -lt 1 ] && interval=1
+	local last=$(uci -q get mihomo.config.last_update)
+	local now=$(date +%s)
+	if [ -n "$last" ] && [ "$last" -gt 0 ] 2>/dev/null; then
+		local elapsed=$((now - last))
+		if [ "$elapsed" -lt $((interval * 3600)) ]; then
+			logger -t mihomo "auto_update: skipped, next run in $((interval * 3600 - elapsed))s"
+			exit 0
+		fi
+	fi
+	logger -t mihomo "auto_update: starting scheduled update"
+	update_subscription "$url"
+	if [ $? -eq 0 ] && pidof mihomo >/dev/null 2>&1; then
+		/etc/init.d/mihomo restart
+	fi
+}
+
+# Report auto-update schedule state for the UI.
+get_schedule() {
+	local enabled=$(uci -q get mihomo.config.auto_update)
+	local interval=$(uci -q get mihomo.config.update_interval || echo 24)
+	case "$interval" in ''|*[!0-9]*) interval=24 ;; esac
+	[ "$interval" -lt 1 ] && interval=1
+	local last=$(uci -q get mihomo.config.last_update)
+	local url=$(uci -q get mihomo.config.subscription_url)
+	local next=""
+	if [ "$enabled" = "1" ] && [ -n "$url" ]; then
+		if [ -n "$last" ] && [ "$last" -gt 0 ] 2>/dev/null; then
+			next=$((last + interval * 3600))
+		fi
+	fi
+	echo "{\"auto_update\":\"$enabled\",\"interval\":\"$interval\",\"last_update\":\"$last\",\"next_update\":\"$next\",\"has_url\":\"$([ -n "$url" ] && echo 1 || echo 0)\"}"
 }
 
 # Emit controlled access rules (from UCI mihomo_rule) as YAML rule lines.
 # Note: Mihomo rules are GLOBAL and cannot be scoped per source IP. The recorded
 # src_ip is kept only for management/traceability; the rule applies to all devices.
 emit_access_rules_yaml() {
-\tuci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=mihomo_rule$/\\1/p' | while read -r sid; do
-\t\tlocal enabled domain action group
-\t\tenabled=$(uci -q get mihomo.$sid.enabled)
-\t\t[ "$enabled" = "1" ] || continue
-\t\tdomain=$(uci -q get mihomo.$sid.domain)
-\t\t[ -n "$domain" ] || continue
-\t\taction=$(uci -q get mihomo.$sid.action)
-\t\tcase "$action" in
-\t\t\tblock) echo "  - 'DOMAIN-SUFFIX,$domain,REJECT'" ;;
-\t\t\tdirect) echo "  - 'DOMAIN-SUFFIX,$domain,DIRECT'" ;;
-\t\t\tproxy)
-\t\t\t\tlocal g
-\t\t\t\tg=$(uci -q get mihomo.$sid.group)
-\t\t\t\t[ -n "$g" ] && echo "  - 'DOMAIN-SUFFIX,$domain,$g'"
-\t\t\t\t;;
-\t\tesac
-\tdone
+	uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=mihomo_rule$/\\1/p' | while read -r sid; do
+		local enabled domain action group
+		enabled=$(uci -q get mihomo.$sid.enabled)
+		[ "$enabled" = "1" ] || continue
+		domain=$(uci -q get mihomo.$sid.domain)
+		[ -n "$domain" ] || continue
+		action=$(uci -q get mihomo.$sid.action)
+		case "$action" in
+			block) echo "  - 'DOMAIN-SUFFIX,$domain,REJECT'" ;;
+			direct) echo "  - 'DOMAIN-SUFFIX,$domain,DIRECT'" ;;
+			proxy)
+				local g
+				g=$(uci -q get mihomo.$sid.group)
+				[ -n "$g" ] && echo "  - 'DOMAIN-SUFFIX,$domain,$g'"
+				;;
+		esac
+	done
 }
 
 prepare_config() {
-\tlocal src_config=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
-\tlocal run_config="/tmp/mihomo_run.yaml"
-\t
-\tlocal dns_port=$(uci -q get mihomo.config.dns_port || echo "1053")
-\tlocal tproxy_port=$(uci -q get mihomo.config.tproxy_port || echo "7893")
-\tlocal mix_port=$(uci -q get mihomo.config.mix_port || echo "7890")
-\tlocal tun_enabled=$(uci -q get mihomo.config.tun_enabled || echo "0")
-\t
-\tif [ ! -f "$src_config" ]; then
-\t\techo "ERROR: Source configuration file $src_config not found" >&2
-\t\treturn 1
-\tfi
-\t
-\t# Copy source config to temp running config
-\tcp "$src_config" "$run_config"
-\t
-\t# Strip existing dns and tun blocks to avoid duplicate key errors
-\tawk -v in_block=0 '
-\t/^dns:/ || /^tun:/ { in_block=1; next }
-\tin_block && /^[a-zA-Z]/ { in_block=0 }
-\t!in_block { print }
-\t' "$run_config" > "${run_config}.tmp"
-\tmv "${run_config}.tmp" "$run_config"
-\t
-\t# Strip top-level ports to avoid conflicts
-\tsed -i '/^mixed-port:/d; /^tproxy-port:/d; /^port:/d; /^socks-port:/d; /^allow-lan:/d; /^external-controller:/d' "$run_config"
-\t
-\t# Prepend our controlled settings at the top
-\tcat <<EOF > "${run_config}.tmp"
+	local src_config=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
+	local run_config="/tmp/mihomo_run.yaml"
+	
+	local dns_port=$(uci -q get mihomo.config.dns_port || echo "1053")
+	local tproxy_port=$(uci -q get mihomo.config.tproxy_port || echo "7893")
+	local mix_port=$(uci -q get mihomo.config.mix_port || echo "7890")
+	local tun_enabled=$(uci -q get mihomo.config.tun_enabled || echo "0")
+	
+	if [ ! -f "$src_config" ]; then
+		echo "ERROR: Source configuration file $src_config not found" >&2
+		return 1
+	fi
+	
+	# Copy source config to temp running config
+	cp "$src_config" "$run_config"
+	
+	# Strip existing dns and tun blocks to avoid duplicate key errors
+	awk -v in_block=0 '
+	/^dns:/ || /^tun:/ { in_block=1; next }
+	in_block && /^[a-zA-Z]/ { in_block=0 }
+	!in_block { print }
+	' "$run_config" > "${run_config}.tmp"
+	mv "${run_config}.tmp" "$run_config"
+	
+	# Strip top-level ports to avoid conflicts
+	sed -i '/^mixed-port:/d; /^tproxy-port:/d; /^port:/d; /^socks-port:/d; /^allow-lan:/d; /^external-controller:/d' "$run_config"
+	
+	# Prepend our controlled settings at the top
+	cat <<EOF > "${run_config}.tmp"
 mixed-port: $mix_port
 tproxy-port: $tproxy_port
 allow-lan: true
 external-controller: 0.0.0.0:9090
 EOF
-\tcat "$run_config" >> "${run_config}.tmp"
-\tmv "${run_config}.tmp" "$run_config"
-\t
-\t# Append controlled DNS block
-\tcat <<EOF >> "$run_config"
+	cat "$run_config" >> "${run_config}.tmp"
+	mv "${run_config}.tmp" "$run_config"
+	
+	# Append controlled DNS block
+	cat <<EOF >> "$run_config"
 dns:
   enable: true
   ipv6: false
@@ -439,363 +562,483 @@ dns:
     - 119.29.29.29
 EOF
 
-\t# Append controlled TUN block
-\tif [ "$tun_enabled" -eq 1 ]; then
-\t\tcat <<EOF >> "$run_config"
+	# Append controlled TUN block
+	if [ "$tun_enabled" -eq 1 ]; then
+		cat <<EOF >> "$run_config"
 tun:
   enable: true
   stack: system
   auto-route: true
   auto-detect-interface: true
 EOF
-\telse
-\t\tcat <<EOF >> "$run_config"
+	else
+		cat <<EOF >> "$run_config"
 tun:
   enable: false
 EOF
-\tfi
+	fi
 
-\t# Inject controlled access rules from UCI (highest priority, first-match).
-\tlocal rules_file="${run_config}.rules"
-\temit_access_rules_yaml > "$rules_file"
-\tif [ -s "$rules_file" ]; then
-\t\tif grep -q '^rules:' "$run_config"; then
-\t\t\tlocal tmpf="${run_config}.rules2"
-\t\t\tawk -v f="$rules_file" '
-\t\t\t\tBEGIN { while ((getline line < f) > 0) buf = buf line "\\n" }
-\t\t\t\t{ print }
-\t\t\t\t/^rules:/ && !done { printf "%s", buf; done=1 }
-\t\t\t' "$run_config" > "$tmpf" && mv "$tmpf" "$run_config"
-\t\telse
-\t\t\tprintf 'rules:\n' >> "$run_config"
-\t\t\tcat "$rules_file" >> "$run_config"
-\t\tfi
-\t\tlogger -t mihomo "Prepared config with UCI access rules"
-\tfi
-\trm -f "$rules_file"
+	# Inject controlled access rules from UCI (highest priority, first-match).
+	local rules_file="${run_config}.rules"
+	emit_access_rules_yaml > "$rules_file"
+	if [ -s "$rules_file" ]; then
+		if grep -q '^rules:' "$run_config"; then
+			local tmpf="${run_config}.rules2"
+			awk -v f="$rules_file" '
+				BEGIN { while ((getline line < f) > 0) buf = buf line "\\n" }
+				{ print }
+				/^rules:/ && !done { printf "%s", buf; done=1 }
+			' "$run_config" > "$tmpf" && mv "$tmpf" "$run_config"
+		else
+			printf 'rules:\n' >> "$run_config"
+			cat "$rules_file" >> "$run_config"
+		fi
+		logger -t mihomo "Prepared config with UCI access rules"
+	fi
+	rm -f "$rules_file"
 
-\techo "SUCCESS: Prepared configuration at $run_config"
-\treturn 0
+	echo "SUCCESS: Prepared configuration at $run_config"
+	return 0
 }
 
 get_proxy_groups() {
-\tif ! curl -s -m 2 "http://127.0.0.1:9090/proxies"; then
-\t\techo "{\\"proxies\\":{}}"
-\tfi
+	if ! curl -s -m 2 "http://127.0.0.1:9090/proxies"; then
+		echo "{\\"proxies\\":{}}"
+	fi
 }
 
 select_node() {
-\tlocal group="$1"
-\tlocal node="$2"
-\tif [ -z "$group" ] || [ -z "$node" ]; then
-\t\techo "ERROR: Group and node name must be specified" >&2
-\t\treturn 1
-\tfi
-\tcurl -s -X PUT \\
-\t\t-H "Content-Type: application/json" \\
-\t\t-d "{\\"name\\":\\"${node}\\"}" \\
-\t\t"http://127.0.0.1:9090/proxies/${group}"
+	local group="$1"
+	local node="$2"
+	if [ -z "$group" ] || [ -z "$node" ]; then
+		echo "ERROR: Group and node name must be specified" >&2
+		return 1
+	fi
+	curl -s -X PUT \\
+		-H "Content-Type: application/json" \\
+		-d "{\\"name\\":\\"${node}\\"}" \\
+		"http://127.0.0.1:9090/proxies/${group}"
 }
 
 get_proxies() {
-\tlocal config_path=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
-\tif [ ! -f "$config_path" ]; then
-\t\tlogger -t mihomo "get_proxies: config file not found at $config_path"
-\t\techo "{\\"error\\":\\"not_found\\", \\"msg\\":\\"本地尚未下载任何订阅配置文件，请点击下方按钮更新订阅。\\"}"
-\t\treturn 0
-\tfi
-\t
-\tlocal size=$(wc -c < "$config_path")
-\tif [ "$size" -lt 10 ]; then
-\t\tlogger -t mihomo "get_proxies: config file empty ($size bytes) at $config_path"
-\t\techo "{\\"error\\":\\"empty\\", \\"msg\\":\\"配置文件内容为空，请重新更新订阅。\\"}"
-\t\treturn 0
-\tfi
-\t
-\tif grep -q -E "<html>|<!DOCTYPE html>" "$config_path"; then
-\t\tlocal title=$(grep -o -E "<title>[^<]+</title>" "$config_path" | sed -e 's/<title>//g' -e 's/<\\/title>//g' | head -n 1)
-\t\t[ -z "$title" ] && title="WAF 拦截或网络错误"
-\t\tlogger -t mihomo "get_proxies: subscription returned an HTML page ($title)"
-\t\techo "{\\"error\\":\\"html\\", \\"msg\\":\\"下载失败：服务器返回了网页内容 (${title})。请检查链接或网络环境。\\"}"
-\t\treturn 0
-\tfi
-\t
-\tlocal nodes=$(awk \'
-\tfunction trim(s){ gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
-\tfunction getf(str, key,   rest, p, q, v){
-\t\tif (match(str, key ":[ \t]*")) {
-\t\t\trest = substr(str, RSTART+RLENGTH)
-\t\t\tif (substr(rest,1,1) == "\\047") { rest=substr(rest,2); p=index(rest,"\\047"); if(p>0) v=substr(rest,1,p-1) }
-\t\t\telse { p=index(rest,","); q=index(rest,"}"); if(p==0||(q>0&&q<p)) p=q; if(p>0) v=substr(rest,1,p-1) }
-\t\t\treturn trim(v)
-\t\t}
-\t\treturn ""
-\t}
-\tBEGIN { print "["; first=1 }
-\t/^proxies:/ { in_p=1; next }
-\tin_p && /^[a-zA-Z]/ && $0 !~ /^[ \t]/ { in_p=0 }
-\tin_p {
-\t\tif ($0 ~ /^[ \t]*-/) {
-\t\t\tif (name != "") { if(!first) printf ","; first=0; printf("  {\\042name\\042:\\042%s\\042,\\042type\\042:\\042%s\\042,\\042server\\042:\\042%s\\042}", name, type, server) }
-\t\t\tname=""; type=""; server=""
-\t\t\ts = $0; sub(/^[ \t]*-[ \t]*/, "", s)
-\t\t\tif (s ~ /\\{/) {
-\t\t\t\tname=getf(s,"name"); type=getf(s,"type"); server=getf(s,"server")
-\t\t\t\tif (name != "") { if(!first) printf ","; first=0; printf("  {\\042name\\042:\\042%s\\042,\\042type\\042:\\042%s\\042,\\042server\\042:\\042%s\\042}", name, type, server) }
-\t\t\t\tname=""; type=""; server=""
-\t\t\t\tnext
-\t\t\t}
-\t\t\t$0 = s
-\t\t\tif ($0 == "") next
-\t\t}
-\t\tif ($0 ~ /^name:/) { sub(/^name:[ \t]*/, "", $0); name=trim($0) }
-\t\telse if ($0 ~ /^type:/) { sub(/^type:[ \t]*/, "", $0); type=trim($0) }
-\t\telse if ($0 ~ /^server:/) { sub(/^server:[ \t]*/, "", $0); server=trim($0) }
-\t}
-\tEND { if (name != "") { if(!first) printf ","; printf("  {\\042name\\042:\\042%s\\042,\\042type\\042:\\042%s\\042,\\042server\\042:\\042%s\\042}", name, type, server) }; print "]" }
-\t\' "$config_path")
-\t
-\tlocal count=$(printf '%s' "$nodes" | grep -c '"name"')
-\tlogger -t mihomo "get_proxies: parsed $count node(s) from $config_path"
-\t
-\tif [ "$nodes" = "[]" ] || [ "$nodes" = "[
+	restore_subscription_url
+	local config_path=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
+	if [ ! -f "$config_path" ]; then
+		logger -t mihomo "get_proxies: config file not found at $config_path"
+		echo "{\\"error\\":\\"not_found\\", \\"msg\\":\\"本地尚未下载任何订阅配置文件，请点击下方按钮更新订阅。\\"}"
+		return 0
+	fi
+	
+	local size=$(wc -c < "$config_path")
+	if [ "$size" -lt 10 ]; then
+		logger -t mihomo "get_proxies: config file empty ($size bytes) at $config_path"
+		echo "{\\"error\\":\\"empty\\", \\"msg\\":\\"配置文件内容为空，请重新更新订阅。\\"}"
+		return 0
+	fi
+	
+	if grep -q -E "<html>|<!DOCTYPE html>" "$config_path"; then
+		local title=$(grep -o -E "<title>[^<]+</title>" "$config_path" | sed -e 's/<title>//g' -e 's/<\\/title>//g' | head -n 1)
+		[ -z "$title" ] && title="WAF 拦截或网络错误"
+		logger -t mihomo "get_proxies: subscription returned an HTML page ($title)"
+		echo "{\\"error\\":\\"html\\", \\"msg\\":\\"下载失败：服务器返回了网页内容 (${title})。请检查链接或网络环境。\\"}"
+		return 0
+	fi
+	
+	local nodes=$(tr -d '\r' < "$config_path" | awk \'
+	function trim(s){ gsub(/^[ 	]+|[ 	]+$/, "", s); return s }
+	function stripq(s){ if ((substr(s,1,1)=="\\042" && substr(s,length(s),1)=="\\042") || (substr(s,1,1)=="\\047" && substr(s,length(s),1)=="\\047")) s=substr(s,2,length(s)-2); return trim(s) }
+	function getf(str, key,   rest, p, q, v){
+		if (match(str, key ":[ 	]*")) {
+			rest = substr(str, RSTART+RLENGTH)
+			if (substr(rest,1,1) == "\\047") { rest=substr(rest,2); p=index(rest,"\\047"); if(p>0) v=substr(rest,1,p-1) }
+			else { p=index(rest,","); q=index(rest,"}"); if(p==0||(q>0&&q<p)) p=q; if(p>0) v=substr(rest,1,p-1) }
+			return stripq(v)
+		}
+		return ""
+	}
+	BEGIN { print "["; first=1 }
+	/^proxies:/ { in_p=1; next }
+	in_p && /^[a-zA-Z]/ && $0 !~ /^[ 	]/ { in_p=0 }
+	in_p {
+		if ($0 ~ /^[ 	]*-/) {
+			if (name != "") { if(!first) printf ","; first=0; printf("  {\\042name\\042:\\042%s\\042,\\042type\\042:\\042%s\\042,\\042server\\042:\\042%s\\042}", name, type, server) }
+			name=""; type=""; server=""
+			s = $0; sub(/^[ 	]*-[ 	]*/, "", s)
+			if (s ~ /\\{/) {
+				name=getf(s,"name"); type=getf(s,"type"); server=getf(s,"server")
+				if (name != "") { if(!first) printf ","; first=0; printf("  {\\042name\\042:\\042%s\\042,\\042type\\042:\\042%s\\042,\\042server\\042:\\042%s\\042}", name, type, server) }
+				name=""; type=""; server=""
+				next
+			}
+			$0 = s
+			if ($0 == "") next
+		}
+		if ($0 ~ /^[ 	]*name:/) { sub(/^[ 	]*name:[ 	]*/, "", $0); name=stripq($0) }
+		else if ($0 ~ /^[ 	]*type:/) { sub(/^[ 	]*type:[ 	]*/, "", $0); type=stripq($0) }
+		else if ($0 ~ /^[ 	]*server:/) { sub(/^[ 	]*server:[ 	]*/, "", $0); server=stripq($0) }
+	}
+	END { if (name != "") { if(!first) printf ","; printf("  {\\042name\\042:\\042%s\\042,\\042type\\042:\\042%s\\042,\\042server\\042:\\042%s\\042}", name, type, server) }; print "]" }
+	\')
+	
+	local count=$(printf '%s' "$nodes" | grep -c '"name"')
+	logger -t mihomo "get_proxies: parsed $count node(s) from $config_path"
+	
+	if [ "$nodes" = "[]" ] || [ "$nodes" = "[
 ]" ]; then
-\t\tif grep -q "proxies: \\[\\]" "$config_path"; then
-\t\t\techo "{\"error\":\"no_nodes\", \"msg\":\"订阅更新成功，但服务器返回了空的节点列表（已过滤 Hysteria2 等不兼容节点，或订阅已过期）。\"}"
-\t\telse
-\t\t\techo "{\"error\":\"parse_failed\", \"msg\":\"未能解析出任何代理节点，请确认订阅内容是否为合法的 Clash/Mihomo 配置。\"}"
-\t\tfi
-\telse
-\t\techo "$nodes"
-\tfi
+		if grep -q "proxies: \\[\\]" "$config_path"; then
+			echo "{\"error\":\"no_nodes\", \"msg\":\"订阅更新成功，但服务器返回了空的节点列表（已过滤 Hysteria2 等不兼容节点，或订阅已过期）。\"}"
+		else
+			echo "{\"error\":\"parse_failed\", \"msg\":\"未能解析出任何代理节点，请确认订阅内容是否为合法的 Clash/Mihomo 配置。\"}"
+		fi
+	else
+		echo "$nodes"
+	fi
 }
 
 # ---------- 访问日志：实时连接 + 历史采集 + 规则管理 ----------
 
 resolve_host() {
-\tlocal ip="$1"
-\tlocal leases="/tmp/dhcp.leases"
-\t[ -z "$ip" ] && return 0
-\t[ -f "$leases" ] || return 0
-\task -v ip="$ip" '$3==ip { print $4; exit }' "$leases"
+	local ip="$1"
+	local leases="/tmp/dhcp.leases"
+	[ -z "$ip" ] && return 0
+	[ -f "$leases" ] || return 0
+	ask -v ip="$ip" '$3==ip { print $4; exit }' "$leases"
 }
 
 flatten_connections() {
-\tlocal raw="$1"
-\t[ -z "$raw" ] && return 0
-\tlocal ids ips hosts dst policy rule up down start
-\tids=$(echo "$raw" | jsonfilter -e '$.connections[@].id' 2>/dev/null)
-\tips=$(echo "$raw" | jsonfilter -e '$.connections[@].metadata.sourceIP' 2>/dev/null)
-\thosts=$(echo "$raw" | jsonfilter -e '$.connections[@].metadata.host' 2>/dev/null)
-\tdst=$(echo "$raw" | jsonfilter -e '$.connections[@].metadata.destinationIP' 2>/dev/null)
-\tpolicy=$(echo "$raw" | jsonfilter -e '$.connections[@].policy' 2>/dev/null)
-\trule=$(echo "$raw" | jsonfilter -e '$.connections[@].rule' 2>/dev/null)
-\tup=$(echo "$raw" | jsonfilter -e '$.connections[@].upload' 2>/dev/null)
-\tdown=$(echo "$raw" | jsonfilter -e '$.connections[@].download' 2>/dev/null)
-\tstart=$(echo "$raw" | jsonfilter -e '$.connections[@].start' 2>/dev/null)
-\techo "$ids" | nl -ba | while read -r n id; do
-\t\t[ -z "$id" ] && continue
-\t\tlocal ip host d pol r u dn st
-\t\tip=$(echo "$ips" | sed -n "${n}p")
-\t\thost=$(echo "$hosts" | sed -n "${n}p")
-\t\td=$(echo "$dst" | sed -n "${n}p")
-\t\tpol=$(echo "$policy" | sed -n "${n}p")
-\t\tr=$(echo "$rule" | sed -n "${n}p")
-\t\tu=$(echo "$up" | sed -n "${n}p")
-\t\tdn=$(echo "$down" | sed -n "${n}p")
-\t\tst=$(echo "$start" | sed -n "${n}p")
-\t\tlocal dev
-\t\tdev=$(resolve_host "$ip")
-\t\t[ -z "$host" ] && host="$d"
-\t\techo "${id}|${ip}|${dev}|${host}|${d}|${pol}|${r}|${u}|${dn}|${st}"
-\tdone
+	local raw="$1"
+	[ -z "$raw" ] && return 0
+	local ids ips hosts dst policy rule up down start
+	ids=$(echo "$raw" | jsonfilter -e '$.connections[@].id' 2>/dev/null)
+	ips=$(echo "$raw" | jsonfilter -e '$.connections[@].metadata.sourceIP' 2>/dev/null)
+	hosts=$(echo "$raw" | jsonfilter -e '$.connections[@].metadata.host' 2>/dev/null)
+	dst=$(echo "$raw" | jsonfilter -e '$.connections[@].metadata.destinationIP' 2>/dev/null)
+	policy=$(echo "$raw" | jsonfilter -e '$.connections[@].policy' 2>/dev/null)
+	rule=$(echo "$raw" | jsonfilter -e '$.connections[@].rule' 2>/dev/null)
+	up=$(echo "$raw" | jsonfilter -e '$.connections[@].upload' 2>/dev/null)
+	down=$(echo "$raw" | jsonfilter -e '$.connections[@].download' 2>/dev/null)
+	start=$(echo "$raw" | jsonfilter -e '$.connections[@].start' 2>/dev/null)
+	echo "$ids" | nl -ba | while read -r n id; do
+		[ -z "$id" ] && continue
+		local ip host d pol r u dn st
+		ip=$(echo "$ips" | sed -n "${n}p")
+		host=$(echo "$hosts" | sed -n "${n}p")
+		d=$(echo "$dst" | sed -n "${n}p")
+		pol=$(echo "$policy" | sed -n "${n}p")
+		r=$(echo "$rule" | sed -n "${n}p")
+		u=$(echo "$up" | sed -n "${n}p")
+		dn=$(echo "$down" | sed -n "${n}p")
+		st=$(echo "$start" | sed -n "${n}p")
+		local dev
+		dev=$(resolve_host "$ip")
+		[ -z "$host" ] && host="$d"
+		echo "${id}|${ip}|${dev}|${host}|${d}|${pol}|${r}|${u}|${dn}|${st}"
+	done
 }
 
 get_connections() {
-\tlocal raw
-\traw=$(curl -s --connect-timeout 2 http://127.0.0.1:9090/connections 2>/dev/null)
-\tif [ -z "$raw" ]; then
-\t\techo "{\\"error\\":\\"no_core\\", \\"msg\\":\\"无法连接 Mihomo 控制器 (9090)，请确认核心已启动。\\"}"
-\t\treturn 0
-\tfi
-\techo "["
-\tfirst=1
-\tflatten_connections "$raw" | while IFS='|' read -r id ip dev host d pol r u dn st; do
-\t\t[ -z "$id" ] && continue
-\t\tif [ $first -eq 0 ]; then printf ','; fi
-\t\tfirst=0
-\t\tprintf '{"id":"%s","ip":"%s","device":"%s","domain":"%s","dst":"%s","policy":"%s","rule":"%s","up":%s,"down":%s,"start":"%s"}' "$id" "$ip" "$dev" "$host" "$d" "$pol" "$r" "${u:-0}" "${dn:-0}" "$st"
-\tdone
-\techo "]"
+	local raw
+	raw=$(curl -s --connect-timeout 2 http://127.0.0.1:9090/connections 2>/dev/null)
+	if [ -z "$raw" ]; then
+		echo "{\\"error\\":\\"no_core\\", \\"msg\\":\\"无法连接 Mihomo 控制器 (9090)，请确认核心已启动。\\"}"
+		return 0
+	fi
+	echo "["
+	first=1
+	flatten_connections "$raw" | while IFS='|' read -r id ip dev host d pol r u dn st; do
+		[ -z "$id" ] && continue
+		if [ $first -eq 0 ]; then printf ','; fi
+		first=0
+		printf '{"id":"%s","ip":"%s","device":"%s","domain":"%s","dst":"%s","policy":"%s","rule":"%s","up":%s,"down":%s,"start":"%s"}' "$id" "$ip" "$dev" "$host" "$d" "$pol" "$r" "${u:-0}" "${dn:-0}" "$st"
+	done
+	echo "]"
 }
 
 collect_connections() {
-\tlocal raw logf seenf
-\tlogf="/tmp/mihomo_access.log"
-\tseenf="/tmp/mihomo_access.seen"
-\traw=$(curl -s --connect-timeout 2 http://127.0.0.1:9090/connections 2>/dev/null)
-\t[ -z "$raw" ] && return 0
-\ttouch "$seenf"
-\tflatten_connections "$raw" | while IFS='|' read -r id ip dev host d pol r u dn st; do
-\t\t[ -z "$id" ] && continue
-\t\tgrep -qxF "$id" "$seenf" && continue
-\t\techo "$id" >> "$seenf"
-\t\tlocal ts
-\t\tts=$(date +%s)
-\t\tprintf '{"ts":%s,"id":"%s","ip":"%s","device":"%s","domain":"%s","dst":"%s","policy":"%s","rule":"%s","up":%s,"down":%s,"start":"%s"}' "$ts" "$id" "$ip" "$dev" "$host" "$d" "$pol" "$r" "${u:-0}" "${dn:-0}" "$st" >> "$logf"
-\tdone
-\ttail -n 2000 "$seenf" > "$seenf.tmp" && mv "$seenf.tmp" "$seenf"
+	local raw logf seenf
+	logf="/tmp/mihomo_access.log"
+	seenf="/tmp/mihomo_access.seen"
+	raw=$(curl -s --connect-timeout 2 http://127.0.0.1:9090/connections 2>/dev/null)
+	[ -z "$raw" ] && return 0
+	touch "$seenf"
+	flatten_connections "$raw" | while IFS='|' read -r id ip dev host d pol r u dn st; do
+		[ -z "$id" ] && continue
+		grep -qxF "$id" "$seenf" && continue
+		echo "$id" >> "$seenf"
+		local ts
+		ts=$(date +%s)
+		printf '{"ts":%s,"id":"%s","ip":"%s","device":"%s","domain":"%s","dst":"%s","policy":"%s","rule":"%s","up":%s,"down":%s,"start":"%s"}' "$ts" "$id" "$ip" "$dev" "$host" "$d" "$pol" "$r" "${u:-0}" "${dn:-0}" "$st" >> "$logf"
+	done
+	tail -n 2000 "$seenf" > "$seenf.tmp" && mv "$seenf.tmp" "$seenf"
 }
 
 # URL-encode a string for use in an HTTP path (POSIX shell, no bashisms).
 urlencode() {
-\tlocal s="$1" out=""
-\twhile [ -n "$s" ]; do
-\t\tlocal c="${s%"${s#?}"}"
-\t\tcase "$c" in
-\t\t\t[a-zA-Z0-9.~_-]) out="${out}${c}" ;;
-\t\t\t' ') out="${out}%20" ;;
-\t\t\t*) out="${out}$(printf '%%%02X' "'$c")" ;;
-\t\tesac
-\t\ts="${s#?}"
-\tdone
-\techo "$out"
+	if command -v od >/dev/null 2>&1; then
+		printf '%s' "$1" | tr -d '\r' | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g'
+		printf '\n'
+		return
+	fi
+	local in c val hex out=""
+	in=$(printf '%s' "$1" | tr -d '\r')
+	out=""
+	while [ -n "$in" ]; do
+		c=${in%"${in#?}"}
+		in=${in#?}
+		case "$c" in
+			[A-Za-z0-9._~-]) out="$out$c" ;;
+			*)
+				val=$(printf '%d' "'$c" 2>/dev/null)
+				if [ -n "$val" ]; then
+					hex=$(printf '%02X' "$val")
+					out="$out%$hex"
+				else
+					out="$out$c"
+				fi ;;
+		esac
+	done
+	printf '%s' "$out"
+	printf '\n'
+}
+
+# Resolve the exact proxy name Mihomo registered, by matching the requested name
+# (after stripping quotes/CR/whitespace) against the controller's /proxies list.
+# This tolerates YAML-parsing mismatches between the subscription file and the
+# running config (e.g. quoted or CRLF-terminated names). Echoes the real name.
+resolve_proxy_name() {
+	local want="$1"
+	local norm_want
+	norm_want=$(printf '%s' "$want" | tr -d '\r' | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | tr -d ' ')
+	[ -z "$norm_want" ] && return 0
+	curl -s --connect-timeout 5 --max-time 8 "http://127.0.0.1:9090/proxies" 2>/dev/null \
+		| grep -o -E '"name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+		| sed -e 's/^"name"[[:space:]]*:[[:space:]]*//' -e 's/^"//' -e 's/"$//' \
+		| while read -r p; do
+			[ -z "$p" ] && continue
+			if [ "$p" = "$want" ]; then echo "$p"; return 0; fi
+			local n
+			n=$(printf '%s' "$p" | tr -d '\r' | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | tr -d ' ')
+			[ "$n" = "$norm_want" ] && { echo "$p"; return 0; }
+		done
+	return 0
 }
 
 test_node_delay() {
-\tlocal name="$1"
-\t[ -z "$name" ] && { echo '{"delay":-1,"msg":"name required"}'; return 0; }
-\t# 测试目标 URL：优先 UCI 配置，其次环境变量，最后默认。
-\t# 某些网络环境下默认地址不可达会导致所有节点都显示失败，故开放为可配置项。
-\tlocal test_url
-\ttest_url=$(uci -q get mihomo.config.test_url)
-\t[ -z "$test_url" ] && test_url="${MIHOMO_TEST_URL:-https://www.gstatic.com/generate_204}"
-\tlocal timeout=5000
-\tlocal enc url_enc body code
-\tenc=$(urlencode "$name")
-\turl_enc=$(urlencode "$test_url")
-\tbody=$(mktemp)
-\tcode=$(curl -s -o "$body" -w '%{http_code}' --connect-timeout 5 --max-time $((timeout / 1000 + 5)) "http://127.0.0.1:9090/proxies/${enc}/delay?url=${url_enc}&timeout=${timeout}" 2>/dev/null)
-\tif [ -z "$code" ] || [ "$code" = "000" ]; then
-\t\techo '{"delay":-1,"msg":"controller_unreachable"}'
-\t\trm -f "$body"
-\t\treturn 0
-\tfi
-\tcat "$body"
-\trm -f "$body"
+	local name="$1"
+	[ -z "$name" ] && { echo '{"delay":-1,"msg":"name required"}'; return 0; }
+	# 测试目标 URL：优先 UCI 配置，其次环境变量，最后默认。
+	# 某些网络环境下默认地址不可达会导致所有节点都显示失败，故开放为可配置项。
+	local test_url
+	test_url=$(uci -q get mihomo.config.test_url)
+	[ -z "$test_url" ] && test_url="${MIHOMO_TEST_URL:-https://www.gstatic.com/generate_204}"
+	local timeout=5000
+	local enc url_enc body code
+	# 去除可能混入的回车符（CRLF 订阅），避免名称不匹配
+	name=$(printf '%s' "$name" | tr -d '\r')
+	enc=$(urlencode "$name")
+	url_enc=$(urlencode "$test_url")
+	local core_running=no core_proxies=-1
+	if pidof mihomo >/dev/null 2>&1; then core_running=yes; fi
+	core_proxies=$(curl -s --connect-timeout 3 --max-time 5 "http://127.0.0.1:9090/proxies" 2>/dev/null | grep -o -E '"name"[[:space:]]*:' | wc -l | tr -d ' ')
+	logger -t mihomo "test_node_delay: name='$name' enc='$enc' test_url='$test_url' core_running=$core_running core_proxy_count=$core_proxies"
+	body=$(mktemp)
+	code=$(curl -s -o "$body" -w '%{http_code}' --connect-timeout 5 --max-time $((timeout / 1000 + 5)) "http://127.0.0.1:9090/proxies/${enc}/delay?url=${url_enc}&timeout=${timeout}" 2>/dev/null)
+	if [ -z "$code" ] || [ "$code" = "000" ]; then
+		echo '{"delay":-1,"msg":"controller_unreachable"}'
+		rm -f "$body"
+		return 0
+	fi
+	local msg=""
+	msg=$(grep -o -E '"message"[[:space:]]*:[[:space:]]*"[^"]*"' "$body" | head -n1 | sed -e 's/^"message"[[:space:]]*:[[:space:]]*//' -e 's/^"//' -e 's/"$//')
+	if [ "$code" != "200" ] && { [ "$msg" = "Resource not found" ] || [ "$msg" = "proxy not found" ]; }; then
+		local real=""
+		real=$(resolve_proxy_name "$name")
+		local avail=""
+		avail=$(curl -s --connect-timeout 3 --max-time 5 "http://127.0.0.1:9090/proxies" 2>/dev/null | grep -o -E '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -e 's/^"name"[[:space:]]*:[[:space:]]*//' -e 's/^"//' -e 's/"$//' | head -n 20 | tr '\n' '|')
+		logger -t mihomo "test_node_delay: '$name' -> $msg; resolved='$real'; core_has_proxies='$avail'"
+		if [ -n "$real" ] && [ "$real" != "$name" ]; then
+			name="$real"
+			enc=$(urlencode "$name")
+			code=$(curl -s -o "$body" -w '%{http_code}' --connect-timeout 5 --max-time $((timeout / 1000 + 5)) "http://127.0.0.1:9090/proxies/${enc}/delay?url=${url_enc}&timeout=${timeout}" 2>/dev/null)
+		fi
+	fi
+	cat "$body"
+	rm -f "$body"
+}
+
+# Test the delay of every node in one shot. The dashboard used to fire one
+# fs.exec per node (30 concurrent calls), which rpcd/file-exec cannot serve
+# reliably and every call timed out. This runs all tests in the backend with
+# bounded parallelism and returns a single JSON array aligned by index with
+# the node order reported by get_proxies.
+test_all_nodes() {
+	local test_url="$1"
+	[ -z "$test_url" ] && test_url=$(uci -q get mihomo.config.test_url)
+	[ -z "$test_url" ] && test_url="${MIHOMO_TEST_URL:-https://www.gstatic.com/generate_204}"
+	local timeout=5000
+	local nodes_json name enc url_enc resp delay msg tmpd i
+	nodes_json=$(get_proxies 2>/dev/null)
+	[ -z "$nodes_json" ] && { echo "[]"; return 0; }
+	tmpd=$(mktemp -d)
+	printf '%s' "$nodes_json" | grep -o '"name":"[^"]*"' | sed 's/"name":"//; s/"$//' > "$tmpd/names"
+	i=0
+	while IFS= read -r name; do
+		[ -z "$name" ] && continue
+		i=$((i + 1))
+		(
+			enc=$(urlencode "$name")
+			url_enc=$(urlencode "$test_url")
+			resp=$(curl -s -m $((timeout / 1000 + 5)) "http://127.0.0.1:9090/proxies/${enc}/delay?url=${url_enc}&timeout=${timeout}" 2>/dev/null)
+			delay=$(printf '%s' "$resp" | grep -o '"delay"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
+			msg=$(printf '%s' "$resp" | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*:"//; s/"$//')
+			if [ -n "$delay" ] && [ "$delay" -ge 0 ] 2>/dev/null; then
+				printf '{"delay":%s}' "$delay" > "$tmpd/$i"
+			else
+				printf '{"delay":-1,"msg":"%s"}' "${msg:-timeout}" > "$tmpd/$i"
+			fi
+		) &
+	done < "$tmpd/names"
+	wait
+	echo "["
+	first=1
+	for f in $(ls "$tmpd" | grep -v '^names$' | sort -n); do
+		[ "$first" -eq 0 ] && printf ','
+		first=0
+		cat "$tmpd/$f"
+	done
+	echo "]"
+	rm -rf "$tmpd"
 }
 
 get_history() {
-\tlocal logf="/tmp/mihomo_access.log"
-\tlocal limit="${1:-200}"
-\t[ -f "$logf" ] || { echo "[]"; return 0; }
-\techo "["
-\tfirst=1
-\ttail -n "$limit" "$logf" | tac | while read -r line; do
-\t\t[ -z "$line" ] && continue
-\t\tif [ $first -eq 0 ]; then printf ','; fi
-\t\tfirst=0
-\t\tprintf '%s' "$line"
-\tdone
-\techo "]"
+	local logf="/tmp/mihomo_access.log"
+	local limit="${1:-200}"
+	[ -f "$logf" ] || { echo "[]"; return 0; }
+	echo "["
+	first=1
+	tail -n "$limit" "$logf" | tac | while read -r line; do
+		[ -z "$line" ] && continue
+		if [ $first -eq 0 ]; then printf ','; fi
+		first=0
+		printf '%s' "$line"
+	done
+	echo "]"
 }
 
 get_access_rules() {
-\techo "["
-\tfirst=1
-\tlocal sids
-\tsids=$(uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=mihomo_rule$/\\1/p')
-\tfor sid in $sids; do
-\t\tlocal ip domain action group enabled comment
-\t\tip=$(uci -q get mihomo.$sid.src_ip)
-\t\tdomain=$(uci -q get mihomo.$sid.domain)
-\t\taction=$(uci -q get mihomo.$sid.action)
-\t\tgroup=$(uci -q get mihomo.$sid.group)
-\t\tenabled=$(uci -q get mihomo.$sid.enabled)
-\t\tcomment=$(uci -q get mihomo.$sid.comment)
-\t\t[ -z "$domain" ] && continue
-\t\tif [ $first -eq 0 ]; then printf ','; fi
-\t\tfirst=0
-\t\tprintf '{"sid":"%s","ip":"%s","domain":"%s","action":"%s","group":"%s","enabled":"%s","comment":"%s"}' "$sid" "$ip" "$domain" "$action" "$group" "$enabled" "$comment"
-\tdone
-\techo "]"
+	echo "["
+	first=1
+	local sids
+	sids=$(uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=mihomo_rule$/\\1/p')
+	for sid in $sids; do
+		local ip domain action group enabled comment
+		ip=$(uci -q get mihomo.$sid.src_ip)
+		domain=$(uci -q get mihomo.$sid.domain)
+		action=$(uci -q get mihomo.$sid.action)
+		group=$(uci -q get mihomo.$sid.group)
+		enabled=$(uci -q get mihomo.$sid.enabled)
+		comment=$(uci -q get mihomo.$sid.comment)
+		[ -z "$domain" ] && continue
+		if [ $first -eq 0 ]; then printf ','; fi
+		first=0
+		printf '{"sid":"%s","ip":"%s","domain":"%s","action":"%s","group":"%s","enabled":"%s","comment":"%s"}' "$sid" "$ip" "$domain" "$action" "$group" "$enabled" "$comment"
+	done
+	echo "]"
 }
 
 add_access_rule() {
-\tlocal ip="$1" domain="$2" action="$3" group="$4"
-\t[ -z "$domain" ] && { echo "ERROR: domain required" >&2; return 1; }
-\t[ -z "$action" ] && action="block"
-\tlocal sid
-\tsid=$(uci add mihomo mihomo_rule)
-\tuci -q set mihomo.$sid.src_ip="$ip"
-\tuci -q set mihomo.$sid.domain="$domain"
-\tuci -q set mihomo.$sid.action="$action"
-\t[ -n "$group" ] && uci -q set mihomo.$sid.group="$group"
-\tuci -q set mihomo.$sid.enabled="1"
-\tuci commit mihomo
-\tlogger -t mihomo "access_rule added: ip=$ip domain=$domain action=$action"
-\techo "OK"
+	local ip="$1" domain="$2" action="$3" group="$4"
+	[ -z "$domain" ] && { echo "ERROR: domain required" >&2; return 1; }
+	[ -z "$action" ] && action="block"
+	local sid
+	sid=$(uci add mihomo mihomo_rule)
+	uci -q set mihomo.$sid.src_ip="$ip"
+	uci -q set mihomo.$sid.domain="$domain"
+	uci -q set mihomo.$sid.action="$action"
+	[ -n "$group" ] && uci -q set mihomo.$sid.group="$group"
+	uci -q set mihomo.$sid.enabled="1"
+	uci commit mihomo
+	logger -t mihomo "access_rule added: ip=$ip domain=$domain action=$action"
+	echo "OK"
 }
 
 del_access_rule() {
-\tlocal sid="$1"
-\t[ -z "$sid" ] && { echo "ERROR: sid required" >&2; return 1; }
-\tuci -q delete mihomo.$sid
-\tuci commit mihomo
-\tlogger -t mihomo "access_rule deleted: $sid"
-\techo "OK"
+	local sid="$1"
+	[ -z "$sid" ] && { echo "ERROR: sid required" >&2; return 1; }
+	uci -q delete mihomo.$sid
+	uci commit mihomo
+	logger -t mihomo "access_rule deleted: $sid"
+	echo "OK"
 }
 
 case "$1" in
-\tget_arch)
-\t\tget_arch
-\t\t;;
-\tcheck_core)
-\t\tcheck_core
-\t\t;;
-\tdownload_core)
-\t\tdownload_core "$2"
-\t\t;;
-\tupdate_subscription)
-\t\tupdate_subscription "$2"
-\t\t;;
-\tprepare_config)
-\t\tprepare_config
-\t\t;;
-\tget_proxies)
-\t\tget_proxies
-\t\t;;
-\ttest_node_delay)
-\t\ttest_node_delay "$2"
-\t\t;;
-\tget_proxy_groups)
-\t\tget_proxy_groups
-\t\t;;
-\tselect_node)
-\t\tselect_node "$2" "$3"
-\t\t;;
-\tget_connections)
-\t\tget_connections
-\t\t;;
-\tcollect_connections)
-\t\tcollect_connections
-\t\t;;
-\tget_history)
-\t\tget_history "$2"
-\t\t;;
-\tget_access_rules)
-\t\tget_access_rules
-\t\t;;
-\tadd_access_rule)
-\t\tadd_access_rule "$2" "$3" "$4" "$5"
-\t\t;;
-\tdel_access_rule)
-\t\tdel_access_rule "$2"
-\t\t;;
-\t*)
-\t\techo "Usage: $0 {get_arch|check_core|download_core|update_subscription|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|get_history|get_access_rules|add_access_rule|del_access_rule|test_node_delay}"
-\t\texit 1
-\t\t;;
+	get_arch)
+		get_arch
+		;;
+	check_core)
+		check_core
+		;;
+	download_core)
+		download_core "$2"
+		;;
+	update_subscription)
+		update_subscription "$2"
+		;;
+	clear_subscription)
+		clear_subscription
+		;;
+	save_subscription_url)
+		save_subscription_url "$2"
+		;;
+	auto_update_now)
+		auto_update_now
+		;;
+	auto_update_loop)
+		auto_update_loop
+		;;
+	get_schedule)
+		get_schedule
+		;;
+	prepare_config)
+		prepare_config
+		;;
+	get_proxies)
+		get_proxies
+		;;
+	test_node_delay)
+		test_node_delay "$2"
+		;;
+	test_all_nodes)
+		test_all_nodes "$2"
+		;;
+	get_proxy_groups)
+		get_proxy_groups
+		;;
+	select_node)
+		select_node "$2" "$3"
+		;;
+	get_connections)
+		get_connections
+		;;
+	collect_connections)
+		collect_connections
+		;;
+	get_history)
+		get_history "$2"
+		;;
+	get_access_rules)
+		get_access_rules
+		;;
+	add_access_rule)
+		add_access_rule "$2" "$3" "$4" "$5"
+		;;
+	del_access_rule)
+		del_access_rule "$2"
+		;;
+	*)
+		echo "Usage: $0 {get_arch|check_core|download_core|update_subscription|clear_subscription|save_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|get_history|get_access_rules|add_access_rule|del_access_rule|test_node_delay|test_all_nodes}"
+		exit 1
+		;;
 esac
 """,
 
@@ -869,349 +1112,349 @@ esac
 'require uci';
 
 function esc(s) {
-\treturn String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
-\t\treturn { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-\t});
+	return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+		return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+	});
 }
 
 function fmt_time(ts) {
-\tif (!ts) return '';
-\ttry {
-\t\tvar d = new Date(ts * 1000);
-\t\treturn d.toLocaleString();
-\t} catch (e) { return String(ts); }
+	if (!ts) return '';
+	try {
+		var d = new Date(ts * 1000);
+		return d.toLocaleString();
+	} catch (e) { return String(ts); }
 }
 
 function fmt_bytes(n) {
-\tn = Number(n) || 0;
-\tif (n < 1024) return n + ' B';
-\tif (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
-\tif (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
-\treturn (n / 1073741824).toFixed(2) + ' GB';
+	n = Number(n) || 0;
+	if (n < 1024) return n + ' B';
+	if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+	if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+	return (n / 1073741824).toFixed(2) + ' GB';
 }
 
 return view.extend({
-\tload: function() {
-\t\treturn uci.load('mihomo').then(function() {
-\t\t\treturn Promise.all([
-\t\t\t\tfs.exec('/usr/share/mihomo/helper.sh', ['get_connections']).catch(function() { return { stdout: '[]' }; }),
-\t\t\t\tfs.exec('/usr/share/mihomo/helper.sh', ['get_history', '300']).catch(function() { return { stdout: '[]' }; }),
-\t\t\t\tfs.exec('/usr/share/mihomo/helper.sh', ['get_access_rules']).catch(function() { return { stdout: '[]' }; }),
-\t\t\t\tfs.exec('/usr/share/mihomo/helper.sh', ['get_proxy_groups']).catch(function() { return { stdout: '{"proxies":{}}' }; })
-\t\t\t]);
-\t\t});
-\t},
+	load: function() {
+		return uci.load('mihomo').then(function() {
+			return Promise.all([
+				fs.exec('/usr/share/mihomo/helper.sh', ['get_connections']).catch(function() { return { stdout: '[]' }; }),
+				fs.exec('/usr/share/mihomo/helper.sh', ['get_history', '300']).catch(function() { return { stdout: '[]' }; }),
+				fs.exec('/usr/share/mihomo/helper.sh', ['get_access_rules']).catch(function() { return { stdout: '[]' }; }),
+				fs.exec('/usr/share/mihomo/helper.sh', ['get_proxy_groups']).catch(function() { return { stdout: '{"proxies":{}}' }; })
+			]);
+		});
+	},
 
-\trender: function(results) {
-\t\tvar self = this;
-\t\tif (self._timer) { clearInterval(self._timer); self._timer = null; }
+	render: function(results) {
+		var self = this;
+		if (self._timer) { clearInterval(self._timer); self._timer = null; }
 
-\t\tvar conn_raw = (results[0] && results[0].stdout) ? results[0].stdout.trim() : '[]';
-\t\tvar hist_raw = (results[1] && results[1].stdout) ? results[1].stdout.trim() : '[]';
-\t\tvar rules_raw = (results[2] && results[2].stdout) ? results[2].stdout.trim() : '[]';
-\t\tvar groups_raw = (results[3] && results[3].stdout) ? results[3].stdout.trim() : '{"proxies":{}}';
+		var conn_raw = (results[0] && results[0].stdout) ? results[0].stdout.trim() : '[]';
+		var hist_raw = (results[1] && results[1].stdout) ? results[1].stdout.trim() : '[]';
+		var rules_raw = (results[2] && results[2].stdout) ? results[2].stdout.trim() : '[]';
+		var groups_raw = (results[3] && results[3].stdout) ? results[3].stdout.trim() : '{"proxies":{}}';
 
-\t\tvar connections = [];
-\t\tvar conn_error = null;
-\t\ttry {
-\t\t\tvar cj = JSON.parse(conn_raw);
-\t\t\tif (cj && cj.error) conn_error = cj.msg;
-\t\t\telse connections = cj;
-\t\t} catch (e) { conn_error = _('无法解析实时连接数据。'); }
+		var connections = [];
+		var conn_error = null;
+		try {
+			var cj = JSON.parse(conn_raw);
+			if (cj && cj.error) conn_error = cj.msg;
+			else connections = cj;
+		} catch (e) { conn_error = _('无法解析实时连接数据。'); }
 
-\t\tvar history = [];
-\t\ttry { history = JSON.parse(hist_raw); } catch (e) { history = []; }
+		var history = [];
+		try { history = JSON.parse(hist_raw); } catch (e) { history = []; }
 
-\t\tvar rules = [];
-\t\ttry { rules = JSON.parse(rules_raw); } catch (e) { rules = []; }
+		var rules = [];
+		try { rules = JSON.parse(rules_raw); } catch (e) { rules = []; }
 
-\t\tvar proxy_groups = {};
-\t\ttry { proxy_groups = JSON.parse(groups_raw).proxies || {}; } catch (e) { proxy_groups = {}; }
+		var proxy_groups = {};
+		try { proxy_groups = JSON.parse(groups_raw).proxies || {}; } catch (e) { proxy_groups = {}; }
 
-\t\tvar group_names = [];
-\t\tfor (var gk in proxy_groups) {
-\t\t\tif (proxy_groups[gk] && proxy_groups[gk].type === 'Selector') group_names.push(gk);
-\t\t}
+		var group_names = [];
+		for (var gk in proxy_groups) {
+			if (proxy_groups[gk] && proxy_groups[gk].type === 'Selector') group_names.push(gk);
+		}
 
-\t\tfunction add_rule(ip, domain, action, group) {
-\t\t\tvar args = ['add_access_rule', ip || '', domain, action];
-\t\t\tif (group) args.push(group);
-\t\t\tui.addNotification(null, E('p', _('正在添加规则：') + esc(domain) + ' -> ' + action), 'info');
-\t\t\treturn fs.exec('/usr/share/mihomo/helper.sh', args).then(function(res) {
-\t\t\t\tif (res.code === 0) {
-\t\t\t\t\tui.addNotification(null, E('p', _('规则已保存（需重启核心后生效）。')), 'info');
-\t\t\t\t\trender_rules();
-\t\t\t\t} else {
-\t\t\t\t\tui.addNotification(null, E('p', _('添加失败：') + (res.stderr || res.stdout || '')), 'danger');
-\t\t\t\t}
-\t\t\t}).catch(function(err) {
-\t\t\t\tui.addNotification(null, E('p', _('通信错误：') + err.message), 'danger');
-\t\t\t});
-\t\t}
+		function add_rule(ip, domain, action, group) {
+			var args = ['add_access_rule', ip || '', domain, action];
+			if (group) args.push(group);
+			ui.addNotification(null, E('p', _('正在添加规则：') + esc(domain) + ' -> ' + action), 'info');
+			return fs.exec('/usr/share/mihomo/helper.sh', args).then(function(res) {
+				if (res.code === 0) {
+					ui.addNotification(null, E('p', _('规则已保存（需重启核心后生效）。')), 'info');
+					render_rules();
+				} else {
+					ui.addNotification(null, E('p', _('添加失败：') + (res.stderr || res.stdout || '')), 'danger');
+				}
+			}).catch(function(err) {
+				ui.addNotification(null, E('p', _('通信错误：') + err.message), 'danger');
+			});
+		}
 
-\t\tfunction del_rule(sid) {
-\t\t\treturn fs.exec('/usr/share/mihomo/helper.sh', ['del_access_rule', sid]).then(function(res) {
-\t\t\t\tif (res.code === 0) {
-\t\t\t\t\tui.addNotification(null, E('p', _('规则已删除（需重启核心后生效）。')), 'info');
-\t\t\t\t\trender_rules();
-\t\t\t\t} else {
-\t\t\t\t\tui.addNotification(null, E('p', _('删除失败：') + (res.stderr || res.stdout || '')), 'danger');
-\t\t\t\t}
-\t\t\t}).catch(function(err) {
-\t\t\t\tui.addNotification(null, E('p', _('通信错误：') + err.message), 'danger');
-\t\t\t});
-\t\t}
+		function del_rule(sid) {
+			return fs.exec('/usr/share/mihomo/helper.sh', ['del_access_rule', sid]).then(function(res) {
+				if (res.code === 0) {
+					ui.addNotification(null, E('p', _('规则已删除（需重启核心后生效）。')), 'info');
+					render_rules();
+				} else {
+					ui.addNotification(null, E('p', _('删除失败：') + (res.stderr || res.stdout || '')), 'danger');
+				}
+			}).catch(function(err) {
+				ui.addNotification(null, E('p', _('通信错误：') + err.message), 'danger');
+			});
+		}
 
-\t\tfunction btn(label, cls, fn) {
-\t\t\treturn E('button', { 'class': 'cbi-button ' + cls, 'style': 'margin: 1px 2px; padding: 2px 8px;', 'click': function(ev) {
-\t\t\t\tev.preventDefault(); fn();
-\t\t\t} }, label);
-\t\t}
+		function btn(label, cls, fn) {
+			return E('button', { 'class': 'cbi-button ' + cls, 'style': 'margin: 1px 2px; padding: 2px 8px;', 'click': function(ev) {
+				ev.preventDefault(); fn();
+			} }, label);
+		}
 
-\t\tfunction conn_rows_html(list, with_ip) {
-\t\t\tif (!list || !list.length) return '<tr><td colspan="5" style="text-align:center;color:#999;padding:15px;">' + _('暂无数据') + '</td></tr>';
-\t\t\tvar rows = '';
-\t\t\tfor (var i = 0; i < list.length; i++) {
-\t\t\t\tvar c = list[i];
-\t\t\t\tvar domain = esc(c.domain || c.dst || '-');
-\t\t\t\tvar ip = esc(c.ip || '');
-\t\t\t\tvar dev = esc(c.device || '');
-\t\t\t\tvar policy = esc(c.policy || (c.rule ? c.rule : '-'));
-\t\t\t\tvar traffic = fmt_bytes(c.up) + ' / ' + fmt_bytes(c.down);
-\t\t\t\trows += '<tr>';
-\t\t\t\tif (with_ip) rows += '<td>' + (dev || ip || '-') + '</td>';
-\t\t\t\trows += '<td>' + domain + '</td>';
-\t\t\t\trows += '<td>' + policy + '</td>';
-\t\t\t\trows += '<td>' + traffic + '</td>';
-\t\t\t\trows += '<td>' + btn(_('代理'), 'cbi-button-action', function() { add_rule(ip, c.domain || c.dst, 'proxy', group_names[0]); }) + btn(_('直连'), 'cbi-button-neutral', function() { add_rule(ip, c.domain || c.dst, 'direct'); }) + btn(_('拦截'), 'cbi-button-reset', function() { add_rule(ip, c.domain || c.dst, 'block'); }) + '</td>';
-\t\t\t\trows += '</tr>';
-\t\t\t}
-\t\t\treturn rows;
-\t\t}
+		function conn_rows_html(list, with_ip) {
+			if (!list || !list.length) return '<tr><td colspan="5" style="text-align:center;color:#999;padding:15px;">' + _('暂无数据') + '</td></tr>';
+			var rows = '';
+			for (var i = 0; i < list.length; i++) {
+				var c = list[i];
+				var domain = esc(c.domain || c.dst || '-');
+				var ip = esc(c.ip || '');
+				var dev = esc(c.device || '');
+				var policy = esc(c.policy || (c.rule ? c.rule : '-'));
+				var traffic = fmt_bytes(c.up) + ' / ' + fmt_bytes(c.down);
+				rows += '<tr>';
+				if (with_ip) rows += '<td>' + (dev || ip || '-') + '</td>';
+				rows += '<td>' + domain + '</td>';
+				rows += '<td>' + policy + '</td>';
+				rows += '<td>' + traffic + '</td>';
+				rows += '<td>' + btn(_('代理'), 'cbi-button-action', function() { add_rule(ip, c.domain || c.dst, 'proxy', group_names[0]); }) + btn(_('直连'), 'cbi-button-neutral', function() { add_rule(ip, c.domain || c.dst, 'direct'); }) + btn(_('拦截'), 'cbi-button-reset', function() { add_rule(ip, c.domain || c.dst, 'block'); }) + '</td>';
+				rows += '</tr>';
+			}
+			return rows;
+		}
 
-\t\tfunction render_connections() {
-\t\t\tvar box = document.getElementById('conn-body');
-\t\t\tif (!box) return;
-\t\t\tif (conn_error) {
-\t\t\t\tbox.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#ff4757;padding:15px;">' + esc(conn_error) + '</td></tr>';
-\t\t\t\treturn;
-\t\t\t}
-\t\t\tbox.innerHTML = conn_rows_html(connections, true);
-\t\t}
+		function render_connections() {
+			var box = document.getElementById('conn-body');
+			if (!box) return;
+			if (conn_error) {
+				box.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#ff4757;padding:15px;">' + esc(conn_error) + '</td></tr>';
+				return;
+			}
+			box.innerHTML = conn_rows_html(connections, true);
+		}
 
-\t\tfunction render_history() {
-\t\t\tvar box = document.getElementById('hist-body');
-\t\t\tif (!box) return;
-\t\t\tif (!history.length) {
-\t\t\t\tbox.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999;padding:15px;">' + _('暂无历史记录（核心运行时每 15 秒采集一次）') + '</td></tr>';
-\t\t\t\treturn;
-\t\t\t}
-\t\t\tvar rows = '';
-\t\t\tfor (var i = 0; i < history.length; i++) {
-\t\t\t\tvar h = history[i];
-\t\t\t\tvar domain = esc(h.domain || h.dst || '-');
-\t\t\t\tvar dev = esc(h.device || '');
-\t\t\t\tvar ip = esc(h.ip || '');
-\t\t\t\tvar time = fmt_time(h.ts);
-\t\t\t\tvar policy = esc(h.policy || (h.rule ? h.rule : '-'));
-\t\t\t\trows += '<tr>';
-\t\t\t\trows += '<td>' + time + '</td>';
-\t\t\t\trows += '<td>' + (dev || ip || '-') + '</td>';
-\t\t\t\trows += '<td>' + domain + '</td>';
-\t\t\t\trows += '<td>' + policy + '</td>';
-\t\t\t\trows += '<td>' + btn(_('拦截'), 'cbi-button-reset', function() { add_rule(ip, h.domain || h.dst, 'block'); }) + btn(_('直连'), 'cbi-button-neutral', function() { add_rule(ip, h.domain || h.dst, 'direct'); }) + '</td>';
-\t\t\t\trows += '</tr>';
-\t\t\t}
-\t\t\tbox.innerHTML = rows;
-\t\t}
+		function render_history() {
+			var box = document.getElementById('hist-body');
+			if (!box) return;
+			if (!history.length) {
+				box.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999;padding:15px;">' + _('暂无历史记录（核心运行时每 15 秒采集一次）') + '</td></tr>';
+				return;
+			}
+			var rows = '';
+			for (var i = 0; i < history.length; i++) {
+				var h = history[i];
+				var domain = esc(h.domain || h.dst || '-');
+				var dev = esc(h.device || '');
+				var ip = esc(h.ip || '');
+				var time = fmt_time(h.ts);
+				var policy = esc(h.policy || (h.rule ? h.rule : '-'));
+				rows += '<tr>';
+				rows += '<td>' + time + '</td>';
+				rows += '<td>' + (dev || ip || '-') + '</td>';
+				rows += '<td>' + domain + '</td>';
+				rows += '<td>' + policy + '</td>';
+				rows += '<td>' + btn(_('拦截'), 'cbi-button-reset', function() { add_rule(ip, h.domain || h.dst, 'block'); }) + btn(_('直连'), 'cbi-button-neutral', function() { add_rule(ip, h.domain || h.dst, 'direct'); }) + '</td>';
+				rows += '</tr>';
+			}
+			box.innerHTML = rows;
+		}
 
-\t\tfunction render_rules() {
-\t\t\tvar box = document.getElementById('rule-body');
-\t\t\tif (!box) return;
-\t\t\tif (!rules.length) {
-\t\t\t\tbox.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#999;padding:15px;">' + _('暂无自定义规则') + '</td></tr>';
-\t\t\t\treturn;
-\t\t\t}
-\t\t\tvar rows = '';
-\t\t\tfor (var i = 0; i < rules.length; i++) {
-\t\t\t\tvar r = rules[i];
-\t\t\t\tvar action_label = r.action === 'block' ? _('拦截') : (r.action === 'direct' ? _('直连') : _('代理'));
-\t\t\t\tvar action_color = r.action === 'block' ? '#ff4757' : (r.action === 'direct' ? '#1e90ff' : '#2ed573');
-\t\t\t\trows += '<tr>';
-\t\t\t\trows += '<td>' + esc(r.ip || '*') + '</td>';
-\t\t\t\trows += '<td>' + esc(r.domain) + '</td>';
-\t\t\t\trows += '<td><span style="color:' + action_color + ';font-weight:bold;">' + action_label + '</span>' + (r.group ? ' (' + esc(r.group) + ')' : '') + '</td>';
-\t\t\t\trows += '<td>' + esc(r.comment || '') + '</td>';
-\t\t\t\trows += '<td>' + (r.enabled === '0' ? _('已禁用') : _('启用')) + '</td>';
-\t\t\t\trows += '<td>' + (r.sid ? btn(_('删除'), 'cbi-button-reset', (function(sid) { return function() { del_rule(sid); }; })(r.sid)) : '') + '</td>';
-\t\t\t\trows += '</tr>';
-\t\t\t}
-\t\t\tbox.innerHTML = rows;
-\t\t}
+		function render_rules() {
+			var box = document.getElementById('rule-body');
+			if (!box) return;
+			if (!rules.length) {
+				box.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#999;padding:15px;">' + _('暂无自定义规则') + '</td></tr>';
+				return;
+			}
+			var rows = '';
+			for (var i = 0; i < rules.length; i++) {
+				var r = rules[i];
+				var action_label = r.action === 'block' ? _('拦截') : (r.action === 'direct' ? _('直连') : _('代理'));
+				var action_color = r.action === 'block' ? '#ff4757' : (r.action === 'direct' ? '#1e90ff' : '#2ed573');
+				rows += '<tr>';
+				rows += '<td>' + esc(r.ip || '*') + '</td>';
+				rows += '<td>' + esc(r.domain) + '</td>';
+				rows += '<td><span style="color:' + action_color + ';font-weight:bold;">' + action_label + '</span>' + (r.group ? ' (' + esc(r.group) + ')' : '') + '</td>';
+				rows += '<td>' + esc(r.comment || '') + '</td>';
+				rows += '<td>' + (r.enabled === '0' ? _('已禁用') : _('启用')) + '</td>';
+				rows += '<td>' + (r.sid ? btn(_('删除'), 'cbi-button-reset', (function(sid) { return function() { del_rule(sid); }; })(r.sid)) : '') + '</td>';
+				rows += '</tr>';
+			}
+			box.innerHTML = rows;
+		}
 
-\t\tvar group_options = '';
-\t\tfor (var gi = 0; gi < group_names.length; gi++) {
-\t\t\tgroup_options += '<option value="' + esc(group_names[gi]) + '">' + esc(group_names[gi]) + '</option>';
-\t\t}
+		var group_options = '';
+		for (var gi = 0; gi < group_names.length; gi++) {
+			group_options += '<option value="' + esc(group_names[gi]) + '">' + esc(group_names[gi]) + '</option>';
+		}
 
-\t\tvar rule_form = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
-\t\t\tE('h3', { 'style': 'margin-top: 0; margin-bottom: 15px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, _('新增访问规则')),
-\t\t\tE('div', { 'class': 'cbi-value' }, [
-\t\t\t\tE('label', { 'class': 'cbi-value-title' }, _('域名 / 后缀')),
-\t\t\t\tE('div', { 'class': 'cbi-value-field' }, [
-\t\t\t\t\tE('input', { 'id': 'rule_domain', 'type': 'text', 'class': 'cbi-input-text', 'placeholder': '例如 example.com（按后缀匹配）', 'style': 'width: 60%;' })
-\t\t\t\t])
-\t\t\t]),
-\t\t\tE('div', { 'class': 'cbi-value' }, [
-\t\t\t\tE('label', { 'class': 'cbi-value-title' }, _('来源 IP（选填）')),
-\t\t\t\tE('div', { 'class': 'cbi-value-field' }, [
-\t\t\t\t\tE('input', { 'id': 'rule_ip', 'type': 'text', 'class': 'cbi-input-text', 'placeholder': '留空表示所有设备', 'style': 'width: 60%;' })
-\t\t\t\t])
-\t\t\t]),
-\t\t\tE('div', { 'class': 'cbi-value' }, [
-\t\t\t\tE('label', { 'class': 'cbi-value-title' }, _('动作')),
-\t\t\t\tE('div', { 'class': 'cbi-value-field' }, [
-\t\t\t\t\tE('select', { 'id': 'rule_action', 'class': 'cbi-input-select', 'style': 'width: 200px;' }, [
-\t\t\t\t\t\tE('option', { 'value': 'block' }, _('拦截 (REJECT)')),
-\t\t\t\t\t\tE('option', { 'value': 'direct' }, _('直连 (DIRECT)')),
-\t\t\t\t\t\tE('option', { 'value': 'proxy' }, _('走代理'))
-\t\t\t\t\t]),
-\t\t\t\t\tE('select', { 'id': 'rule_group', 'class': 'cbi-input-select', 'style': 'width: 200px; margin-left:8px;', 'innerHTML': group_options })
-\t\t\t\t])
-\t\t\t]),
-\t\t\tE('div', { 'class': 'cbi-value' }, [
-\t\t\t\tE('label', { 'class': 'cbi-value-title' }, _('备注（选填）')),
-\t\t\t\tE('div', { 'class': 'cbi-value-field' }, [
-\t\t\t\t\tE('input', { 'id': 'rule_comment', 'type': 'text', 'class': 'cbi-input-text', 'style': 'width: 60%;' })
-\t\t\t\t])
-\t\t\t]),
-\t\t\tE('div', { 'class': 'cbi-value' }, [
-\t\t\t\tE('div', { 'class': 'cbi-value-field' }, [
-\t\t\t\t\tbtn(_('添加规则'), 'cbi-button-add', function() {
-\t\t\t\t\t\tvar d = document.getElementById('rule_domain').value.trim();
-\t\t\t\t\t\tvar ip = document.getElementById('rule_ip').value.trim();
-\t\t\t\t\t\tvar ac = document.getElementById('rule_action').value;
-\t\t\t\t\t\tvar gp = document.getElementById('rule_group').value;
-\t\t\t\t\t\tvar cm = document.getElementById('rule_comment').value.trim();
-\t\t\t\t\t\tif (!d) { ui.addNotification(null, E('p', _('请填写域名。')), 'danger'); return; }
-\t\t\t\t\t\tvar args = ['add_access_rule', ip, d, ac];
-\t\t\t\t\t\tif (ac === 'proxy' && gp) args.push(gp);
-\t\t\t\t\t\treturn fs.exec('/usr/share/mihomo/helper.sh', args).then(function(res) {
-\t\t\t\t\t\t\tif (res.code === 0) {
-\t\t\t\t\t\t\t\tui.addNotification(null, E('p', _('规则已保存（需重启核心后生效）。')), 'info');
-\t\t\t\t\t\t\t\trender_rules();
-\t\t\t\t\t\t\t} else {
-\t\t\t\t\t\t\t\tui.addNotification(null, E('p', _('添加失败：') + (res.stderr || res.stdout || '')), 'danger');
-\t\t\t\t\t\t\t}
-\t\t\t\t\t\t}).catch(function(err) {
-\t\t\t\t\t\t\tui.addNotification(null, E('p', _('通信错误：') + err.message), 'danger');
-\t\t\t\t\t\t});
-\t\t\t\t\t}),
-\t\t\t\t\tbtn(_('应用并重启核心'), 'cbi-button-apply', function(ev) {
-\t\t\t\t\t\tev.preventDefault();
-\t\t\t\t\t\treturn fs.exec('/etc/init.d/mihomo', ['restart']).then(function() {
-\t\t\t\t\t\t\tui.addNotification(null, E('p', _('核心已重启，规则已生效。')), 'info');
-\t\t\t\t\t\t\tsetTimeout(function() { location.reload(); }, 1500);
-\t\t\t\t\t\t}).catch(function(err) {
-\t\t\t\t\t\t\tui.addNotification(null, E('p', _('重启失败：') + err.message), 'danger');
-\t\t\t\t\t\t});
-\t\t\t\t\t})
-\t\t\t\t])
-\t\t\t])
-\t\t]);
+		var rule_form = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
+			E('h3', { 'style': 'margin-top: 0; margin-bottom: 15px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, _('新增访问规则')),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('域名 / 后缀')),
+				E('div', { 'class': 'cbi-value-field' }, [
+					E('input', { 'id': 'rule_domain', 'type': 'text', 'class': 'cbi-input-text', 'placeholder': '例如 example.com（按后缀匹配）', 'style': 'width: 60%;' })
+				])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('来源 IP（选填）')),
+				E('div', { 'class': 'cbi-value-field' }, [
+					E('input', { 'id': 'rule_ip', 'type': 'text', 'class': 'cbi-input-text', 'placeholder': '留空表示所有设备', 'style': 'width: 60%;' })
+				])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('动作')),
+				E('div', { 'class': 'cbi-value-field' }, [
+					E('select', { 'id': 'rule_action', 'class': 'cbi-input-select', 'style': 'width: 200px;' }, [
+						E('option', { 'value': 'block' }, _('拦截 (REJECT)')),
+						E('option', { 'value': 'direct' }, _('直连 (DIRECT)')),
+						E('option', { 'value': 'proxy' }, _('走代理'))
+					]),
+					E('select', { 'id': 'rule_group', 'class': 'cbi-input-select', 'style': 'width: 200px; margin-left:8px;', 'innerHTML': group_options })
+				])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('备注（选填）')),
+				E('div', { 'class': 'cbi-value-field' }, [
+					E('input', { 'id': 'rule_comment', 'type': 'text', 'class': 'cbi-input-text', 'style': 'width: 60%;' })
+				])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('div', { 'class': 'cbi-value-field' }, [
+					btn(_('添加规则'), 'cbi-button-add', function() {
+						var d = document.getElementById('rule_domain').value.trim();
+						var ip = document.getElementById('rule_ip').value.trim();
+						var ac = document.getElementById('rule_action').value;
+						var gp = document.getElementById('rule_group').value;
+						var cm = document.getElementById('rule_comment').value.trim();
+						if (!d) { ui.addNotification(null, E('p', _('请填写域名。')), 'danger'); return; }
+						var args = ['add_access_rule', ip, d, ac];
+						if (ac === 'proxy' && gp) args.push(gp);
+						return fs.exec('/usr/share/mihomo/helper.sh', args).then(function(res) {
+							if (res.code === 0) {
+								ui.addNotification(null, E('p', _('规则已保存（需重启核心后生效）。')), 'info');
+								render_rules();
+							} else {
+								ui.addNotification(null, E('p', _('添加失败：') + (res.stderr || res.stdout || '')), 'danger');
+							}
+						}).catch(function(err) {
+							ui.addNotification(null, E('p', _('通信错误：') + err.message), 'danger');
+						});
+					}),
+					btn(_('应用并重启核心'), 'cbi-button-apply', function(ev) {
+						ev.preventDefault();
+						return fs.exec('/etc/init.d/mihomo', ['restart']).then(function() {
+							ui.addNotification(null, E('p', _('核心已重启，规则已生效。')), 'info');
+							setTimeout(function() { location.reload(); }, 1500);
+						}).catch(function(err) {
+							ui.addNotification(null, E('p', _('重启失败：') + err.message), 'danger');
+						});
+					})
+				])
+			])
+		]);
 
-\t\tvar view_html = E('div', { 'class': 'cbi-map' }, [
-\t\t\tE('h2', {}, _('Mihomo 访问日志')),
-\t\t\tE('p', {}, _('监控局域网设备实时连接与历史访问，并按域名配置拦截 / 直连 / 代理规则。规则保存在 UCI，重启核心后生效。')),
+		var view_html = E('div', { 'class': 'cbi-map' }, [
+			E('h2', {}, _('Mihomo 访问日志')),
+			E('p', {}, _('监控局域网设备实时连接与历史访问，并按域名配置拦截 / 直连 / 代理规则。规则保存在 UCI，重启核心后生效。')),
 
-\t\t\t// Real-time connections
-\t\t\tE('div', { 'class': 'cbi-section' }, [
-\t\t\t\tE('h3', {}, _('实时连接（每 5 秒刷新）')),
-\t\t\t\tE('div', { 'id': 'conn-wrap', 'style': 'max-height: 380px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px;' }, [
-\t\t\t\t\tE('table', { 'class': 'table', 'style': 'margin: 0;' }, [
-\t\t\t\t\t\tE('thead', {}, [
-\t\t\t\t\t\t\tE('tr', {}, [
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('设备')),
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('域名 / 目标')),
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('策略')),
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('流量 (↑/↓)')),
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('操作'))
-\t\t\t\t\t\t\t])
-\t\t\t\t\t\t]),
-\t\t\t\t\t\tE('tbody', { 'id': 'conn-body' })
-\t\t\t\t\t])
-\t\t\t\t])
-\t\t\t]),
+			// Real-time connections
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, _('实时连接（每 5 秒刷新）')),
+				E('div', { 'id': 'conn-wrap', 'style': 'max-height: 380px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px;' }, [
+					E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
+						E('thead', {}, [
+							E('tr', {}, [
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('设备')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('域名 / 目标')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('策略')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('流量 (↑/↓)')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('操作'))
+							])
+						]),
+						E('tbody', { 'id': 'conn-body' })
+					])
+				])
+			]),
 
-\t\t\t// History
-\t\t\tE('div', { 'class': 'cbi-section' }, [
-\t\t\t\tE('h3', {}, _('历史访问记录')),
-\t\t\t\tE('div', { 'style': 'max-height: 380px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px;' }, [
-\t\t\t\t\tE('table', { 'class': 'table', 'style': 'margin: 0;' }, [
-\t\t\t\t\t\tE('thead', {}, [
-\t\t\t\t\t\t\tE('tr', {}, [
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('时间')),
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('设备')),
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('域名 / 目标')),
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('策略')),
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('操作'))
-\t\t\t\t\t\t\t])
-\t\t\t\t\t\t]),
-\t\t\t\t\t\tE('tbody', { 'id': 'hist-body' })
-\t\t\t\t\t])
-\t\t\t\t])
-\t\t\t]),
+			// History
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, _('历史访问记录')),
+				E('div', { 'style': 'max-height: 380px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px;' }, [
+					E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
+						E('thead', {}, [
+							E('tr', {}, [
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('时间')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('设备')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('域名 / 目标')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('策略')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('操作'))
+							])
+						]),
+						E('tbody', { 'id': 'hist-body' })
+					])
+				])
+			]),
 
-\t\t\t// Rules
-\t\t\tE('div', { 'class': 'cbi-section' }, [
-\t\t\t\tE('h3', {}, _('访问规则管理')),
-\t\t\t\tE('div', { 'style': 'max-height: 320px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px; margin-bottom: 15px;' }, [
-\t\t\t\t\tE('table', { 'class': 'table', 'style': 'margin: 0;' }, [
-\t\t\t\t\t\tE('thead', {}, [
-\t\t\t\t\t\t\tE('tr', {}, [
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('来源 IP')),
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('域名')),
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('动作')),
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('备注')),
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('状态')),
-\t\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('操作'))
-\t\t\t\t\t\t\t])
-\t\t\t\t\t\t]),
-\t\t\t\t\t\tE('tbody', { 'id': 'rule-body' })
-\t\t\t\t\t])
-\t\t\t\t])
-\t\t\t]),
+			// Rules
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, _('访问规则管理')),
+				E('div', { 'style': 'max-height: 320px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px; margin-bottom: 15px;' }, [
+					E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
+						E('thead', {}, [
+							E('tr', {}, [
+								E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('来源 IP')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('域名')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('动作')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('备注')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('状态')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('操作'))
+							])
+						]),
+						E('tbody', { 'id': 'rule-body' })
+					])
+				])
+			]),
 
-\t\t\trule_form
-\t\t]);
+			rule_form
+		]);
 
-\t\tsetTimeout(function() {
-\t\t\trender_connections();
-\t\t\trender_history();
-\t\t\trender_rules();
-\t\t}, 0);
+		setTimeout(function() {
+			render_connections();
+			render_history();
+			render_rules();
+		}, 0);
 
-\t\tself._timer = setInterval(function() {
-\t\t\tfs.exec('/usr/share/mihomo/helper.sh', ['get_connections']).then(function(res) {
-\t\t\t\ttry {
-\t\t\t\t\tvar j = JSON.parse((res.stdout || '[]').trim());
-\t\t\t\t\tif (j && !j.error) { connections = j; conn_error = null; render_connections(); }
-\t\t\t\t} catch (e) {}
-\t\t\t});
-\t\t\tfs.exec('/usr/share/mihomo/helper.sh', ['get_history', '300']).then(function(res) {
-\t\t\t\ttry {
-\t\t\t\t\thistory = JSON.parse((res.stdout || '[]').trim());
-\t\t\t\t\trender_history();
-\t\t\t\t} catch (e) {}
-\t\t\t});
-\t\t}, 5000);
+		self._timer = setInterval(function() {
+			fs.exec('/usr/share/mihomo/helper.sh', ['get_connections']).then(function(res) {
+				try {
+					var j = JSON.parse((res.stdout || '[]').trim());
+					if (j && !j.error) { connections = j; conn_error = null; render_connections(); }
+				} catch (e) {}
+			});
+			fs.exec('/usr/share/mihomo/helper.sh', ['get_history', '300']).then(function(res) {
+				try {
+					history = JSON.parse((res.stdout || '[]').trim());
+					render_history();
+				} catch (e) {}
+			});
+		}, 5000);
 
-\t\treturn view_html;
-\t},
+		return view_html;
+	},
 
-\tunload: function() {
-\t\tif (this._timer) { clearInterval(this._timer); this._timer = null; }
-\t}
+	unload: function() {
+		if (this._timer) { clearInterval(this._timer); this._timer = null; }
+	}
 });
 """,
 
@@ -1224,500 +1467,544 @@ return view.extend({
 'require uci';
 
 return view.extend({
-\tload: function() {
-\t\treturn uci.load('mihomo').then(function() {
-\t\t\treturn Promise.all([
-\t\t\t\tfs.exec('/usr/share/mihomo/helper.sh', ['check_core']).catch(function() { return { stdout: '' }; }),
-\t\t\t\tfs.exec('/sbin/logread', ['-e', 'mihomo']).catch(function() { return { stdout: '' }; }),
-\t\t\t\trpc.declare({
-\t\t\t\t\tobject: 'service',
-\t\t\t\t\tmethod: 'list',
-\t\t\t\t\tparams: [ 'name' ]
-\t\t\t\t})({ name: 'mihomo' }).catch(function() { return {}; }),
-\t\t\t\tfs.exec('/usr/share/mihomo/helper.sh', ['get_proxies']).catch(function() { return { stdout: '[]' }; }),
-\t\t\t\tfs.exec('/usr/share/mihomo/helper.sh', ['get_proxy_groups']).catch(function() { return { stdout: '{"proxies":{}}' }; })
-\t\t\t]);
-\t\t});
-\t},
+	load: function() {
+		return uci.load('mihomo').then(function() {
+			return Promise.all([
+				fs.exec('/usr/share/mihomo/helper.sh', ['check_core']).catch(function() { return { stdout: '' }; }),
+				fs.exec('/sbin/logread', ['-e', 'mihomo']).catch(function() { return { stdout: '' }; }),
+				rpc.declare({
+					object: 'service',
+					method: 'list',
+					params: [ 'name' ]
+				})({ name: 'mihomo' }).catch(function() { return {}; }),
+				fs.exec('/usr/share/mihomo/helper.sh', ['get_proxies']).catch(function() { return { stdout: '[]' }; }),
+				fs.exec('/usr/share/mihomo/helper.sh', ['get_proxy_groups']).catch(function() { return { stdout: '{"proxies":{}}' }; }),
+				fs.exec('/usr/share/mihomo/helper.sh', ['get_schedule']).catch(function() { return { stdout: '{"auto_update":"0","interval":"24","last_update":"","next_update":"","has_url":"0"}' }; })
+			]);
+		});
+	},
 
-\trender: function(results) {
-\t\tvar core_status = (results[0] && results[0].stdout) ? results[0].stdout.trim() : '';
-\t\tvar logs = (results[1] && results[1].stdout) ? results[1].stdout.trim() : '';
-\t\tlogs = logs || _('暂无日志记录。');
-\t\tvar service_data = results[2];
-\t\tvar proxy_data_raw = (results[3] && results[3].stdout) ? results[3].stdout.trim() : '[]';
-\t\tvar proxy_groups_raw = (results[4] && results[4].stdout) ? results[4].stdout.trim() : '{"proxies":{}}';
-\t\t
-\t\tvar proxies = [];
-\t\tvar parse_error = null;
-\t\ttry {
-\t\t\tvar parsed = JSON.parse(proxy_data_raw);
-\t\t\tif (parsed && parsed.error) {
-\t\t\t\tparse_error = parsed.msg;
-\t\t\t} else {
-\t\t\t\tproxies = parsed;
-\t\t\t}
-\t\t} catch(e) {
-\t\t\tproxies = [];
-\t\t\tparse_error = _('本地配置文件数据损坏或解析失败。');
-\t\t}
+	render: function(results) {
+		var core_status = (results[0] && results[0].stdout) ? results[0].stdout.trim() : '';
+		var logs = (results[1] && results[1].stdout) ? results[1].stdout.trim() : '';
+		logs = logs || _('暂无日志记录。');
+		var service_data = results[2];
+		var proxy_data_raw = (results[3] && results[3].stdout) ? results[3].stdout.trim() : '[]';
+		var proxy_groups_raw = (results[4] && results[4].stdout) ? results[4].stdout.trim() : '{"proxies":{}}';
 
-\t\tvar proxy_groups = {};
-\t\ttry {
-\t\t\tproxy_groups = JSON.parse(proxy_groups_raw).proxies || {};
-\t\t} catch(e) {
-\t\t\tproxy_groups = {};
-\t\t}
+		var schedule_raw = (results[5] && results[5].stdout) ? results[5].stdout.trim() : '{"auto_update":"0","interval":"24","last_update":"","next_update":"","has_url":"0"}';
+		var schedule = {};
+		try { schedule = JSON.parse(schedule_raw); } catch(e) { schedule = {}; }
+		
+		var proxies = [];
+		var parse_error = null;
+		try {
+			var parsed = JSON.parse(proxy_data_raw);
+			if (parsed && parsed.error) {
+				parse_error = parsed.msg;
+			} else {
+				proxies = parsed;
+			}
+		} catch(e) {
+			proxies = [];
+			parse_error = _('本地配置文件数据损坏或解析失败。');
+		}
 
-\t\t// 控制器是否可达：get_proxy_groups 在核心未启动/控制器不可达时返回 {"proxies":{}}
-\t\tvar controller_up = (proxy_groups_raw.indexOf('"proxies":{}') === -1);
+		var proxy_groups = {};
+		try {
+			proxy_groups = JSON.parse(proxy_groups_raw).proxies || {};
+		} catch(e) {
+			proxy_groups = {};
+		}
 
-\t\tvar is_running = false;
-\t\tif (service_data && service_data.mihomo && service_data.mihomo.instances) {
-\t\t\tvar instances = service_data.mihomo.instances;
-\t\t\tfor (var key in instances) {
-\t\t\t\tif (instances[key].running) {
-\t\t\t\t\tis_running = true;
-\t\t\t\t\tbreak;
-\t\t\t\t}
-\t\t\t}
-\t\t}
+		// 控制器是否可达：get_proxy_groups 在核心未启动/控制器不可达时返回 {"proxies":{}}
+		var controller_up = (proxy_groups_raw.indexOf('"proxies":{}') === -1);
 
-\t\tvar is_installed = core_status.indexOf('installed:') === 0;
-\t\tvar core_ver = _('未安装');
-\t\tif (is_installed) {
-\t\t\tcore_ver = core_status.split(':')[1];
-\t\t}
+		var is_running = false;
+		if (service_data && service_data.mihomo && service_data.mihomo.instances) {
+			var instances = service_data.mihomo.instances;
+			for (var key in instances) {
+				if (instances[key].running) {
+					is_running = true;
+					break;
+				}
+			}
+		}
 
-\t\tvar core_path = uci.get('mihomo', 'config', 'core_path') || '/usr/bin/mihomo';
+		var is_installed = core_status.indexOf('installed:') === 0;
+		var core_ver = _('未安装');
+		if (is_installed) {
+			core_ver = core_status.split(':')[1];
+		}
 
-\t\tvar status_badge;
-\t\tif (controller_up) {
-\t\t\tstatus_badge = '<span class="label success" style="background-color: #2ed573; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;">RUNNING</span>';
-\t\t} else if (is_running) {
-\t\t\tstatus_badge = '<span class="label" style="background-color: #ffa502; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;">运行异常</span>';
-\t\t} else {
-\t\t\tstatus_badge = '<span class="label danger" style="background-color: #ff4757; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;">STOPPED</span>';
-\t\t}
+		var core_path = uci.get('mihomo', 'config', 'core_path') || '/usr/bin/mihomo';
 
-\t\tvar perform_download = function(ev) {
-\t\t\tev.preventDefault();
-\t\t\tvar url_input = document.getElementById('core_download_url');
-\t\t\tvar url = url_input ? url_input.value.trim() : '';
-\t\t\t
-\t\t\tvar close_btn = E('button', {
-\t\t\t\t'class': 'cbi-button cbi-button-neutral',
-\t\t\t\t'style': 'display: none; margin-top: 15px;',
-\t\t\t\t'click': function() {
-\t\t\t\t\tui.hideModal();
-\t\t\t\t\tlocation.reload();
-\t\t\t\t}
-\t\t\t}, _('关闭'));
+		var status_badge;
+		if (controller_up) {
+			status_badge = '<span class="label success" style="background-color: #2ed573; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;">RUNNING</span>';
+		} else if (is_running) {
+			status_badge = '<span class="label" style="background-color: #ffa502; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;">运行异常</span>';
+		} else {
+			status_badge = '<span class="label danger" style="background-color: #ff4757; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;">STOPPED</span>';
+		}
 
-\t\t\tui.showModal(_('正在下载核心'), [
-\t\t\t\tE('p', {}, _('正在下载 Mihomo 核心二进制文件... 这可能需要一些时间。')),
-\t\t\t\tE('pre', { 'id': 'download_log', 'style': 'max-height: 200px; overflow-y: auto; background: #222; color: #fff; padding: 10px; border-radius: 4px; font-family: monospace;' }, _('开始下载...\\n')),
-\t\t\t\tE('div', { 'class': 'right' }, [close_btn])
-\t\t\t]);
+		var perform_download = function(ev) {
+			ev.preventDefault();
+			var url_input = document.getElementById('core_download_url');
+			var url = url_input ? url_input.value.trim() : '';
+			
+			var close_btn = E('button', {
+				'class': 'cbi-button cbi-button-neutral',
+				'style': 'display: none; margin-top: 15px;',
+				'click': function() {
+					ui.hideModal();
+					location.reload();
+				}
+			}, _('关闭'));
 
-\t\t\tvar args = ['download_core'];
-\t\t\tif (url) {
-\t\t\t\targs.push(url);
-\t\t\t}
+			ui.showModal(_('正在下载核心'), [
+				E('p', {}, _('正在下载 Mihomo 核心二进制文件... 这可能需要一些时间。')),
+				E('pre', { 'id': 'download_log', 'style': 'max-height: 200px; overflow-y: auto; background: #222; color: #fff; padding: 10px; border-radius: 4px; font-family: monospace;' }, _('开始下载...\\n')),
+				E('div', { 'class': 'right' }, [close_btn])
+			]);
 
-\t\t\treturn fs.exec('/usr/share/mihomo/helper.sh', args).then(function(res) {
-\t\t\t\tvar pre = document.getElementById('download_log');
-\t\t\t\tif (pre) {
-\t\t\t\t\tpre.textContent += (res.stdout || '') + (res.stderr ? '\\n' + res.stderr : '');
-\t\t\t\t}
-\t\t\t\tclose_btn.style.display = 'inline-block';
-\t\t\t}).catch(function(err) {
-\t\t\t\tvar pre = document.getElementById('download_log');
-\t\t\t\tif (pre) {
-\t\t\t\t\tpre.textContent += '\\nERROR: ' + err.message;
-\t\t\t\t}
-\t\t\t\tclose_btn.style.display = 'inline-block';
-\t\t\t});
-\t\t};
+			var args = ['download_core'];
+			if (url) {
+				args.push(url);
+			}
 
-\t\tvar manager_fields = [
-\t\t\tE('label', { 'class': 'cbi-value-title' }, _('自定义下载地址 (选填)')),
-\t\t\tE('div', { 'class': 'cbi-value-field' }, [
-\t\t\t\tE('input', {
-\t\t\t\t\t'id': 'core_download_url',
-\t\t\t\t\t'type': 'text',
-\t\t\t\t\t'class': 'cbi-input-text',
-\t\t\t\t\t'placeholder': '留空则默认使用 GitHub 官方源下载',
-\t\t\t\t\t'style': 'width: 60%;'
-\t\t\t\t})
-\t\t\t])
-\t\t];
-\t\t
-\t\tvar download_btn_field = E('div', { 'class': 'cbi-value' }, [
-\t\t\tE('div', { 'class': 'cbi-value-field' }, [
-\t\t\t\tE('button', {
-\t\t\t\t\t'class': 'cbi-button cbi-button-action',
-\t\t\t\t\t'click': perform_download
-\t\t\t\t}, _('下载并安装核心'))
-\t\t\t])
-\t\t]);
+			return fs.exec('/usr/share/mihomo/helper.sh', args).then(function(res) {
+				var pre = document.getElementById('download_log');
+				if (pre) {
+					pre.textContent += (res.stdout || '') + (res.stderr ? '\\n' + res.stderr : '');
+				}
+				close_btn.style.display = 'inline-block';
+			}).catch(function(err) {
+				var pre = document.getElementById('download_log');
+				if (pre) {
+					pre.textContent += '\\nERROR: ' + err.message;
+				}
+				close_btn.style.display = 'inline-block';
+			});
+		};
 
-\t\tvar core_manager_body;
-\t\tif (is_installed) {
-\t\t\tvar download_container = E('div', { 'style': 'display: none; margin-top: 15px; border-top: 1px dashed rgba(0,0,0,0.1); padding-top: 15px;' }, [
-\t\t\t\tE('div', { 'class': 'cbi-value' }, manager_fields),
-\t\t\t\tdownload_btn_field
-\t\t\t]);
+		var manager_fields = [
+			E('label', { 'class': 'cbi-value-title' }, _('自定义下载地址 (选填)')),
+			E('div', { 'class': 'cbi-value-field' }, [
+				E('input', {
+					'id': 'core_download_url',
+					'type': 'text',
+					'class': 'cbi-input-text',
+					'placeholder': '留空则默认使用 GitHub 官方源下载',
+					'style': 'width: 60%;'
+				})
+			])
+		];
+		
+		var download_btn_field = E('div', { 'class': 'cbi-value' }, [
+			E('div', { 'class': 'cbi-value-field' }, [
+				E('button', {
+					'class': 'cbi-button cbi-button-action',
+					'click': perform_download
+				}, _('下载并安装核心'))
+			])
+		]);
 
-\t\t\tcore_manager_body = E('div', {}, [
-\t\t\t\tE('table', { 'class': 'table' }, [
-\t\t\t\t\tE('tr', {}, [
-\t\t\t\t\t\tE('td', { 'width': '33%' }, _('安装状态')),
-\t\t\t\t\t\tE('td', {}, '<span style="color: #2ed573; font-weight: bold;">✔ 已启用并部署</span>')
-\t\t\t\t\t]),
-\t\t\t\t\tE('tr', {}, [
-\t\t\t\t\t\tE('td', {}, _('安装路径')),
-\t\t\t\t\t\tE('td', {}, E('code', {}, core_path))
-\t\t\t\t\t]),
-\t\t\t\t\tE('tr', {}, [
-\t\t\t\t\t\tE('td', {}, _('核心版本')),
-\t\t\t\t\t\tE('td', {}, E('strong', {}, core_ver))
-\t\t\t\t\t])
-\t\t\t\t]),
-\t\t\t\tE('div', { 'style': 'margin-top: 15px;' }, [
-\t\t\t\t\tE('button', {
-\t\t\t\t\t\t'class': 'cbi-button cbi-button-neutral',
-\t\t\t\t\t\t'click': function(ev) {
-\t\t\t\t\t\t\tev.preventDefault();
-\t\t\t\t\t	\tif (download_container.style.display === 'none') {
-\t\t\t\t\t		\t\tdownload_container.style.display = 'block';
-\t\t\t\t\t		\t\tev.target.textContent = _('收起更新选项');
-\t\t\t\t\t		\t} else {
-\t\t\t\t\t		\t\tdownload_container.style.display = 'none';
-\t\t\t\t\t		\t\tev.target.textContent = _('更新/重新安装核心');
-\t\t\t\t\t		\t}
-\t\t\t\t\t	}
-\t\t\t\t\t}, _('更新/重新安装核心')),
-\t\t\t\t\tdownload_container
-\t\t\t\t])
-\t\t\t]);
-\t\t} else {
-\t\t\tcore_manager_body = E('div', {}, [
-\t\t\t\tE('div', { 'style': 'padding: 10px 15px; background: rgba(255, 71, 87, 0.1); border-left: 4px solid #ff4757; color: #ff4757; font-weight: bold; border-radius: 4px; margin-bottom: 15px;' }, 
-\t\t\t\t\t_('⚠️ 未检测到 Mihomo 运行核心，请在下方点击下载安装。')
-\t\t\t\t),
-\t\t\t\tE('div', { 'class': 'cbi-value' }, manager_fields),
-\t\t\t\tdownload_btn_field
-\t\t\t]);
-\t\t}
+		var core_manager_body;
+		if (is_installed) {
+			var download_container = E('div', { 'style': 'display: none; margin-top: 15px; border-top: 1px dashed rgba(0,0,0,0.1); padding-top: 15px;' }, [
+				E('div', { 'class': 'cbi-value' }, manager_fields),
+				download_btn_field
+			]);
 
-\t\tvar group_rows = [];
-\t\tvar group_names = Object.keys(proxy_groups);
-\t\tvar selector_groups_count = 0;
-
-\t\tfor (var i = 0; i < group_names.length; i++) {
-\t\t\tvar gname = group_names[i];
-\t\t\tvar g = proxy_groups[gname];
-\t\t\tif (g && g.type === 'Selector') {
-\t\t\t\tselector_groups_count++;
-\t\t\t\t
-\t\t\t\tvar options = [];
-\t\t\t\tfor (var j = 0; j < g.all.length; j++) {
-\t\t\t\t\tvar nname = g.all[j];
-\t\t\t\t\toptions.push(E('option', {
-\t\t\t\t\t\t'value': nname,
-\t\t\t\t\t\t'selected': (nname === g.now) ? 'selected' : null
-\t\t\t\t\t}, nname));
-\t\t\t\t}
-
-\t\t\t\tvar select_el = E('select', {
-\t\t\t\t\t'class': 'cbi-input-select',
-\t\t\t\t\t'style': 'width: 100%; max-width: 280px; padding: 4px; border-radius: 4px; border: 1px solid rgba(0,0,0,0.15); background: white;',
-\t\t\t\t\t'data-group': gname,
-\t\t\t\t\t'change': function(ev) {
-\t\t\t\t\t\tvar group = ev.target.getAttribute('data-group');
-\t\t\t\t\t\tvar node = ev.target.value;
-\t\t\t\t\t\t
-\t\t\t\t\t\tui.addNotification(null, E('p', _('正在切换节点：') + group + ' ➡ ' + node), 'info');
-\t\t\t\t\t\t
-\t\t\t\t\t\treturn fs.exec('/usr/share/mihomo/helper.sh', ['select_node', group, node]).then(function(res) {
-\t\t\t\t\t\t\tif (res.code === 0) {
-\t\t\t\t\t\t\t\tui.addNotification(null, E('p', _('节点切换成功！')), 'info');
-\t\t\t\t\t\t\t} else {
-\t\t\t\t\t\t\t\tui.addNotification(null, E('p', _('节点切换失败：') + (res.stderr || res.stdout || '')), 'danger');
-\t\t\t\t\t\t\t}
-\t\t\t\t\t\t}).catch(function(err) {
-\t\t\t\t\t\t\tui.addNotification(null, E('p', _('通信错误：') + err.message), 'danger');
-\t\t\t\t\t\t});
-\t\t\t\t\t}
-\t\t\t\t}, options);
-
-\t\t\t\tgroup_rows.push(E('tr', {}, [
-\t\t\t\t\tE('td', { 'style': 'font-weight: bold; vertical-align: middle; padding: 8px;' }, gname),
-\t\t\t\t\tE('td', { 'style': 'vertical-align: middle; padding: 8px;' }, E('span', { 'class': 'label info', 'style': 'background-color: #17a2b8; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px;' }, g.type.toUpperCase())),
-\t\t\t\t\tE('td', { 'style': 'vertical-align: middle; padding: 8px;' }, select_el)
-\t\t\t\t]));
-\t\t\t}
-\t\t}
-
-\t\tvar proxy_groups_panel;
-\t\tif (controller_up && selector_groups_count > 0) {
-\t\t\tproxy_groups_panel = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
-\t\t\t\tE('h3', { 'style': 'margin-top: 0; margin-bottom: 15px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, _('分流策略组管理 (实时切换节点)')),
-\t\t\t\tE('table', { 'class': 'table', 'style': 'margin: 0;' }, [
-\t\t\t\t\tE('thead', {}, [
-\t\t\t\t\t\tE('tr', {}, [
-\t\t\t\t\t\t\tE('th', { 'width': '40%', 'style': 'background: rgba(0,0,0,0.02);' }, _('策略组名称')),
-\t\t\t\t\t\t\tE('th', { 'width': '20%', 'style': 'background: rgba(0,0,0,0.02);' }, _('类型')),
-\t\t\t\t\t\t\tE('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('选择节点'))
-\t\t\t\t\t\t])
-\t\t\t\t\t]),
-\t\t\t\t\tE('tbody', {}, group_rows)
-\t\t\t\t])
-\t\t\t]);
-\t\t} else {
-\t\t\tvar pg_hint = controller_up
-\t\t\t\t? _('该订阅配置中暂无可选的策略组（selector）。')
-\t\t\t\t: _('Mihomo 核心未运行或控制器不可达，无法进行实时策略组切换。请先在上方「运行状态」点击「启动」，刷新本页面后再试。');
-\t\t\tproxy_groups_panel = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
-\t\t\t\tE('h3', { 'style': 'margin-top: 0; margin-bottom: 10px;' }, _('分流策略组管理')),
-\t\t\t\tE('div', { 'style': 'padding: 10px; text-align: center; color: #ff4757; background: rgba(255, 71, 87, 0.05); border-radius: 4px; font-weight: bold;' }, 
-\t\t\t\t\tpg_hint
-\t\t\t\t)
-\t\t\t]);
-\t\t}
-
-\t\tvar node_cards = [];
-\t\tvar delay_els = {};
-\t\tvar valid_node_count = 0;
-\t\tfor (var i = 0; i < proxies.length; i++) {
-\t\t\tvar p = proxies[i];
-\t\t\tif (p && p.name && p.type) {
-\t\t\t\tvalid_node_count++;
-\t\t\t\tvar card_tip = _('节点类型') + '：' + p.type + '\\n' + _('服务器地址') + '：' + (p.server || '-');
-\t\t\t\tvar delay_el = E('div', { 'style': 'font-size: 12px; color: #888; margin-top: 6px;' }, _('延时 —'));
-\t\t\t\tdelay_els[p.name] = delay_el;
-\t\t\t\tvar tip = E('div', { 'style': 'display:none; position:absolute; left:0; top:100%; z-index:50; margin-top:4px; background:#333; color:#fff; padding:6px 8px; border-radius:4px; font-size:11px; white-space:pre-line; max-width:240px; word-break:break-all;' }, card_tip);
-\t\t\t\tvar card = E('div', {
-\t\t\t\t\t'style': 'position:relative; border:1px solid rgba(0,0,0,0.08); border-radius:8px; padding:10px; background:#fff; cursor:default; min-height:60px; display:flex; flex-direction:column; justify-content:space-between;',
-\t\t\t\t\t'onmouseover': (function(t) { return function() { t.style.display = 'block'; }; })(tip),
-\t\t\t\t\t'onmouseout': (function(t) { return function() { t.style.display = 'none'; }; })(tip)
-\t\t\t\t}, [
-\t\t\t\t\tE('div', { 'style': 'font-weight:bold; font-size:13px; line-height:1.3; word-break:break-all;' }, p.name),
-\t\t\t\t\tdelay_el,
-\t\t\t\t\ttip
-\t\t\t\t]);
-\t\t\t\tnode_cards.push(card);
-\t\t\t}
-\t\t}
-
-\t\tvar sub_url = uci.get('mihomo', 'config', 'subscription_url') || '';
-
-\t\tvar run_delay_test = function() {
-\t\t\tif (!valid_node_count) return;
-\t\t\tui.addNotification(null, E('p', _('正在测试节点延时...')), 'info');
-\t\t\tfor (var i = 0; i < proxies.length; i++) {
-\t\t\t\t(function(p) {
-\t\t\t\t\tif (!p || !p.name || !p.type) return;
-\t\t\t\t\tvar el = delay_els[p.name];
-\t\t\t\t\tif (el) el.textContent = _('测试中...');
-					fs.exec('/usr/share/mihomo/helper.sh', ['test_node_delay', p.name]).then(function(res) {
-						try {
-							var d = JSON.parse((res.stdout || '{}').trim());
-							if (typeof d.delay === 'number' && d.delay >= 0) {
-								el.textContent = d.delay + ' ms';
-							} else {
-								var reason = d.msg || d.message || '';
-								if (reason === 'controller_unreachable') el.textContent = _('控制器未连接');
-								else if (reason === 'name required') el.textContent = _('名称缺失');
-								else if (reason) el.textContent = _('失败') + ':' + String(reason).slice(0, 16);
-								else el.textContent = _('超时/失败');
-							}
-						} catch (e) {
-							el.textContent = _('超时/失败');
+			core_manager_body = E('div', {}, [
+				E('table', { 'class': 'table' }, [
+					E('tr', {}, [
+						E('td', { 'width': '33%' }, _('安装状态')),
+						E('td', {}, '<span style="color: #2ed573; font-weight: bold;">✔ 已启用并部署</span>')
+					]),
+					E('tr', {}, [
+						E('td', {}, _('安装路径')),
+						E('td', {}, E('code', {}, core_path))
+					]),
+					E('tr', {}, [
+						E('td', {}, _('核心版本')),
+						E('td', {}, E('strong', {}, core_ver))
+					])
+				]),
+				E('div', { 'style': 'margin-top: 15px;' }, [
+					E('button', {
+						'class': 'cbi-button cbi-button-neutral',
+						'click': function(ev) {
+							ev.preventDefault();
+							if (download_container.style.display === 'none') {
+									download_container.style.display = 'block';
+									ev.target.textContent = _('收起更新选项');
+								} else {
+									download_container.style.display = 'none';
+									ev.target.textContent = _('更新/重新安装核心');
+								}
 						}
-					}).catch(function() {
-						if (el) el.textContent = _('超时/失败');
+					}, _('更新/重新安装核心')),
+					download_container
+				])
+			]);
+		} else {
+			core_manager_body = E('div', {}, [
+				E('div', { 'style': 'padding: 10px 15px; background: rgba(255, 71, 87, 0.1); border-left: 4px solid #ff4757; color: #ff4757; font-weight: bold; border-radius: 4px; margin-bottom: 15px;' }, 
+					_('⚠️ 未检测到 Mihomo 运行核心，请在下方点击下载安装。')
+				),
+				E('div', { 'class': 'cbi-value' }, manager_fields),
+				download_btn_field
+			]);
+		}
+
+		var group_rows = [];
+		var group_names = Object.keys(proxy_groups);
+		var selector_groups_count = 0;
+
+		for (var i = 0; i < group_names.length; i++) {
+			var gname = group_names[i];
+			var g = proxy_groups[gname];
+			if (g && g.type === 'Selector') {
+				selector_groups_count++;
+				
+				var options = [];
+				for (var j = 0; j < g.all.length; j++) {
+					var nname = g.all[j];
+					options.push(E('option', {
+						'value': nname,
+						'selected': (nname === g.now) ? 'selected' : null
+					}, nname));
+				}
+
+				var select_el = E('select', {
+					'class': 'cbi-input-select',
+					'style': 'width: 100%; max-width: 280px; padding: 4px; border-radius: 4px; border: 1px solid rgba(0,0,0,0.15); background: white;',
+					'data-group': gname,
+					'change': function(ev) {
+						var group = ev.target.getAttribute('data-group');
+						var node = ev.target.value;
+						
+						ui.addNotification(null, E('p', _('正在切换节点：') + group + ' ➡ ' + node), 'info');
+						
+						return fs.exec('/usr/share/mihomo/helper.sh', ['select_node', group, node]).then(function(res) {
+							if (res.code === 0) {
+								ui.addNotification(null, E('p', _('节点切换成功！')), 'info');
+							} else {
+								ui.addNotification(null, E('p', _('节点切换失败：') + (res.stderr || res.stdout || '')), 'danger');
+							}
+						}).catch(function(err) {
+							ui.addNotification(null, E('p', _('通信错误：') + err.message), 'danger');
+						});
+					}
+				}, options);
+
+				group_rows.push(E('tr', {}, [
+					E('td', { 'style': 'font-weight: bold; vertical-align: middle; padding: 8px;' }, gname),
+					E('td', { 'style': 'vertical-align: middle; padding: 8px;' }, E('span', { 'class': 'label info', 'style': 'background-color: #17a2b8; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px;' }, g.type.toUpperCase())),
+					E('td', { 'style': 'vertical-align: middle; padding: 8px;' }, select_el)
+				]));
+			}
+		}
+
+		var proxy_groups_panel;
+		if (controller_up && selector_groups_count > 0) {
+			proxy_groups_panel = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
+				E('h3', { 'style': 'margin-top: 0; margin-bottom: 15px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, _('分流策略组管理 (实时切换节点)')),
+				E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
+					E('thead', {}, [
+						E('tr', {}, [
+							E('th', { 'width': '40%', 'style': 'background: rgba(0,0,0,0.02);' }, _('策略组名称')),
+							E('th', { 'width': '20%', 'style': 'background: rgba(0,0,0,0.02);' }, _('类型')),
+							E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('选择节点'))
+						])
+					]),
+					E('tbody', {}, group_rows)
+				])
+			]);
+		} else {
+			var pg_hint = controller_up
+				? _('该订阅配置中暂无可选的策略组（selector）。')
+				: _('Mihomo 核心未运行或控制器不可达，无法进行实时策略组切换。请先在上方「运行状态」点击「启动」，刷新本页面后再试。');
+			proxy_groups_panel = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
+				E('h3', { 'style': 'margin-top: 0; margin-bottom: 10px;' }, _('分流策略组管理')),
+				E('div', { 'style': 'padding: 10px; text-align: center; color: #ff4757; background: rgba(255, 71, 87, 0.05); border-radius: 4px; font-weight: bold;' }, 
+					pg_hint
+				)
+			]);
+		}
+
+		var node_cards = [];
+		var delay_els = {};
+		var valid_node_count = 0;
+		for (var i = 0; i < proxies.length; i++) {
+			var p = proxies[i];
+			if (p && p.name && p.type) {
+				valid_node_count++;
+				var card_tip = _('节点类型') + '：' + p.type + '\\n' + _('服务器地址') + '：' + (p.server || '-');
+				var delay_el = E('div', { 'style': 'font-size: 12px; color: #888; margin-top: 6px;' }, _('延时 —'));
+				delay_els[p.name] = delay_el;
+				var tip = E('div', { 'style': 'display:none; position:absolute; left:0; top:100%; z-index:50; margin-top:4px; background:#333; color:#fff; padding:6px 8px; border-radius:4px; font-size:11px; white-space:pre-line; max-width:240px; word-break:break-all;' }, card_tip);
+				var card = E('div', {
+					'style': 'position:relative; border:1px solid rgba(0,0,0,0.08); border-radius:8px; padding:10px; background:#fff; cursor:default; min-height:60px; display:flex; flex-direction:column; justify-content:space-between;',
+					'onmouseover': (function(t) { return function() { t.style.display = 'block'; }; })(tip),
+					'onmouseout': (function(t) { return function() { t.style.display = 'none'; }; })(tip)
+				}, [
+					E('div', { 'style': 'font-weight:bold; font-size:13px; line-height:1.3; word-break:break-all;' }, p.name),
+					delay_el,
+					tip
+				]);
+				node_cards.push(card);
+			}
+		}
+
+		var sub_url = uci.get('mihomo', 'config', 'subscription_url') || '';
+
+		var run_delay_test = function() {
+			if (!valid_node_count) return;
+			ui.addNotification(null, E('p', _('正在测试节点延时...')), 'info');
+			for (var i = 0; i < proxies.length; i++) {
+				var p = proxies[i];
+				if (p && p.name && delay_els[p.name]) delay_els[p.name].textContent = _('测试中...');
+			}
+			fs.exec('/usr/share/mihomo/helper.sh', ['test_all_nodes']).then(function(res) {
+				try {
+					var arr = JSON.parse((res.stdout || '[]').trim());
+					for (var i = 0; i < proxies.length; i++) {
+						var p = proxies[i];
+						var el = delay_els[p.name];
+						if (!el) continue;
+						var d = arr[i];
+						if (d && typeof d.delay === 'number' && d.delay >= 0) {
+							el.textContent = d.delay + ' ms';
+						} else {
+							var reason = (d && d.msg) || '';
+							if (reason === 'controller_unreachable') el.textContent = _('控制器未连接');
+							else if (reason) el.textContent = _('失败') + ':' + String(reason).slice(0, 16);
+							else el.textContent = _('超时/失败');
+						}
+					}
+				} catch (e) {
+					for (var k in delay_els) delay_els[k].textContent = _('超时/失败');
+				}
+			}).catch(function() {
+				for (var k in delay_els) delay_els[k].textContent = _('超时/失败');
+			});
+		};
+
+		var node_test_btn = E('button', {
+			'class': 'cbi-button cbi-button-action',
+			'style': 'float: right; margin-top: -2px;',
+			'click': function(ev) {
+				ev.preventDefault();
+				run_delay_test();
+			}
+		}, _('测试'));
+
+		var node_clear_btn = E('button', {
+			'class': 'cbi-button cbi-button-reset',
+			'style': 'float: right; margin-top: -2px; margin-right: 8px;',
+			'click': function(ev) {
+				ev.preventDefault();
+				if (!confirm(_('确定要删除所有已订阅的节点吗？此操作不可恢复，删除后需重新更新订阅。'))) return;
+				ui.showModal(_('正在清空节点'), [ E('p', {}, _('正在删除所有已订阅的节点...')) ]);
+				return fs.exec('/usr/share/mihomo/helper.sh', ['clear_subscription']).then(function(res) {
+					ui.hideModal();
+					ui.addNotification(null, E('p', _('已清空所有订阅节点。')), 'info');
+					location.reload();
+				}).catch(function(err) {
+					ui.hideModal();
+					ui.addNotification(null, E('p', _('清空节点失败：') + err.message), 'danger');
+				});
+			}
+		}, _('清空节点'));
+
+		var node_header_right = E('div', { 'style': 'display: flex; gap: 8px; align-items: center;' }, []);
+		if (valid_node_count > 0) {
+			node_header_right.appendChild(node_clear_btn);
+			if (controller_up) node_header_right.appendChild(node_test_btn);
+		}
+		var node_list_header_children = [ E('h3', { 'style': 'margin-top: 0; margin-bottom: 0;' }, _('配置订阅节点列表')), node_header_right ];
+		var node_list_header = E('div', { 'style': 'display: flex; align-items: center; justify-content: space-between;' }, node_list_header_children);
+
+		var node_list_schedule = null;
+		if (schedule.auto_update === '1') {
+			var sched_txt = _('自动更新：每 ') + schedule.interval + _(' 小时');
+			if (schedule.last_update && schedule.last_update !== '') {
+				sched_txt += _('　|　上次更新：') + new Date(parseInt(schedule.last_update, 10) * 1000).toLocaleString();
+			}
+			if (schedule.next_update && schedule.next_update !== '') {
+				sched_txt += _('　|　下次更新：') + new Date(parseInt(schedule.next_update, 10) * 1000).toLocaleString();
+			} else if (schedule.has_url !== '1') {
+				sched_txt += _('　|　未配置订阅链接');
+			}
+			node_list_schedule = E('div', {
+				'style': 'margin-top: 8px; font-size: 12px; color: #888;'
+			}, sched_txt);
+		}
+
+		var node_list_hint = null;
+		if (valid_node_count > 0 && !controller_up) {
+			node_list_hint = E('div', {
+				'style': 'margin-top: 12px; padding: 10px 12px; border-radius: 6px; background: rgba(255, 159, 67, 0.08); border: 1px solid #ff9f43; color: #e67e22; font-size: 13px; line-height: 1.5;'
+			}, _('Mihomo 核心未运行或控制器不可达，无法测试节点延时。请先在上方「运行状态」点击「启动」，刷新本页面后再测试。'));
+		}
+
+		var node_list_body;
+		if (valid_node_count > 0) {
+			node_list_body = E('div', { 'style': 'display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 200px)); gap: 10px; margin-top: 12px;' }, node_cards);
+		} else if (parse_error) {
+			var retry_update_btn = E('button', {
+				'class': 'cbi-button cbi-button-action',
+				'style': 'margin-top: 10px;',
+				'click': function(ev) {
+					ev.preventDefault();
+					ui.showModal(_('正在下载订阅配置'), [
+						E('p', {}, _('正在从订阅链接下载节点和规则配置... 请稍候。'))
+					]);
+					return fs.exec('/usr/share/mihomo/helper.sh', ['update_subscription', sub_url]).then(function(res) {
+						ui.hideModal();
+						if (res.code === 0) {
+							ui.addNotification(null, E('p', _('订阅配置已成功更新！')), 'info');
+							location.reload();
+						} else {
+							ui.addNotification(null, E('p', _('更新配置失败：') + (res.stderr || res.stdout || '')), 'danger');
+						}
+					}).catch(function(err) {
+						ui.hideModal();
+						ui.addNotification(null, E('p', _('下载订阅失败：') + err.message), 'danger');
 					});
-\t\t\t\t})(proxies[i]);
-\t\t\t}
-\t\t};
+				}
+			}, _('重新更新订阅'));
+			node_list_body = E('div', { 'style': 'padding: 20px; text-align: center; color: #ff4757; background: rgba(255, 71, 87, 0.05); border-radius: 6px; border: 1px dashed #ff4757; line-height: 1.6;' }, [
+				E('p', { 'style': 'font-weight: bold; margin: 0;' }, parse_error),
+				retry_update_btn
+			]);
+		} else if (sub_url) {
+			var quick_update_btn = E('button', {
+				'class': 'cbi-button cbi-button-action',
+				'style': 'margin-top: 10px;',
+				'click': function(ev) {
+					ev.preventDefault();
+					ui.showModal(_('正在下载订阅配置'), [
+						E('p', {}, _('正在从订阅链接下载节点和规则配置... 请稍候。'))
+					]);
+					return fs.exec('/usr/share/mihomo/helper.sh', ['update_subscription', sub_url]).then(function(res) {
+						ui.hideModal();
+						if (res.code === 0) {
+							ui.addNotification(null, E('p', _('订阅配置已成功更新！')), 'info');
+							location.reload();
+						} else {
+							ui.addNotification(null, E('p', _('更新配置失败：') + (res.stderr || res.stdout || '')), 'danger');
+						}
+					}).catch(function(err) {
+						ui.hideModal();
+						ui.addNotification(null, E('p', _('下载订阅失败：') + err.message), 'danger');
+					});
+				}
+			}, _('立即更新订阅'));
+			node_list_body = E('div', { 'style': 'padding: 20px; text-align: center; color: #ff9f43; background: rgba(255, 159, 67, 0.05); border-radius: 6px; border: 1px dashed #ff9f43;' }, [
+				E('p', { 'style': 'font-weight: bold; margin: 0;' }, _('⚠️ 已配置订阅链接，但本地尚未下载节点数据。')),
+				quick_update_btn
+			]);
+		} else {
+			node_list_body = E('div', { 'style': 'padding: 15px; text-align: center; color: #999;' }, _('暂无可用节点信息，请先输入订阅链接并点击立即更新订阅。'));
+		}
 
-\t\tvar node_test_btn = E('button', {
-\t\t\t'class': 'cbi-button cbi-button-action',
-\t\t\t'style': 'float: right; margin-top: -2px;',
-\t\t\t'click': function(ev) {
-\t\t\t\tev.preventDefault();
-\t\t\t\trun_delay_test();
-\t\t\t}
-\t\t}, _('测试'));
+		var logs_textarea = E('textarea', {
+			'style': 'width: 100%; height: 250px; font-family: monospace; padding: 12px; border-radius: 6px; border: 1px solid rgba(0,0,0,0.12); background: rgba(0,0,0,0.02); resize: vertical; margin-bottom: 12px; font-size: 13px; line-height: 1.5;',
+			'readonly': 'readonly'
+		}, logs);
+		var clear_logs_btn = E('button', {
+			'class': 'cbi-button cbi-button-neutral',
+			'style': 'margin: 0;',
+			'click': function(ev) {
+				ev.preventDefault();
+				logs_textarea.value = '';
+			}
+		}, _('清空'));
 
-\t\tvar node_list_header_children = [ E('h3', { 'style': 'margin-top: 0; margin-bottom: 0;' }, _('配置订阅节点列表')) ];
-\t\tif (valid_node_count > 0 && controller_up) {
-\t\t\tnode_list_header_children.push(node_test_btn);
-\t\t}
-\t\tvar node_list_header = E('div', { 'style': 'display: flex; align-items: center; justify-content: space-between;' }, node_list_header_children);
+		var view_html = E('div', { 'class': 'cbi-map' }, [
+			E('h2', {}, _('Mihomo 代理仪表盘')),
+			E('p', {}, _('管理 Mihomo 核心守护进程，监控运行状态并选择代理节点。')),
 
-\t\tvar node_list_hint = null;
-\t\tif (valid_node_count > 0 && !controller_up) {
-\t\t\tnode_list_hint = E('div', {
-\t\t\t\t'style': 'margin-top: 12px; padding: 10px 12px; border-radius: 6px; background: rgba(255, 159, 67, 0.08); border: 1px solid #ff9f43; color: #e67e22; font-size: 13px; line-height: 1.5;'
-\t\t\t}, _('Mihomo 核心未运行或控制器不可达，无法测试节点延时。请先在上方「运行状态」点击「启动」，刷新本页面后再测试。'));
-\t\t}
+			// Status panel
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, _('服务运行状态')),
+				E('table', { 'class': 'table' }, [
+					E('tr', {}, [
+						E('td', { 'width': '33%' }, _('守护进程状态')),
+						E('td', {}, status_badge)
+					]),
+					E('tr', {}, [
+						E('td', {}, _('已安装核心版本')),
+						E('td', {}, E('strong', {}, core_ver))
+					])
+				]),
+				
+				E('div', { 'class': 'cbi-section-node' }, [
+					E('button', {
+						'class': 'cbi-button cbi-button-apply',
+						'style': 'margin-right: 10px;',
+						'click': function(ev) {
+							ev.preventDefault();
+							return fs.exec('/etc/init.d/mihomo', ['start']).then(function() {
+								location.reload();
+							});
+						}
+					}, _('启动')),
+					E('button', {
+						'class': 'cbi-button cbi-button-reset',
+						'style': 'margin-right: 10px;',
+						'click': function(ev) {
+							ev.preventDefault();
+							return fs.exec('/etc/init.d/mihomo', ['stop']).then(function() {
+								location.reload();
+							});
+						}
+					}, _('停止')),
+					E('button', {
+						'class': 'cbi-button cbi-button-action',
+						'click': function(ev) {
+							ev.preventDefault();
+							return fs.exec('/etc/init.d/mihomo', ['restart']).then(function() {
+								location.reload();
+							});
+						}
+					}, _('重启'))
+				])
+			]),
 
-\t\tvar node_list_body;
-\t\tif (valid_node_count > 0) {
-\t\t\tnode_list_body = E('div', { 'style': 'display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 200px)); gap: 10px; margin-top: 12px;' }, node_cards);
-\t\t} else if (parse_error) {
-\t\t\tvar retry_update_btn = E('button', {
-\t\t\t\t'class': 'cbi-button cbi-button-action',
-\t\t\t\t'style': 'margin-top: 10px;',
-\t\t\t\t'click': function(ev) {
-\t\t\t\t\tev.preventDefault();
-\t\t\t\t\tui.showModal(_('正在下载订阅配置'), [
-\t\t\t\t\t\tE('p', {}, _('正在从订阅链接下载节点和规则配置... 请稍候。'))
-\t\t\t\t\t]);
-\t\t\t\t\treturn fs.exec('/usr/share/mihomo/helper.sh', ['update_subscription', sub_url]).then(function(res) {
-\t\t\t\t\t\tui.hideModal();
-\t\t\t\t\t\tif (res.code === 0) {
-\t\t\t\t\t\t\tui.addNotification(null, E('p', _('订阅配置已成功更新！')), 'info');
-\t\t\t\t\t\t\tlocation.reload();
-\t\t\t\t\t\t} else {
-\t\t\t\t\t\t\tui.addNotification(null, E('p', _('更新配置失败：') + (res.stderr || res.stdout || '')), 'danger');
-\t\t\t\t\t\t}
-\t\t\t\t\t}).catch(function(err) {
-\t\t\t\t\t\tui.hideModal();
-\t\t\t\t\t\tui.addNotification(null, E('p', _('下载订阅失败：') + err.message), 'danger');
-\t\t\t\t\t});
-\t\t\t\t}
-\t\t\t}, _('重新更新订阅'));
-\t\t\tnode_list_body = E('div', { 'style': 'padding: 20px; text-align: center; color: #ff4757; background: rgba(255, 71, 87, 0.05); border-radius: 6px; border: 1px dashed #ff4757; line-height: 1.6;' }, [
-\t\t\t\tE('p', { 'style': 'font-weight: bold; margin: 0;' }, parse_error),
-\t\t\t\tretry_update_btn
-\t\t\t]);
-\t\t} else if (sub_url) {
-\t\t\tvar quick_update_btn = E('button', {
-\t\t\t\t'class': 'cbi-button cbi-button-action',
-\t\t\t\t'style': 'margin-top: 10px;',
-\t\t\t\t'click': function(ev) {
-\t\t\t\t\tev.preventDefault();
-\t\t\t\t\tui.showModal(_('正在下载订阅配置'), [
-\t\t\t\t\t\tE('p', {}, _('正在从订阅链接下载节点和规则配置... 请稍候。'))
-\t\t\t\t\t]);
-\t\t\t\t\treturn fs.exec('/usr/share/mihomo/helper.sh', ['update_subscription', sub_url]).then(function(res) {
-\t\t\t\t\t\tui.hideModal();
-\t\t\t\t\t\tif (res.code === 0) {
-\t\t\t\t\t\t\tui.addNotification(null, E('p', _('订阅配置已成功更新！')), 'info');
-\t\t\t\t\t\t\tlocation.reload();
-\t\t\t\t\t\t} else {
-\t\t\t\t\t\t\tui.addNotification(null, E('p', _('更新配置失败：') + (res.stderr || res.stdout || '')), 'danger');
-\t\t\t\t\t\t}
-\t\t\t\t\t}).catch(function(err) {
-\t\t\t\t\t\tui.hideModal();
-\t\t\t\t\t\tui.addNotification(null, E('p', _('下载订阅失败：') + err.message), 'danger');
-\t\t\t\t\t});
-\t\t\t\t}
-\t\t\t}, _('立即更新订阅'));
-\t\t\tnode_list_body = E('div', { 'style': 'padding: 20px; text-align: center; color: #ff9f43; background: rgba(255, 159, 67, 0.05); border-radius: 6px; border: 1px dashed #ff9f43;' }, [
-\t\t\t\tE('p', { 'style': 'font-weight: bold; margin: 0;' }, _('⚠️ 已配置订阅链接，但本地尚未下载节点数据。')),
-\t\t\t\tquick_update_btn
-\t\t\t]);
-\t\t} else {
-\t\t\tnode_list_body = E('div', { 'style': 'padding: 15px; text-align: center; color: #999;' }, _('暂无可用节点信息，请先输入订阅链接并点击立即更新订阅。'));
-\t\t}
+			// Proxy groups switching panel
+			proxy_groups_panel,
 
-\t\tvar logs_textarea = E('textarea', {
-\t\t\t'style': 'width: 100%; height: 250px; font-family: monospace; padding: 12px; border-radius: 6px; border: 1px solid rgba(0,0,0,0.12); background: rgba(0,0,0,0.02); resize: vertical; margin-bottom: 12px; font-size: 13px; line-height: 1.5;',
-\t\t\t'readonly': 'readonly'
-\t\t}, logs);
-\t\tvar clear_logs_btn = E('button', {
-\t\t\t'class': 'cbi-button cbi-button-neutral',
-\t\t\t'style': 'margin: 0;',
-\t\t\t'click': function(ev) {
-\t\t\t\tev.preventDefault();
-\t\t\t\tlogs_textarea.value = '';
-\t\t\t}
-\t\t}, _('清空'));
+			// Nodes list panel
+			E('div', { 'class': 'cbi-section' }, [
+				node_list_header,
+				node_list_schedule,
+				node_list_body,
+				node_list_hint
+			].filter(function(x) { return x !== null; })),
 
-\t\tvar view_html = E('div', { 'class': 'cbi-map' }, [
-\t\t\tE('h2', {}, _('Mihomo 代理仪表盘')),
-\t\t\tE('p', {}, _('管理 Mihomo 核心守护进程，监控运行状态并选择代理节点。')),
+			// Core Management panel
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, _('核心程序管理')),
+				core_manager_body
+			]),
 
-\t\t\t// Status panel
-\t\t\tE('div', { 'class': 'cbi-section' }, [
-\t\t\t\tE('h3', {}, _('服务运行状态')),
-\t\t\t\tE('table', { 'class': 'table' }, [
-\t\t\t\t\tE('tr', {}, [
-\t\t\t\t\t\tE('td', { 'width': '33%' }, _('守护进程状态')),
-\t\t\t\t\t\tE('td', {}, status_badge)
-\t\t\t\t\t]),
-\t\t\t\t\tE('tr', {}, [
-\t\t\t\t\t\tE('td', {}, _('已安装核心版本')),
-\t\t\t\t\t\tE('td', {}, E('strong', {}, core_ver))
-\t\t\t\t\t])
-\t\t\t\t]),
-\t\t\t\t
-\t\t\t\tE('div', { 'class': 'cbi-section-node' }, [
-\t\t\t\t\tE('button', {
-\t\t\t\t\t	'class': 'cbi-button cbi-button-apply',
-\t\t\t\t\t	'style': 'margin-right: 10px;',
-\t\t\t\t\t	'click': function(ev) {
-\t\t\t\t\t		ev.preventDefault();
-\t\t\t\t\t		return fs.exec('/etc/init.d/mihomo', ['start']).then(function() {
-\t\t\t\t\t			location.reload();
-\t\t\t\t\t		});
-\t\t\t\t		}
-\t\t\t\t	}, _('启动')),
-\t\t\t\t\tE('button', {
-\t\t\t\t\t	'class': 'cbi-button cbi-button-reset',
-\t\t\t\t		'style': 'margin-right: 10px;',
-\t\t\t\t		'click': function(ev) {
-\t\t\t\t\t		ev.preventDefault();
-\t\t\t\t			return fs.exec('/etc/init.d/mihomo', ['stop']).then(function() {
-\t\t\t\t				location.reload();
-\t\t\t\t			});
-\t\t\t\t		}
-\t\t\t\t	}, _('停止')),
-\t\t\t\t\tE('button', {
-\t\t\t\t\t	'class': 'cbi-button cbi-button-action',
-\t\t\t\t		'click': function(ev) {
-\t\t\t\t\t		ev.preventDefault();
-\t\t\t\t			return fs.exec('/etc/init.d/mihomo', ['restart']).then(function() {
-\t\t\t\t				location.reload();
-\t\t\t\t			});
-\t\t\t\t		}
-\t\t\t\t	}, _('重启'))
-\t\t\t\t])
-\t\t\t]),
+			// Logs panel
+			E('div', { 'class': 'cbi-section' }, [
+				E('div', { 'style': 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;' }, [
+					E('h3', { 'style': 'margin: 0;' }, _('系统代理日志')),
+					clear_logs_btn
+				]),
+				logs_textarea
+			])
+		]);
 
-\t\t\t// Proxy groups switching panel
-\t\t\tproxy_groups_panel,
-
-\t\t\t// Nodes list panel
-\t\t\tE('div', { 'class': 'cbi-section' }, [
-\t\t\t\tnode_list_header,
-\t\t\t\tnode_list_body,
-\t\t\t\tnode_list_hint
-\t\t\t]),
-
-\t\t\t// Core Management panel
-\t\t\tE('div', { 'class': 'cbi-section' }, [
-\t\t\t\tE('h3', {}, _('核心程序管理')),
-\t\t\t\tcore_manager_body
-\t\t\t]),
-
-\t\t\t// Logs panel
-\t\t\tE('div', { 'class': 'cbi-section' }, [
-\t\t\t\tE('div', { 'style': 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;' }, [
-\t\t\t\t\tE('h3', { 'style': 'margin: 0;' }, _('系统代理日志')),
-\t\t\t\t\tclear_logs_btn
-\t\t\t\t]),
-\t\t\t\tlogs_textarea
-\t\t\t])
-\t\t]);
-
-\t\treturn view_html;
-\t}
+		return view_html;
+	}
 });
 """,
     "root/www/luci-static/resources/view/mihomo/settings.js": """'use strict';
@@ -1727,105 +2014,139 @@ return view.extend({
 'require fs';
 
 return view.extend({
-\trender: function() {
-\t\tvar m, s, o;
+	render: function() {
+		var m, s, o;
 
-\t\tm = new form.Map('mihomo', _('Mihomo 代理设置'),
-\t\t\t_('配置代理服务参数、DNS 解析器和订阅节点信息。'));
-\t\t
-\t\tm.restart = 'mihomo';
+		m = new form.Map('mihomo', _('Mihomo 代理设置'),
+			_('配置代理服务参数、DNS 解析器和订阅节点信息。'));
+		
+		m.restart = 'mihomo';
 
-\t\ts = m.section(form.TypedSection, 'mihomo', _('常规设置'));
-\t\ts.anonymous = true;
+		s = m.section(form.TypedSection, 'mihomo', _('常规设置'));
+		s.anonymous = true;
 
-\t\to = s.option(form.Value, 'subscription_url', _('订阅链接'), _('用于下载节点配置的 Clash 兼容订阅链接。'));
-\t\to.rmempty = true;
+		o = s.option(form.Value, 'subscription_url', _('订阅链接'), _('用于下载节点配置的 Clash 兼容订阅链接。'));
+		o.rmempty = true;
 
-\t\t// 订阅管理按钮，直接放在订阅链接下方
-\t\to = s.option(form.DummyValue, '_update_btn', _('订阅管理'));
-\t\to.rawhtml = true;
-\t\to.cfgvalue = function(section_id) {
-\t\t\tvar update_btn = E('button', {
-\t\t\t\t'class': 'cbi-button cbi-button-action',
-\t\t\t\t'click': function(ev) {
-\t\t\t\t\tev.preventDefault();
-\t\t\t\t\tvar url_input = document.getElementById('cbid.mihomo.' + section_id + '.subscription_url');
-\t\t\t\t\tvar url = url_input ? url_input.value.trim() : '';
+		// 订阅管理按钮，直接放在订阅链接下方
+		o = s.option(form.DummyValue, '_update_btn', _('订阅管理'));
+		o.rawhtml = true;
+		o.cfgvalue = function(section_id) {
+			var update_btn = E('button', {
+				'class': 'cbi-button cbi-button-action',
+				'click': function(ev) {
+					ev.preventDefault();
+					var url_input = document.getElementById('cbid.mihomo.' + section_id + '.subscription_url');
+					var url = url_input ? url_input.value.trim() : '';
 					if (!url) {
 						url = uci.get('mihomo', section_id, 'subscription_url') || '';
 					}
-\t\t\t\t\t
-\t\t\t\t\tif (!url) {
-\t\t\t\t\t\tui.addNotification(null, E('p', _('请先输入有效的订阅链接并点击保存！')), 'warning');
-\t\t\t\t\t\treturn;
-\t\t\t\t\t}
+					
+					if (!url) {
+						ui.addNotification(null, E('p', _('请先输入有效的订阅链接并点击保存！')), 'warning');
+						return;
+					}
 
-\t\t\t\t\t// 将订阅链接缓存到 UCI，避免刷新或跳转后丢失
-\t\t\t\t\tuci.set('mihomo', section_id, 'subscription_url', url).then(function() {
-\t\t\t\t\t\treturn uci.commit('mihomo');
-\t\t\t\t\t}).catch(function() {});
+					// 将订阅链接缓存到 UCI，避免刷新或跳转后丢失
+					uci.set('mihomo', section_id, 'subscription_url', url).then(function() {
+						return uci.commit('mihomo');
+					}).catch(function() {});
 
-\t\t\t\t\tui.showModal(_('正在下载订阅配置'), [
-\t\t\t\t\t\tE('p', {}, _('正在从订阅链接下载节点和规则配置... 请稍候。'))
-\t\t\t\t\t]);
+					ui.showModal(_('正在下载订阅配置'), [
+						E('p', {}, _('正在从订阅链接下载节点和规则配置... 请稍候。'))
+					]);
 
-\t\t\t\t\treturn fs.exec('/usr/share/mihomo/helper.sh', ['update_subscription', url]).then(function(res) {
-\t\t\t\t\t\tui.hideModal();
-\t\t\t\t\t\tif (res.code === 0) {
-\t\t\t\t\t\t\tui.addNotification(null, E('p', _('订阅配置已成功更新！')), 'info');
-\t\t\t\t\t\t} else {
-\t\t\t\t\t\t\tui.addNotification(null, E('p', _('更新配置失败：') + (res.stderr || res.stdout || '')), 'danger');
-\t\t\t\t\t\t}
-\t\t\t\t\t}).catch(function(err) {
-\t\t\t\t\t\tui.hideModal();
-\t\t\t\t\t\tui.addNotification(null, E('p', _('下载订阅失败：') + err.message), 'danger');
-\t\t\t\t\t});
-\t\t\t\t}
-\t\t\t}, _('立即更新订阅'));
-\t\t\t
-\t\t\treturn E('div', {}, [update_btn]);
-\t\t};
+					return fs.exec('/usr/share/mihomo/helper.sh', ['update_subscription', url]).then(function(res) {
+						ui.hideModal();
+						if (res.code === 0) {
+							ui.addNotification(null, E('p', _('订阅配置已成功更新！')), 'info');
+						} else {
+							ui.addNotification(null, E('p', _('更新配置失败：') + (res.stderr || res.stdout || '')), 'danger');
+						}
+					}).catch(function(err) {
+						ui.hideModal();
+						ui.addNotification(null, E('p', _('下载订阅失败：') + err.message), 'danger');
+					});
+				}
+			}, _('立即更新订阅'));
+			
+			return E('div', {}, [update_btn]);
+		};
 
-\t\to = s.option(form.Value, 'test_url', _('延时测试地址'), _('节点「测试」按钮用来探测延时的目标 URL。某些网络环境下默认地址不可达会导致所有节点都显示失败，可改为你网络中可正常访问的地址（如 https://www.google.com/generate_204）。留空使用默认。'));
-\t\to.rmempty = true;
-\t\to.placeholder = 'https://www.gstatic.com/generate_204';
+		o = s.option(form.Flag, 'auto_update', _('定时更新订阅'), _('开启后，系统会每小时检查一次，并按下方设置的时间间隔自动重新下载订阅节点（需已配置订阅链接）。'));
+	o.rmempty = false;
 
-\t\to = s.option(form.Flag, 'tun_enabled', _('启用 TUN 模式'), _('使用虚拟网卡 (TUN) 接口进行全局流量接管。接管更彻底但会消耗略高 CPU。'));
-\t\to.rmempty = false;
+	o = s.option(form.Value, 'update_interval', _('更新间隔（小时）'), _('自动更新订阅的时间间隔，单位：小时。例如填 24 表示每天更新一次，填 6 表示每 6 小时更新一次。'));
+	o.rmempty = true;
+	o.datatype = 'uinteger';
+	o.value('6', _('每 6 小时'));
+	o.value('12', _('每 12 小时'));
+	o.value('24', _('每天'));
+	o.value('48', _('每 2 天'));
+	o.placeholder = '24';
 
-\t\to = s.option(form.Flag, 'dns_hijack', _('劫持系统 DNS'), _('将本地所有 DNS 请求劫持并转发给 Mihomo 内置的 DNS 服务。'));
-\t\to.rmempty = false;
+	o = s.option(form.DummyValue, '_clear_btn', _('节点管理'));
+	o.rawhtml = true;
+	o.cfgvalue = function(section_id) {
+		var clear_btn = E('button', {
+			'class': 'cbi-button cbi-button-reset',
+			'click': function(ev) {
+				ev.preventDefault();
+				if (!confirm(_('确定要删除所有已订阅的节点吗？此操作不可恢复，删除后需重新更新订阅。'))) return;
+				ui.showModal(_('正在清空节点'), [ E('p', {}, _('正在删除所有已订阅的节点...')) ]);
+				return fs.exec('/usr/share/mihomo/helper.sh', ['clear_subscription']).then(function(res) {
+					ui.hideModal();
+					ui.addNotification(null, E('p', _('已清空所有订阅节点。')), 'info');
+					location.reload();
+				}).catch(function(err) {
+					ui.hideModal();
+					ui.addNotification(null, E('p', _('清空节点失败：') + err.message), 'danger');
+				});
+			}
+		}, _('清空已订阅节点'));
+		return E('div', {}, [clear_btn]);
+	};
 
-\t\t// Advanced Section
-\t\ts = m.section(form.TypedSection, 'mihomo', _('高级设置'));
-\t\ts.anonymous = true;
+	o = s.option(form.Value, 'test_url', _('延时测试地址'), _('节点「测试」按钮用来探测延时的目标 URL。某些网络环境下默认地址不可达会导致所有节点都显示失败，可改为你网络中可正常访问的地址（如 https://www.google.com/generate_204）。留空使用默认。'));
+		o.rmempty = true;
+		o.placeholder = 'https://www.gstatic.com/generate_204';
 
-\t\to = s.option(form.Value, 'core_path', _('核心程序路径'), _('Mihomo 核心程序的可执行文件绝对路径。'));
-\t\to.placeholder = '/usr/bin/mihomo';
-\t\to.rmempty = false;
+		o = s.option(form.Flag, 'tun_enabled', _('启用 TUN 模式'), _('使用虚拟网卡 (TUN) 接口进行全局流量接管。接管更彻底但会消耗略高 CPU。'));
+		o.rmempty = false;
 
-\t\to = s.option(form.Value, 'config_path', _('订阅配置文件路径'), _('保存订阅节点和分流规则的 YAML 配置文件路径。'));
-\t\to.placeholder = '/etc/mihomo/config.yaml';
-\t\to.rmempty = false;
+		o = s.option(form.Flag, 'dns_hijack', _('劫持系统 DNS'), _('将本地所有 DNS 请求劫持并转发给 Mihomo 内置的 DNS 服务。'));
+		o.rmempty = false;
 
-\t\to = s.option(form.Value, 'work_dir', _('工作目录'), _('Mihomo (Clash Meta) 工作数据库与配置根目录。'));
-\t\to.placeholder = '/etc/mihomo';
-\t\to.rmempty = false;
+		// Advanced Section
+		s = m.section(form.TypedSection, 'mihomo', _('高级设置'));
+		s.anonymous = true;
 
-\t\to = s.option(form.Value, 'mix_port', _('Mixed 端口'), _('集成 HTTP(S) 和 SOCKS5 的混合代理端口。'));
-\t\to.placeholder = '7890';
-\t\to.rmempty = false;
+		o = s.option(form.Value, 'core_path', _('核心程序路径'), _('Mihomo 核心程序的可执行文件绝对路径。'));
+		o.placeholder = '/usr/bin/mihomo';
+		o.rmempty = false;
 
-\t\to = s.option(form.Value, 'tproxy_port', _('TProxy 端口'), _('TCP/UDP 透明代理使用的 TProxy 监听端口。'));
-\t\to.placeholder = '7893';
-\t\to.rmempty = false;
+		o = s.option(form.Value, 'config_path', _('订阅配置文件路径'), _('保存订阅节点和分流规则的 YAML 配置文件路径。'));
+		o.placeholder = '/etc/mihomo/config.yaml';
+		o.rmempty = false;
 
-\t\to = s.option(form.Value, 'dns_port', _('DNS 端口'), _('Mihomo 本地 DNS 解析器监听端口。'));
-\t\to.placeholder = '1053';
-\t\to.rmempty = false;
+		o = s.option(form.Value, 'work_dir', _('工作目录'), _('Mihomo (Clash Meta) 工作数据库与配置根目录。'));
+		o.placeholder = '/etc/mihomo';
+		o.rmempty = false;
 
-\t\treturn m.render();
-\t}
+		o = s.option(form.Value, 'mix_port', _('Mixed 端口'), _('集成 HTTP(S) 和 SOCKS5 的混合代理端口。'));
+		o.placeholder = '7890';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'tproxy_port', _('TProxy 端口'), _('TCP/UDP 透明代理使用的 TProxy 监听端口。'));
+		o.placeholder = '7893';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'dns_port', _('DNS 端口'), _('Mihomo 本地 DNS 解析器监听端口。'));
+		o.placeholder = '1053';
+		o.rmempty = false;
+
+		return m.render();
+	}
 });
 """
 }
