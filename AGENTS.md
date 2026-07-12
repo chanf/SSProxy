@@ -42,7 +42,7 @@ helper.sh 子命令分两类：
 - **静态/文件类**：`get_arch`、`check_core`、`download_core [url]`、`update_subscription <url>`、`prepare_config`、`get_proxies`
 - **实时控制类**（需核心已启动）：`get_proxy_groups`、`select_node <group> <node>` — 通过 `curl` 调用 Mihomo 外部控制器 API (`127.0.0.1:9090`)，这就是 `Depends` 要带 `curl` 的原因
 
-核心下载版本硬编码为 `v1.18.9`（GitHub `MetaCubeX/mihomo`），架构靠 `uname -m` 推断。
+核心下载版本硬编码为 `v1.19.28`（GitHub `MetaCubeX/mihomo`）。架构靠 `uname -m` 推断，且对 x86_64 会进一步检测微架构：支持 AVX2/BMI1/BMI2/FMA/F16C 的 v3 CPU 用 `amd64` 构建，否则用 `amd64-compatible` 兼容构建（J4125 等仅 v1/v2 的 CPU 必须用兼容构建，否则启动即崩溃）。
 
 > 已知瑕疵：`case` 的 `*` 兜底分支 `Usage` 提示未同步 `get_proxy_groups`/`select_node`，新增子命令时记得更新帮助文本。
 

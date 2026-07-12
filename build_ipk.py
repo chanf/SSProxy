@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-50"
+PKG_VERSION = "1.0.0-52"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -291,7 +291,7 @@ download_core() {
 \t\treturn 1
 \tfi
 
-\tlocal version="v1.18.9"
+\tlocal version="v1.19.28"
 \tlocal mirror="https://github.com/MetaCubeX/mihomo/releases/download/${version}"
 \tlocal filename="mihomo-linux-${arch}-${version}.gz"
 \tlocal url="${mirror}/${filename}"
