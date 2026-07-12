@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-46"
+PKG_VERSION = "1.0.0-48"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -227,11 +227,26 @@ service_triggers() {
     # Backend helper script to auto-detect architecture, download core, parse subscription, and merge config
     "root/usr/share/mihomo/helper.sh": """#!/bin/sh
 
+cpu_amd64_v3() {
+\t# Go GOAMD64=v3 需要 AVX2 + BMI1 + BMI2 + FMA + F16C 等指令集；
+\t# 缺少任一关键标志即视为非 v3，退回 amd64-compatible 兼容构建。
+\tgrep -qw -m1 avx2 /proc/cpuinfo 2>/dev/null || return 1
+\tgrep -qw -m1 bmi2 /proc/cpuinfo 2>/dev/null || return 1
+\tgrep -qw -m1 bmi1 /proc/cpuinfo 2>/dev/null || return 1
+\tgrep -qw -m1 fma  /proc/cpuinfo 2>/dev/null || return 1
+\tgrep -qw -m1 f16c /proc/cpuinfo 2>/dev/null || return 1
+\treturn 0
+}
+
 get_arch() {
 \tlocal raw_arch=$(uname -m)
 \tcase "$raw_arch" in
 \t\tx86_64)
-\t\t\techo "amd64"
+\t\t\tif cpu_amd64_v3; then
+\t\t\t\techo "amd64"
+\t\t\telse
+\t\t\t\techo "amd64-compatible"
+\t\t\tfi
 \t\t\t;;
 \t\taarch64)
 \t\t\techo "arm64"
