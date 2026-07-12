@@ -1057,6 +1057,11 @@ return view.extend({
 \t\t\t\t\t\treturn;
 \t\t\t\t\t}
 
+\t\t\t\t\t// 将订阅链接缓存到 UCI，避免刷新或跳转后丢失
+\t\t\t\t\tuci.set('mihomo', section_id, 'subscription_url', url).then(function() {
+\t\t\t\t\t\treturn uci.commit('mihomo');
+\t\t\t\t\t}).catch(function() {});
+
 \t\t\t\t\tui.showModal(_('正在下载订阅配置'), [
 \t\t\t\t\t\tE('p', {}, _('正在从订阅链接下载节点和规则配置... 请稍候。'))
 \t\t\t\t\t]);
