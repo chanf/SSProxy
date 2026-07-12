@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-39"
+PKG_VERSION = "1.0.0-41"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -115,9 +115,8 @@ disable_dns_hijack() {
 start_service() {
 \tconfig_load mihomo
 \t
-\tlocal enabled core_path config_path work_dir dns_port dns_hijack tproxy_port tun_enabled
-\t
-\tconfig_get_bool enabled config enabled 0
+\tlocal core_path config_path work_dir dns_port dns_hijack tproxy_port tun_enabled
+	
 \tconfig_get core_path config core_path "/usr/bin/mihomo"
 \tconfig_get config_path config config_path "/etc/mihomo/config.yaml"
 \tconfig_get work_dir config work_dir "/etc/mihomo"
@@ -125,9 +124,7 @@ start_service() {
 \tconfig_get_bool dns_hijack config dns_hijack 1
 \tconfig_get tproxy_port config tproxy_port "7893"
 \tconfig_get_bool tun_enabled config tun_enabled 0
-\t
-\t[ "$enabled" -eq 1 ] || return 0
-\t
+	
 \tif [ ! -x "$core_path" ]; then
 \t\tlogger -t mihomo "ERROR: Core binary not found or not executable at $core_path"
 \t\treturn 1
@@ -1672,9 +1669,6 @@ return view.extend({
 
 \t\ts = m.section(form.TypedSection, 'mihomo', _('常规设置'));
 \t\ts.anonymous = true;
-
-\t\to = s.option(form.Flag, 'enabled', _('启用服务'), _('开启或关闭 Mihomo 路由代理服务。'));
-\t\to.rmempty = false;
 
 \t\to = s.option(form.Value, 'subscription_url', _('订阅链接'), _('用于下载节点配置的 Clash 兼容订阅链接。'));
 \t\to.rmempty = true;
