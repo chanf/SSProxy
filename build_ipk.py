@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-44"
+PKG_VERSION = "1.0.0-46"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -1254,6 +1254,9 @@ return view.extend({
 \t\t\tproxy_groups = {};
 \t\t}
 
+\t\t// 控制器是否可达：get_proxy_groups 在核心未启动/控制器不可达时返回 {"proxies":{}}
+\t\tvar controller_up = (proxy_groups_raw.indexOf('"proxies":{}') === -1);
+
 \t\tvar is_running = false;
 \t\tif (service_data && service_data.mihomo && service_data.mihomo.instances) {
 \t\t\tvar instances = service_data.mihomo.instances;
@@ -1527,10 +1530,17 @@ return view.extend({
 \t\t}, _('测试'));
 
 \t\tvar node_list_header_children = [ E('h3', { 'style': 'margin-top: 0; margin-bottom: 0;' }, _('配置订阅节点列表')) ];
-\t\tif (valid_node_count > 0) {
+\t\tif (valid_node_count > 0 && controller_up) {
 \t\t\tnode_list_header_children.push(node_test_btn);
 \t\t}
 \t\tvar node_list_header = E('div', { 'style': 'display: flex; align-items: center; justify-content: space-between;' }, node_list_header_children);
+
+\t\tvar node_list_hint = null;
+\t\tif (valid_node_count > 0 && !controller_up) {
+\t\t\tnode_list_hint = E('div', {
+\t\t\t\t'style': 'margin-top: 12px; padding: 10px 12px; border-radius: 6px; background: rgba(255, 159, 67, 0.08); border: 1px solid #ff9f43; color: #e67e22; font-size: 13px; line-height: 1.5;'
+\t\t\t}, _('Mihomo 核心未运行或控制器不可达，无法测试节点延时。请先在上方「运行状态」点击「启动」，刷新本页面后再测试。'));
+\t\t}
 
 \t\tvar node_list_body;
 \t\tif (valid_node_count > 0) {
@@ -1650,7 +1660,8 @@ return view.extend({
 \t\t\t// Nodes list panel
 \t\t\tE('div', { 'class': 'cbi-section' }, [
 \t\t\t\tnode_list_header,
-\t\t\t\tnode_list_body
+\t\t\t\tnode_list_body,
+\t\t\t\tnode_list_hint
 \t\t\t]),
 
 \t\t\t// Core Management panel
