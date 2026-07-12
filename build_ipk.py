@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-48"
+PKG_VERSION = "1.0.0-50"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -1291,9 +1291,14 @@ return view.extend({
 
 \t\tvar core_path = uci.get('mihomo', 'config', 'core_path') || '/usr/bin/mihomo';
 
-\t\tvar status_badge = is_running 
-\t\t\t? '<span class="label success" style="background-color: #2ed573; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;">RUNNING</span>'
-\t\t\t: '<span class="label danger" style="background-color: #ff4757; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;">STOPPED</span>';
+\t\tvar status_badge;
+\t\tif (controller_up) {
+\t\t\tstatus_badge = '<span class="label success" style="background-color: #2ed573; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;">RUNNING</span>';
+\t\t} else if (is_running) {
+\t\t\tstatus_badge = '<span class="label" style="background-color: #ffa502; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;">运行异常</span>';
+\t\t} else {
+\t\t\tstatus_badge = '<span class="label danger" style="background-color: #ff4757; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;">STOPPED</span>';
+\t\t}
 
 \t\tvar perform_download = function(ev) {
 \t\t\tev.preventDefault();
@@ -1456,7 +1461,7 @@ return view.extend({
 \t\t}
 
 \t\tvar proxy_groups_panel;
-\t\tif (is_running && selector_groups_count > 0) {
+\t\tif (controller_up && selector_groups_count > 0) {
 \t\t\tproxy_groups_panel = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
 \t\t\t\tE('h3', { 'style': 'margin-top: 0; margin-bottom: 15px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, _('分流策略组管理 (实时切换节点)')),
 \t\t\t\tE('table', { 'class': 'table', 'style': 'margin: 0;' }, [
@@ -1471,10 +1476,13 @@ return view.extend({
 \t\t\t\t])
 \t\t\t]);
 \t\t} else {
+\t\t\tvar pg_hint = controller_up
+\t\t\t\t? _('该订阅配置中暂无可选的策略组（selector）。')
+\t\t\t\t: _('Mihomo 核心未运行或控制器不可达，无法进行实时策略组切换。请先在上方「运行状态」点击「启动」，刷新本页面后再试。');
 \t\t\tproxy_groups_panel = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
 \t\t\t\tE('h3', { 'style': 'margin-top: 0; margin-bottom: 10px;' }, _('分流策略组管理')),
 \t\t\t\tE('div', { 'style': 'padding: 10px; text-align: center; color: #ff4757; background: rgba(255, 71, 87, 0.05); border-radius: 4px; font-weight: bold;' }, 
-\t\t\t\t\t_('提示：Mihomo 服务未运行，无法进行实时策略组切换。请先启动服务。')
+\t\t\t\t\tpg_hint
 \t\t\t\t)
 \t\t\t]);
 \t\t}
