@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-102"
+PKG_VERSION = "1.0.0-109"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -540,19 +540,25 @@ get_schedule() {
 # src_ip is kept only for management/traceability; the rule applies to all devices.
 emit_access_rules_yaml() {
 	uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=mihomo_rule$/\\1/p' | while read -r sid; do
-		local enabled domain action group
+		local enabled domain action group rule_type rtype
 		enabled=$(uci -q get mihomo.$sid.enabled)
 		[ "$enabled" = "1" ] || continue
 		domain=$(uci -q get mihomo.$sid.domain)
 		[ -n "$domain" ] || continue
+		rule_type=$(uci -q get mihomo.$sid.rule_type)
+		case "$rule_type" in
+			domain) rtype="DOMAIN" ;;
+			keyword) rtype="DOMAIN-KEYWORD" ;;
+			*) rtype="DOMAIN-SUFFIX" ;;
+		esac
 		action=$(uci -q get mihomo.$sid.action)
 		case "$action" in
-			block) echo "  - 'DOMAIN-SUFFIX,$domain,REJECT'" ;;
-			direct) echo "  - 'DOMAIN-SUFFIX,$domain,DIRECT'" ;;
+			block) echo "  - '$rtype,$domain,REJECT'" ;;
+			direct) echo "  - '$rtype,$domain,DIRECT'" ;;
 			proxy)
 				local g
 				g=$(uci -q get mihomo.$sid.group)
-				[ -n "$g" ] && echo "  - 'DOMAIN-SUFFIX,$domain,$g'"
+				[ -n "$g" ] && echo "  - '$rtype,$domain,$g'"
 				;;
 		esac
 	done
@@ -1005,34 +1011,38 @@ get_access_rules() {
 	local sids
 	sids=$(uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=mihomo_rule$/\\1/p')
 	for sid in $sids; do
-		local ip domain action group enabled comment
+		local ip domain action group enabled comment rule_type
 		ip=$(uci -q get mihomo.$sid.src_ip)
 		domain=$(uci -q get mihomo.$sid.domain)
 		action=$(uci -q get mihomo.$sid.action)
 		group=$(uci -q get mihomo.$sid.group)
 		enabled=$(uci -q get mihomo.$sid.enabled)
 		comment=$(uci -q get mihomo.$sid.comment)
+		rule_type=$(uci -q get mihomo.$sid.rule_type)
+		[ -z "$rule_type" ] && rule_type="suffix"
 		[ -z "$domain" ] && continue
 		if [ $first -eq 0 ]; then printf ','; fi
 		first=0
-		printf '{"sid":"%s","ip":"%s","domain":"%s","action":"%s","group":"%s","enabled":"%s","comment":"%s"}' "$sid" "$ip" "$domain" "$action" "$group" "$enabled" "$comment"
+		printf '{"sid":"%s","ip":"%s","domain":"%s","action":"%s","group":"%s","enabled":"%s","comment":"%s","rule_type":"%s"}' "$sid" "$ip" "$domain" "$action" "$group" "$enabled" "$comment" "$rule_type"
 	done
 	echo "]"
 }
 
 add_access_rule() {
-	local ip="$1" domain="$2" action="$3" group="$4"
+	local ip="$1" domain="$2" action="$3" group="$4" rule_type="$5"
 	[ -z "$domain" ] && { echo "ERROR: domain required" >&2; return 1; }
 	[ -z "$action" ] && action="block"
+	[ -z "$rule_type" ] && rule_type="suffix"
 	local sid
 	sid=$(uci add mihomo mihomo_rule)
 	uci -q set mihomo.$sid.src_ip="$ip"
 	uci -q set mihomo.$sid.domain="$domain"
 	uci -q set mihomo.$sid.action="$action"
 	[ -n "$group" ] && uci -q set mihomo.$sid.group="$group"
+	uci -q set mihomo.$sid.rule_type="$rule_type"
 	uci -q set mihomo.$sid.enabled="1"
 	uci commit mihomo
-	logger -t mihomo "access_rule added: ip=$ip domain=$domain action=$action"
+	logger -t mihomo "access_rule added: ip=$ip domain=$domain action=$action rule_type=$rule_type"
 	echo "OK"
 }
 
@@ -1043,6 +1053,58 @@ del_access_rule() {
 	uci commit mihomo
 	logger -t mihomo "access_rule deleted: $sid"
 	echo "OK"
+}
+
+import_rules() {
+	local text="$1"
+	local imported=0 skipped=0 duplicates=0 skipped_samples=""
+	local tmpin tmpex tmpclean
+	tmpin=$(mktemp); tmpex=$(mktemp); tmpclean=$(mktemp)
+	echo "$text" > "$tmpin"
+	sed -e 's/[[:space:]]*$//' -e 's/^[[:space:]]*//' -e "s/^-[[:space:]]*//" -e "s/^'//" -e "s/'$//" "$tmpin" | grep -v -E '^(#|$|rules:)' > "$tmpclean"
+	uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=mihomo_rule$/\\1/p' | while read -r sid; do
+		local d a g rt
+		d=$(uci -q get mihomo.$sid.domain); a=$(uci -q get mihomo.$sid.action)
+		g=$(uci -q get mihomo.$sid.group); rt=$(uci -q get mihomo.$sid.rule_type)
+		[ -z "$rt" ] && rt="suffix"
+		[ -n "$d" ] && echo "$rt|$d|$a|$g"
+	done > "$tmpex"
+	while IFS= read -r line; do
+		[ -z "$line" ] && continue
+		local rest type value policy
+		type=${line%%,*}; rest=${line#*,}
+		[ "$rest" = "$line" ] && { skipped=$((skipped+1)); continue; }
+		value=${rest%%,*}; rest2=${rest#*,}; policy=${rest2%%,*}
+		[ -z "$type" ] || [ -z "$value" ] || [ -z "$policy" ] && { skipped=$((skipped+1)); continue; }
+		type=$(printf '%s' "$type" | tr '[:lower:]' '[:upper:]')
+		local rt action group=""
+		case "$type" in
+			DOMAIN) rt="domain" ;;
+			DOMAIN-SUFFIX) rt="suffix" ;;
+			DOMAIN-KEYWORD) rt="keyword" ;;
+			*) skipped=$((skipped+1)); case " $skipped_samples " in *" $type "*) ;; *) [ $(printf '%s' "$skipped_samples" | wc -c) -lt 200 ] && skipped_samples="$skipped_samples $type" ;; esac; continue ;;
+		esac
+		case "$policy" in
+			DIRECT) action="direct" ;;
+			REJECT) action="block" ;;
+			*) action="proxy"; group="$policy" ;;
+		esac
+		if grep -qxF "$rt|$value|$action|$group" "$tmpex"; then duplicates=$((duplicates+1)); continue; fi
+		echo "$rt|$value|$action|$group" >> "$tmpex"
+		local sid; sid=$(uci add mihomo mihomo_rule)
+		uci -q set mihomo.$sid.domain="$value"
+		uci -q set mihomo.$sid.action="$action"
+		[ -n "$group" ] && uci -q set mihomo.$sid.group="$group"
+		uci -q set mihomo.$sid.rule_type="$rt"
+		uci -q set mihomo.$sid.enabled="1"
+		imported=$((imported+1))
+	done < "$tmpclean"
+	uci commit mihomo
+	rm -f "$tmpin" "$tmpex" "$tmpclean"
+	local arr="" first=1 t
+	for t in $skipped_samples; do [ $first -eq 0 ] && arr="$arr,"; first=0; arr="$arr\\"$t\\""; done
+	echo "{\\"imported\\":$imported,\\"skipped\\":$skipped,\\"duplicates\\":$duplicates,\\"skipped_samples\\":[$arr]}"
+	return 0
 }
 
 case "$1" in
@@ -1110,13 +1172,16 @@ case "$1" in
 		get_access_rules
 		;;
 	add_access_rule)
-		add_access_rule "$2" "$3" "$4" "$5"
+		add_access_rule "$2" "$3" "$4" "$5" "$6"
 		;;
 	del_access_rule)
 		del_access_rule "$2"
 		;;
+	import_rules)
+		import_rules "$2"
+		;;
 	*)
-		echo "Usage: $0 {get_arch|check_core|download_core|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|add_access_rule|del_access_rule|test_node_delay|test_all_nodes}"
+		echo "Usage: $0 {get_arch|check_core|download_core|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|add_access_rule|del_access_rule|import_rules|test_node_delay|test_all_nodes}"
 		exit 1
 		;;
 esac
@@ -1684,6 +1749,9 @@ return view.extend({
 				var r = rules[i];
 				var action_label = r.action === 'block' ? _('拦截') : (r.action === 'direct' ? _('直连') : _('代理'));
 				var action_color = r.action === 'block' ? '#ff4757' : (r.action === 'direct' ? '#1e90ff' : '#2ed573');
+				var rt = r.rule_type || 'suffix';
+				var rt_label = rt === 'domain' ? _('精确') : (rt === 'keyword' ? _('关键字') : _('后缀'));
+				var rt_color = rt === 'domain' ? '#8e44ad' : (rt === 'keyword' ? '#e67e22' : '#7f8c8d');
 				
 				var action_node = E('span', { 'style': 'color:' + action_color + ';font-weight:bold;' }, action_label);
 				var action_td = E('td', {}, [
@@ -1693,7 +1761,10 @@ return view.extend({
 
 				var tr = E('tr', {}, [
 					E('td', {}, r.ip || '*'),
-					E('td', {}, r.domain),
+					E('td', {}, [
+						r.domain,
+						E('span', { 'style': 'margin-left:6px;font-size:11px;padding:1px 6px;border-radius:8px;background:' + rt_color + ';color:#fff;' }, rt_label)
+					]),
 					action_td,
 					E('td', {}, r.comment || ''),
 					E('td', {}, r.enabled === '0' ? _('已禁用') : _('启用')),
@@ -1715,9 +1786,14 @@ return view.extend({
 		var rule_form = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
 			E('h3', { 'style': 'margin-top: 0; margin-bottom: 15px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, _('新增访问规则')),
 			E('div', { 'class': 'cbi-value' }, [
-				E('label', { 'class': 'cbi-value-title' }, _('域名 / 后缀')),
+				E('label', { 'class': 'cbi-value-title' }, _('域名')),
 				E('div', { 'class': 'cbi-value-field' }, [
-					E('input', { 'id': 'rule_domain', 'type': 'text', 'class': 'cbi-input-text', 'placeholder': '例如 example.com（按后缀匹配）', 'style': 'width: 60%;' })
+					E('input', { 'id': 'rule_domain', 'type': 'text', 'class': 'cbi-input-text', 'placeholder': '例如 example.com（按后缀匹配）', 'style': 'width: 60%;' }),
+					E('select', { 'id': 'rule_type', 'class': 'cbi-input-select', 'style': 'margin-left:8px;width:120px;' }, [
+						E('option', { 'value': 'suffix' }, _('后缀')),
+						E('option', { 'value': 'domain' }, _('精确')),
+						E('option', { 'value': 'keyword' }, _('关键字'))
+					])
 				])
 			]),
 			E('div', { 'class': 'cbi-value' }, [
@@ -1752,8 +1828,8 @@ return view.extend({
 						var gp = document.getElementById('rule_group').value;
 						var cm = document.getElementById('rule_comment').value.trim();
 						if (!d) { ui.addNotification(null, E('p', _('请填写域名。')), 'danger'); return; }
-						var args = ['add_access_rule', ip, d, ac];
-						if (ac === 'proxy' && gp) args.push(gp);
+						var rt = document.getElementById('rule_type').value;
+						var args = ['add_access_rule', ip, d, ac, (ac === 'proxy' ? gp : ''), rt];
 						return fs.exec('/usr/share/mihomo/helper.sh', args).then(function(res) {
 							if (res.code === 0) {
 								ui.addNotification(null, E('p', _('规则已保存（需重启核心后生效）。')), 'info');
@@ -1785,6 +1861,65 @@ return view.extend({
 			])
 		]);
 
+
+		var import_form = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
+
+			E('h3', { 'style': 'margin-top: 0; margin-bottom: 10px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, _('批量导入规则')),
+
+			E('p', { 'style': 'color:#666;font-size:13px;margin-bottom:10px;' }, _('粘贴 Mihomo 规则，每行一条（如 DOMAIN-SUFFIX,example.com,DIRECT）。仅导入 DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD；IP-CIDR / GEOIP / MATCH 等会跳过。')),
+
+			E('textarea', { 'id': 'rule_import', 'class': 'cbi-input-textarea', 'style': 'width:100%;height:160px;font-family:monospace;font-size:12px;margin-bottom:10px;', 'placeholder': 'DOMAIN-SUFFIX,apple.com,DIRECT' }),
+
+			btn(_('导入'), 'cbi-button-add', function() {
+
+				var txt = document.getElementById('rule_import').value.trim();
+
+				if (!txt) { ui.addNotification(null, E('p', _('请粘贴规则内容。')), 'danger'); return; }
+
+				return fs.exec('/usr/share/mihomo/helper.sh', ['import_rules', txt]).then(function(res) {
+
+					var msg;
+
+					try {
+
+						var j = JSON.parse((res.stdout || '').trim());
+
+						msg = _('已导入 ') + j.imported + _(' 条；跳过 ') + j.skipped + _(' 条（非域名规则）') + (j.duplicates ? _('；重复 ') + j.duplicates + _(' 条') : '') + (j.skipped_samples && j.skipped_samples.length ? '：' + j.skipped_samples.join(', ') : '');
+
+					} catch (e) { msg = _('导入完成：') + (res.stdout || res.stderr || ''); }
+
+					if (res.code === 0) {
+
+						ui.addNotification(null, E('p', msg), 'info');
+
+						document.getElementById('rule_import').value = '';
+
+						self.load().then(function(new_results) {
+
+							var nr_raw = (new_results[0] && new_results[0].stdout) ? new_results[0].stdout.trim() : '[]';
+
+							try { rules = JSON.parse(nr_raw); } catch (e) { rules = []; }
+
+							render_rules();
+
+						});
+
+					} else {
+
+						ui.addNotification(null, E('p', _('导入失败：') + (res.stderr || res.stdout || '')), 'danger');
+
+					}
+
+				}).catch(function(err) {
+
+					ui.addNotification(null, E('p', _('通信错误：') + err.message), 'danger');
+
+				});
+
+			})
+
+		]);
+
 		var view_html = E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, _('Mihomo 访问规则管理')),
 			E('p', {}, _('配置并管理局域网设备的特定域名代理规则。用户规则会被注入到核心配置文件 rules 列表的最顶部以优先匹配。规则保存在 UCI，需重启核心后才能生效。')),
@@ -1808,7 +1943,9 @@ return view.extend({
 				])
 			]),
 
-			rule_form
+			rule_form,
+
+			import_form
 		]);
 
 		setTimeout(function() {
