@@ -18,16 +18,15 @@ python build_ipk.py
 
 ⚠️ **每次构建会自改 `build_ipk.py`**：`main()` 第一步调用 `increment_version()`，把 `PKG_VERSION`（如 `1.0.0-81` → `1.0.0-82`）原地重写并刷新 `IPK_FILENAME`。构建后一定有"源文件被改"的 diff，属预期；编辑该文件请以磁盘最新内容为准。
 
-## 部署
+## 部署与基本开发规则
 
-可以使用 `./deploy.sh` 脚本将最新构建的 IPK 自动上传并安装到软路由器。该脚本使用 macOS 自带的 `expect` 自动输入密码并完成以下操作：
-1. 查找 `dist/` 目录下最新生成的 IPK 文件。
-2. 通过 `scp` 上传文件至路由器的 `/tmp/` 目录。
-3. 通过 `ssh` 在路由器执行 `opkg install`，安装完成后自动重启 `mihomo` 服务。
+可以使用 `./deploy.sh` 脚本将最新构建的 IPK 自动上传并安装到软路由器。该脚本使用 macOS 自带的 `expect` 自动输入密码并完成相关步骤。
 
-运行部署：
+⚠️ **基本开发规则：** 每次构建新版本后，**必须**将最新生成的 IPK 部署并安装到服务器（即软路由）上，以确保远程测试环境的插件和本地代码完全同步。
+
+合并编译与部署执行：
 ```bash
-./deploy.sh
+python3 build_ipk.py && ./deploy.sh
 ```
 
 ## 核心架构：单源真相 `src_files`

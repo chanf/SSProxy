@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-94"
+PKG_VERSION = "1.0.0-99"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -81,8 +81,9 @@ enable_tproxy() {
 	ip rule add fwmark 1 table 100 2>/dev/null
 	ip route add local default dev lo table 100 2>/dev/null
 	
-	# 2. Add nftables redirection rules
-	nft create table inet mihomo 2>/dev/null
+	# 2. Add nftables redirection rules (delete table first to ensure clean state)
+	nft delete table inet mihomo 2>/dev/null
+	nft add table inet mihomo
 	nft add chain inet mihomo prerouting { type filter hook prerouting priority mangle \\; }
 	nft add rule inet mihomo prerouting ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } return
 	
@@ -190,8 +191,13 @@ EOF
 	
 	# Apply network redirections
 	if [ "$tun_enabled" -ne 1 ]; then
-		local acl_ips=""
+		local acl_mode acl_ips=""
 		config_get acl_mode config acl_mode "all"
+		
+		# If DNS hijack is enabled, force acl_mode to "all" to prevent Fake-IP bypass conflicts
+		if [ "$dns_hijack" -eq 1 ]; then
+			acl_mode="all"
+		fi
 		
 		append_acl_ip() {
 			[ -n "$1" ] && acl_ips="${acl_ips:+$acl_ips,}$1"
@@ -230,19 +236,12 @@ EOF
 stop_service() {
 	config_load mihomo
 	
-	local dns_port dns_hijack tun_enabled
+	local dns_port
 	config_get dns_port config dns_port "1053"
-	config_get_bool dns_hijack config dns_hijack 1
-	config_get_bool tun_enabled config tun_enabled 0
 	
-	# Clean up redirect rules
-	if [ "$tun_enabled" -ne 1 ]; then
-		disable_tproxy
-	fi
-	
-	if [ "$dns_hijack" -eq 1 ]; then
-		disable_dns_hijack "$dns_port"
-	fi
+	# Clean up redirect rules and DNS changes unconditionally to prevent stale configuration
+	disable_tproxy
+	disable_dns_hijack "$dns_port"
 	
 	rm -f /tmp/mihomo_run.yaml
 	logger -t mihomo "Mihomo service stopped"
@@ -1126,7 +1125,7 @@ esac
     # LuCI Menu definition (JSON)
     "root/usr/share/luci/menu.d/luci-app-mihomo.json": """{
     "admin/services/mihomo": {
-        "title": "Mihomo 代理",
+        "title": "豆豉代理",
         "order": 50,
         "action": {
             "type": "firstchild"
@@ -1281,6 +1280,108 @@ return view.extend({
 			} }, label);
 		}
 
+		function updateTrackedDevices(conns, hist) {
+			var state = {};
+			try {
+				state = JSON.parse(localStorage.getItem('mihomo_tracked_devices') || '{}');
+			} catch (e) { state = {}; }
+
+			var directPolicies = { 'direct': true, 'reject': true, 'block': true, '-': true, '': true };
+
+			function processItem(item) {
+				var ip = item.ip;
+				if (!ip) return;
+				if (ip === '127.0.0.1' || ip === '::1') return;
+				
+				var devName = item.device || '';
+				var isProxied = false;
+				var policy = (item.policy || '').toLowerCase();
+				if (policy && !directPolicies[policy]) {
+					isProxied = true;
+				}
+
+				if (!state[ip]) {
+					state[ip] = {
+						ip: ip,
+						name: devName,
+						proxied: isProxied
+					};
+				} else {
+					if (devName && !state[ip].name) {
+						state[ip].name = devName;
+					}
+					if (isProxied) {
+						state[ip].proxied = true;
+					}
+				}
+			}
+
+			if (conns && conns.length) {
+				for (var i = 0; i < conns.length; i++) {
+					processItem(conns[i]);
+				}
+			}
+
+			if (hist && hist.length) {
+				for (var j = 0; j < hist.length; j++) {
+					processItem(hist[j]);
+				}
+			}
+
+			localStorage.setItem('mihomo_tracked_devices', JSON.stringify(state));
+
+			var whitelistBox = document.getElementById('whitelist-box');
+			var deviceBox = document.getElementById('device-box');
+			
+			var whitelistCountEl = document.getElementById('whitelist-count');
+			var deviceCountEl = document.getElementById('device-count');
+
+			var whitelistHTML = '';
+			var deviceHTML = '';
+			
+			var whitelistCount = 0;
+			var deviceCount = 0;
+
+			var keys = Object.keys(state).sort(function(a, b) {
+				var pa = a.split('.').map(Number);
+				var pb = b.split('.').map(Number);
+				if (pa.length === 4 && pb.length === 4 && !pa.some(isNaN) && !pb.some(isNaN)) {
+					for (var i = 0; i < 4; i++) {
+						if (pa[i] !== pb[i]) return pa[i] - pb[i];
+					}
+					return 0;
+				}
+				return a.localeCompare(b);
+			});
+
+			for (var k = 0; k < keys.length; k++) {
+				var dev = state[keys[k]];
+				var label = dev.name ? dev.name + ' (' + dev.ip + ')' : dev.ip;
+				var row = E('div', { 'style': 'padding: 6px 12px; border-bottom: 1px dashed rgba(0,0,0,0.04); display: flex; justify-content: space-between; align-items: center;' }, [
+					E('span', { 'style': 'font-family: monospace; font-weight: 500;' }, label),
+					E('span', { 'style': 'color: #999; font-size: 11px;' }, _('已活跃'))
+				]);
+
+				if (dev.proxied) {
+					whitelistHTML += row.outerHTML;
+					whitelistCount++;
+				} else {
+					deviceHTML += row.outerHTML;
+					deviceCount++;
+				}
+			}
+
+			if (whitelistBox) {
+				whitelistBox.innerHTML = whitelistHTML || '<div style="text-align: center; color: #999; padding: 15px; font-size: 13px;">' + _('暂无红杏设备') + '</div>';
+			}
+			if (deviceBox) {
+				deviceBox.innerHTML = deviceHTML || '<div style="text-align: center; color: #999; padding: 15px; font-size: 13px;">' + _('暂无活跃设备') + '</div>';
+			}
+
+			if (whitelistCountEl) whitelistCountEl.innerText = whitelistCount;
+			if (deviceCountEl) deviceCountEl.innerText = deviceCount;
+		}
+
 		function render_connections() {
 			var box = document.getElementById('conn-body');
 			if (!box) return;
@@ -1384,8 +1485,43 @@ return view.extend({
 		}
 
 		var view_html = E('div', { 'class': 'cbi-map' }, [
-			E('h2', {}, _('Mihomo 访问日志')),
+			E('h2', {}, _('豆豉代理访问日志')),
 			E('p', {}, _('监控局域网设备实时连接与历史访问。您可以点击操作按钮快速针对特定域名创建规则。')),
+
+			// IP列表板块（红杏 vs 设备）
+			E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
+				E('h3', { 'style': 'margin-top: 0; margin-bottom: 15px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, _('IP列表')),
+				E('div', { 'style': 'display: flex; gap: 20px; margin-bottom: 15px; align-items: stretch;' }, [
+					// 左边：红杏 (走代理)
+					E('div', { 'style': 'flex: 1; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px; padding: 12px; background: rgba(46, 213, 115, 0.02); display: flex; flex-direction: column; min-height: 180px;' }, [
+						E('h4', { 'style': 'margin-top: 0; margin-bottom: 8px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 6px; color: #2ed573; display: flex; justify-content: space-between; align-items: center;' }, [
+							E('span', { 'style': 'font-weight: bold;' }, _('红杏 (走代理)')),
+							E('span', { 'id': 'whitelist-count', 'style': 'background: #2ed573; color: white; padding: 2px 6px; border-radius: 10px; font-size: 11px; font-weight: bold;' }, '0')
+						]),
+						E('div', { 'id': 'whitelist-box', 'style': 'flex: 1; max-height: 200px; overflow-y: auto;' }, [
+							E('div', { 'style': 'text-align: center; color: #999; padding: 15px; font-size: 13px;' }, _('暂无红杏设备'))
+						])
+					]),
+					// 右边：设备 (直通/直连)
+					E('div', { 'style': 'flex: 1; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px; padding: 12px; background: rgba(30, 144, 255, 0.02); display: flex; flex-direction: column; min-height: 180px;' }, [
+						E('h4', { 'style': 'margin-top: 0; margin-bottom: 8px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 6px; color: #1e90ff; display: flex; justify-content: space-between; align-items: center;' }, [
+							E('span', { 'style': 'font-weight: bold;' }, _('设备 (直通/直连)')),
+							E('span', { 'id': 'device-count', 'style': 'background: #1e90ff; color: white; padding: 2px 6px; border-radius: 10px; font-size: 11px; font-weight: bold;' }, '0')
+						]),
+						E('div', { 'id': 'device-box', 'style': 'flex: 1; max-height: 200px; overflow-y: auto;' }, [
+							E('div', { 'style': 'text-align: center; color: #999; padding: 15px; font-size: 13px;' }, _('暂无活跃设备'))
+						])
+					])
+				]),
+				E('div', { 'style': 'text-align: right;' }, [
+					btn(_('清空所有记录'), 'cbi-button-reset', function() {
+						if (confirm(_('确定要清空所有检测到的设备历史记录并重新开始吗？'))) {
+							localStorage.removeItem('mihomo_tracked_devices');
+							updateTrackedDevices([], []);
+						}
+					})
+				])
+			]),
 
 			// Real-time connections
 			E('div', { 'class': 'cbi-section' }, [
@@ -1408,7 +1544,7 @@ return view.extend({
 								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('设备')),
 								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('域名 / 目标')),
 								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('策略')),
-								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('流量 (↑/↓)')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, [ _('流量 (↑/↓)') ]),
 								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('操作'))
 							])
 						]),
@@ -1440,19 +1576,26 @@ return view.extend({
 		setTimeout(function() {
 			render_connections();
 			render_history();
+			updateTrackedDevices(connections, history);
 		}, 0);
 
 		self._timer = setInterval(function() {
 			fs.exec('/usr/share/mihomo/helper.sh', ['get_connections']).then(function(res) {
 				try {
 					var j = JSON.parse((res.stdout || '[]').trim());
-					if (j && !j.error) { connections = j; conn_error = null; render_connections(); }
+					if (j && !j.error) { 
+						connections = j; 
+						conn_error = null; 
+						render_connections(); 
+						updateTrackedDevices(connections, history);
+					}
 				} catch (e) {}
 			});
 			fs.exec('/usr/share/mihomo/helper.sh', ['get_history', '300']).then(function(res) {
 				try {
 					history = JSON.parse((res.stdout || '[]').trim());
 					render_history();
+					updateTrackedDevices(connections, history);
 				} catch (e) {}
 			});
 		}, 5000);
@@ -2145,7 +2288,7 @@ return view.extend({
 		}, _('清空'));
 
 		var view_html = E('div', { 'class': 'cbi-map' }, [
-			E('h2', {}, _('Mihomo 代理仪表盘')),
+			E('h2', {}, _('豆豉代理仪表盘')),
 			E('p', {}, _('管理 Mihomo 核心守护进程，监控运行状态并选择代理节点。')),
 
 			// Status panel
@@ -2236,7 +2379,7 @@ return view.extend({
 	render: function() {
 		var m, s, o;
 
-		m = new form.Map('mihomo', _('Mihomo 代理设置'),
+		m = new form.Map('mihomo', _('豆豉代理设置'),
 			_('配置代理服务参数、DNS 解析器和订阅节点信息。'));
 		
 		m.restart = 'mihomo';
@@ -2373,7 +2516,48 @@ return view.extend({
 		o.placeholder = '1053';
 		o.rmempty = false;
 
-		return m.render();
+		return m.render().then(function(node) {
+			setTimeout(function() {
+				function updateWhitelistStatus() {
+					var dns_hijack_el = document.getElementById('cbid.mihomo.config.dns_hijack');
+					var tun_enabled_el = document.getElementById('cbid.mihomo.config.tun_enabled');
+					var acl_mode_el = document.getElementById('cbid.mihomo.config.acl_mode');
+					var acl_ips_container = document.getElementById('cbid.mihomo.config.acl_ips');
+					
+					var is_dns_hijack = dns_hijack_el && dns_hijack_el.checked;
+					var is_tun_enabled = tun_enabled_el && tun_enabled_el.checked;
+					var disable_whitelist = is_dns_hijack || is_tun_enabled;
+					
+					if (acl_mode_el) {
+						acl_mode_el.disabled = disable_whitelist;
+						if (disable_whitelist) {
+							acl_mode_el.value = 'all';
+							var event = document.createEvent('HTMLEvents');
+							event.initEvent('change', true, true);
+							acl_mode_el.dispatchEvent(event);
+						}
+					}
+					
+					if (acl_ips_container) {
+						var inputs = acl_ips_container.querySelectorAll('input, button');
+						for (var i = 0; i < inputs.length; i++) {
+							inputs[i].disabled = disable_whitelist;
+						}
+					}
+				}
+				
+				var dns_hijack_el = document.getElementById('cbid.mihomo.config.dns_hijack');
+				var tun_enabled_el = document.getElementById('cbid.mihomo.config.tun_enabled');
+				if (dns_hijack_el) {
+					dns_hijack_el.addEventListener('change', updateWhitelistStatus);
+				}
+				if (tun_enabled_el) {
+					tun_enabled_el.addEventListener('change', updateWhitelistStatus);
+				}
+				updateWhitelistStatus();
+			}, 100);
+			return node;
+		});
 	}
 });
 """

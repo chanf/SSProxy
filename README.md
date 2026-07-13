@@ -43,6 +43,104 @@
   - **`accesslog.js` (访问日志)**：展示 5s 轮询的实时连接（带模糊搜索）与历史访问日志；
   - **`rules.js` (规则管理)**：提供 UCI 自定义域名规则的管理和一键应用。
 
+### 🔄 数据流向与系统架构
+
+> 📌 **前置条件说明：** 本拓扑图展示的是**「白名单分流模式生效时（即关闭全局 DNS 劫持与 TUN 模式）」**的数据流向。若开启了全局 DNS 劫持或 TUN 模式，决策逻辑将强制转入全局接管，普通直连设备 `devB` 也会同等被导入 Mihomo。
+
+```mermaid
+graph TD
+    %% LAN Devices and DNS Flow
+    subgraph LAN ["局域网客户端 (LAN Devices)"]
+        devA["白名单设备 (192.168.66.158)"]
+        devB["普通直连设备 (192.168.66.100)"]
+    end
+
+    subgraph Router ["软路由系统 (iStoreOS/OpenWrt)"]
+        %% DNS Hijack sub-layer
+        subgraph DNS_Layer ["DNS 劫持层 (Dnsmasq)"]
+            dns_masq["Dnsmasq (Port 53)"]
+        end
+
+        %% Firewall sub-layer
+        subgraph Firewall ["防火墙规则 (nftables mangle table)"]
+            daddr_check{"1. 目的地址过滤<br/>(是否为私有/局域网网段?)"}
+            whitelist_check{"2. 来源 IP 白名单校验<br/>(是否在 acl_ips 列表中?)"}
+            tproxy_rules["3. TProxy 重定向标记<br/>(标记 mark 1, 重定向至 :7893)"]
+        end
+
+        %% Routing Table / WAN Bypass
+        bypass_wan["标准系统路由 (Bypass WAN / Direct Route)"]
+        policy_route["策略路由表 100<br/>(fwmark 1 -> lo)"]
+
+        %% Mihomo Core
+        subgraph Mihomo ["代理内核 (Mihomo Core)"]
+            tproxy_in["TProxy 监听接口 (:7893)"]
+            rule_engine{"规则匹配引擎<br/>(分流规则 / 自定义规则)"}
+            controller_api["外部控制器 API (:9090)"]
+            mihomo_dns["Mihomo DNS (Port 1053)"]
+        end
+    end
+
+    subgraph WebGUI ["浏览器管理页面 (LuCI Web GUI)"]
+        douchi_gui["豆豉代理 Web UI"]
+        local_store[("localStorage<br/>(设备活跃/红杏状态缓存)")]
+    end
+
+    subgraph Internet ["外部网络 (WAN)"]
+        proxied_wan["代理服务器 (Proxy Servers)"]
+        direct_wan["公网直连 (Direct Internet)"]
+    end
+
+    %% DNS Relationships
+    devA -- "1.1 DNS 请求" --> dns_masq
+    devB -- "1.1 DNS 请求" --> dns_masq
+    dns_masq -- "1.2 (直连解析) 请求公网" --> direct_wan
+    direct_wan -- "1.3 返回真实 IP" --> dns_masq
+    dns_masq -- "1.4 响应" --> devA
+    dns_masq -- "1.4 响应" --> devB
+
+    %% TCP/UDP Traffic Flow
+    devA -- "2.1 TCP/UDP 流量 (进入分流核对)" --> daddr_check
+    devB -- "2.1 TCP/UDP 流量 (直接转发)" --> bypass_wan
+
+    daddr_check -- "是 (私有 IP)" --> bypass_wan
+    daddr_check -- "否 (外网 IP)" --> whitelist_check
+
+    whitelist_check -- "是 (白名单内设备)" --> tproxy_rules
+
+    tproxy_rules --> policy_route
+    policy_route -- "重定向" --> tproxy_in
+    bypass_wan --> direct_wan
+
+    %% Mihomo Processing
+    tproxy_in --> rule_engine
+    rule_engine -- "代理规则" --> proxied_wan
+    rule_engine -- "直连规则" --> direct_wan
+
+    %% Web UI Control and Logs Flow
+    douchi_gui -- "每 5s 轮询 get_connections" --> controller_api
+    douchi_gui -- "读写设备分类状态" --> local_store
+    controller_api -- "返回实时连接与策略" --> douchi_gui
+```
+
+### 🧠 决策分流逻辑分支 (Decision Tree)
+
+当任意局域网客户端发起外网请求时，系统在底层的判定分流逻辑路径如下：
+
+```mermaid
+flowchart TD
+    Start["局域网内设备"] --> Step1{"软路由是否开启了 TUN 模式<br/>或 DNS 劫持模式？"}
+    
+    Step1 -- "是 (开启任一模式)" --> Proxy["防火墙规则/分流规则判断<br/>(走 Mihomo 流程)"]
+    Step1 -- "否" --> Step2{"是否开启了白名单功能<br/>(acl_mode = 'whitelist')？"}
+    
+    Step2 -- "没有开启 (all 模式)" --> Proxy
+    Step2 -- "开启" --> Step3{"设备 IP 是否在白名单内？"}
+    
+    Step3 -- "在白名单里面" --> Proxy
+    Step3 -- "不在白名单 (直接旁路)" --> Direct["直通上网<br/>(公网直连)"]
+```
+
 ---
 
 ## 📦 编译与部署
@@ -74,6 +172,8 @@ python3 build_ipk.py
 ```bash
 python3 build_ipk.py && ./deploy.sh
 ```
+
+> 💡 **基本开发规则：** 每次构建新版本后，**必须**将最新生成的 IPK 部署推送至服务器（软路由），以保证测试环境上的运行代码与本地保持一致。推荐始终使用上述合并指令进行开发调试。
 
 ---
 
