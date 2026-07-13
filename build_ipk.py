@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-109"
+PKG_VERSION = "1.0.0-117"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -131,6 +131,7 @@ disable_dns_hijack() {
 
 start_service() {
 	config_load mihomo
+	echo "start $(date +%s)" > /tmp/mihomo_op.state
 	/usr/share/mihomo/helper.sh restore_subscription_url
 	
 	local core_path config_path work_dir dns_port dns_hijack tproxy_port tun_enabled acl_mode
@@ -235,6 +236,7 @@ EOF
 
 stop_service() {
 	config_load mihomo
+	echo "stop $(date +%s)" > /tmp/mihomo_op.state
 	
 	local dns_port
 	config_get dns_port config dns_port "1053"
@@ -1107,6 +1109,33 @@ import_rules() {
 	return 0
 }
 
+get_op_state() {
+	local statef="/tmp/mihomo_op.state"
+	local op="" since=0 now elapsed ctrl=0 nftexists=0 state result=""
+	now=$(date +%s)
+	if [ -f "$statef" ]; then
+		op=$(awk '{print $1}' "$statef" 2>/dev/null)
+		since=$(awk '{print $2}' "$statef" 2>/dev/null)
+	fi
+	case "$since" in ''|*[!0-9]*) since=0 ;; esac
+	mihomo_curl -s -m 1 "http://127.0.0.1:${API_PORT}/version" >/dev/null 2>&1 && ctrl=1
+	nft list table inet mihomo >/dev/null 2>&1 && nftexists=1
+	elapsed=$((now - since))
+	if [ -z "$op" ] || [ "$since" = "0" ]; then
+		state="idle"; [ "$ctrl" = "1" ] && result="running" || result="stopped"
+	elif [ "$op" = "start" ] || [ "$op" = "restart" ]; then
+		if [ "$ctrl" = "1" ]; then state="done"; result="running";
+			elif [ "$elapsed" -lt 45 ]; then state="in_progress";
+			else state="timeout"; fi
+	elif [ "$op" = "stop" ]; then
+		if [ "$ctrl" = "0" ] && [ "$nftexists" = "0" ]; then state="done"; result="stopped";
+			elif [ "$elapsed" -lt 30 ]; then state="in_progress";
+			else state="timeout"; fi
+	else
+		state="idle"; [ "$ctrl" = "1" ] && result="running" || result="stopped"
+	fi
+	echo "{\\"state\\":\\"$state\\",\\"op\\":\\"$op\\",\\"elapsed\\":$elapsed,\\"running\\":$ctrl,\\"result\\":\\"$result\\"}"
+}
 case "$1" in
 	get_arch)
 		get_arch
@@ -1168,6 +1197,9 @@ case "$1" in
 	get_history)
 		get_history "$2"
 		;;
+	get_op_state)
+		get_op_state
+		;;
 	get_access_rules)
 		get_access_rules
 		;;
@@ -1181,7 +1213,7 @@ case "$1" in
 		import_rules "$2"
 		;;
 	*)
-		echo "Usage: $0 {get_arch|check_core|download_core|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|add_access_rule|del_access_rule|import_rules|test_node_delay|test_all_nodes}"
+		echo "Usage: $0 {get_arch|check_core|download_core|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|add_access_rule|del_access_rule|import_rules|test_node_delay|test_all_nodes}"
 		exit 1
 		;;
 esac
@@ -1978,7 +2010,8 @@ return view.extend({
 				})({ name: 'mihomo' }).catch(function() { return {}; }),
 				fs.exec('/usr/share/mihomo/helper.sh', ['get_proxies']).catch(function() { return { stdout: '[]' }; }),
 				fs.exec('/usr/share/mihomo/helper.sh', ['get_proxy_groups']).catch(function() { return { stdout: '{"proxies":{}}' }; }),
-				fs.exec('/usr/share/mihomo/helper.sh', ['get_schedule']).catch(function() { return { stdout: '{"auto_update":"0","interval":"24","last_update":"","next_update":"","has_url":"0"}' }; })
+				fs.exec('/usr/share/mihomo/helper.sh', ['get_schedule']).catch(function() { return { stdout: '{"auto_update":"0","interval":"24","last_update":"","next_update":"","has_url":"0"}' }; }),
+				fs.exec('/usr/share/mihomo/helper.sh', ['get_op_state']).catch(function() { return { stdout: '{"state":"idle","op":"","elapsed":0,"running":0,"result":"stopped"}' }; })
 			]);
 		});
 	},
@@ -1994,6 +2027,9 @@ return view.extend({
 		var schedule_raw = (results[5] && results[5].stdout) ? results[5].stdout.trim() : '{"auto_update":"0","interval":"24","last_update":"","next_update":"","has_url":"0"}';
 		var schedule = {};
 		try { schedule = JSON.parse(schedule_raw); } catch(e) { schedule = {}; }
+		var op_state_raw = (results[6] && results[6].stdout) ? results[6].stdout.trim() : '{"state":"idle","op":"","elapsed":0,"running":0,"result":"stopped"}';
+		var op_state = {};
+		try { op_state = JSON.parse(op_state_raw); } catch(e) { op_state = { state: 'idle' }; }
 		
 		var proxies = [];
 		var parse_error = null;
@@ -2424,6 +2460,46 @@ return view.extend({
 			}
 		}, _('清空'));
 
+		var opBusy = (op_state.state === 'in_progress');
+		var opPollCount = 0;
+		function setOpBusy(busy, label) {
+			opBusy = busy;
+			var ids = ['btn_start', 'btn_stop', 'btn_restart'];
+			for (var i = 0; i < ids.length; i++) {
+				var bn = document.getElementById(ids[i]);
+				if (bn) { bn.disabled = busy; bn.style.opacity = busy ? '0.5' : '1'; }
+			}
+			var st = document.getElementById('op_status');
+			if (st) { st.textContent = label || ''; }
+		}
+		function pollOpState() {
+			opPollCount++;
+			if (opPollCount > 50) { ui.addNotification(null, E('p', _('操作超时，可能失败，可重试。')), 'warning'); setOpBusy(false, ''); return; }
+			return fs.exec('/usr/share/mihomo/helper.sh', ['get_op_state']).then(function(res) {
+				var o = {};
+				try { o = JSON.parse((res.stdout || '').trim()); } catch(e) { o = { state: 'idle' }; }
+				if (o.state === 'done') { location.reload(); return; }
+				if (o.state === 'in_progress') {
+					setOpBusy(true, _('操作进行中…已 ') + (o.elapsed || 0) + 's');
+					setTimeout(pollOpState, 1500);
+				} else {
+					if (o.state === 'timeout') ui.addNotification(null, E('p', _('操作超时，可能失败，可重试。')), 'warning');
+					setOpBusy(false, '');
+				}
+			}).catch(function() { setTimeout(pollOpState, 2000); });
+		}
+		function doServiceOp(op) {
+			if (opBusy) return;
+			var label = op === 'start' ? _('正在启动…') : (op === 'stop' ? _('正在停止…') : _('正在重启…'));
+			setOpBusy(true, label);
+			return fs.exec('/etc/init.d/mihomo', [op]).then(function() {
+				setTimeout(pollOpState, 1000);
+			}).catch(function(err) {
+				ui.addNotification(null, E('p', _('操作失败：') + err.message), 'danger');
+				setOpBusy(false, '');
+			});
+		}
+		if (opBusy) { setOpBusy(true, _('操作进行中…')); setTimeout(pollOpState, 1000); }
 		var view_html = E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, _('豆豉代理仪表盘')),
 			E('p', {}, _('管理 Mihomo 核心守护进程，监控运行状态并选择代理节点。')),
@@ -2447,38 +2523,12 @@ return view.extend({
 				]),
 				
 				E('div', { 'class': 'cbi-section-node' }, [
-					E('button', {
-						'class': 'cbi-button cbi-button-apply',
-						'style': 'margin-right: 10px;',
-						'click': function(ev) {
-							ev.preventDefault();
-							return fs.exec('/etc/init.d/mihomo', ['start']).then(function() {
-								location.reload();
-							});
-						}
-					}, _('启动')),
-					E('button', {
-						'class': 'cbi-button cbi-button-reset',
-						'style': 'margin-right: 10px;',
-						'click': function(ev) {
-							ev.preventDefault();
-							return fs.exec('/etc/init.d/mihomo', ['stop']).then(function() {
-								location.reload();
-							});
-						}
-					}, _('停止')),
-					E('button', {
-						'class': 'cbi-button cbi-button-action',
-						'click': function(ev) {
-							ev.preventDefault();
-							return fs.exec('/etc/init.d/mihomo', ['restart']).then(function() {
-								location.reload();
-							});
-						}
-					}, _('重启'))
+					E('button', { 'id': 'btn_start', 'class': 'cbi-button cbi-button-apply', 'style': 'margin-right: 10px;', 'click': function(ev) { ev.preventDefault(); doServiceOp('start'); } }, _('启动')),
+					E('button', { 'id': 'btn_stop', 'class': 'cbi-button cbi-button-reset', 'style': 'margin-right: 10px;', 'click': function(ev) { ev.preventDefault(); doServiceOp('stop'); } }, _('停止')),
+					E('button', { 'id': 'btn_restart', 'class': 'cbi-button cbi-button-action', 'style': 'margin-right: 10px;', 'click': function(ev) { ev.preventDefault(); doServiceOp('restart'); } }, _('重启')),
+					E('span', { 'id': 'op_status', 'style': 'margin-left: 10px; color: #666; font-size: 13px;' }, '')
 				])
 			]),
-
 			// Proxy groups switching panel
 			proxy_groups_panel,
 
