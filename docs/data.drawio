@@ -29,7 +29,7 @@
                 <mxCell id="3" value="软路由是否开启了 TUN 模式、DNS劫持模式。" style="rhombus;whiteSpace=wrap;html=1;" vertex="1" parent="1">
                     <mxGeometry x="314" y="220" width="80" height="80" as="geometry"/>
                 </mxCell>
-                <mxCell id="4" value="防火墙规则判断" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                <mxCell id="4" value="走 Mihomo 流程（TProxy/TUN 接管）" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
                     <mxGeometry x="610" y="380" width="120" height="60" as="geometry"/>
                 </mxCell>
                 <mxCell id="15" style="edgeStyle=none;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.513;entryY=0.088;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="12" target="13">

@@ -94,7 +94,7 @@ graph TD
 flowchart TD
     Start["局域网内设备"] --> Step1{"软路由是否开启了 TUN 模式<br/>或 DNS 劫持模式？"}
     
-    Step1 -- "是 (开启任一模式)" --> Proxy["防火墙规则/分流规则判断<br/>(走 Mihomo 流程)"]
+    Step1 -- "是 (开启任一模式)" --> Proxy["进入 Mihomo 流程<br/>(TProxy 或 TUN 接管)"]
     Step1 -- "否" --> Step2{"是否开启了白名单功能<br/>(acl_mode = 'whitelist')？"}
     
     Step2 -- "没有开启 (all 模式)" --> Proxy
@@ -147,7 +147,7 @@ flowchart TD
 
 1. **目的地址过滤（Bypass Private Subnets）**：
    * 流量进入 nftables 的 `inet mihomo` 表的 `prerouting` 链。
-   * 第一条规则检查目的 IP（`ip daddr`）。如果目的地是局域网私有网段（如 `127.0.0.0/8`, `192.168.0.0/16`, `10.0.0.0/8`），防火墙执行 `return`（放行旁路），不进行任何劫持拦截，保证本地设备互访和路由器访问正常。
+   * 第一条规则检查目的 IP（`ip daddr`）。如果目的地是局域网私有/保留网段（如 `127.0.0.0/8`、`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、`224.0.0.0/4`、`255.255.255.255/32`），防火墙执行 `return`（放行旁路），不进行任何劫持拦截，保证本地设备互访和路由器访问正常。
 2. **源 IP 白名单过滤（Source IP Whitelist Filter）**：
    * 如果目的 IP 是公网地址，防火墙检查源 IP（`ip saddr`）。
    * **非白名单设备：** 匹配 `ip saddr != { acl_ips } return` 规则，执行 `return` 直接跳出该链，通过主路由表的默认网关直连 WAN 出网（走直通模式）。
@@ -207,7 +207,7 @@ Mihomo 核心运行  --> (连接状态) -- [Helper.sh collect_loop] (每15秒增
    * 浏览器拿到连接数据后，触发 `updateTrackedDevices(connections, history)`：
      * 从本地 `localStorage` 读取已保存的设备列表字典。
      * 提取每个连接的源 IP（`ip`）与设备名（`device`），并对未记录的 IP 初始化为 **「设备（直通/直连）」** 状态。
-     * 解析连接的出口策略（`policy`）。如果其出站策略**不属于**直连或拦截列表（即非 `direct`、`reject`、`block`、`""`），则判定该设备产生了代理行为，**永久将其标记为「红杏（走代理）」**。
+     * 解析连接的出口策略（`policy`）。如果其出站策略**不属于**直连或拦截列表（即非 `direct`、`reject`、`block`、`-`、`""`），则判定该设备产生了代理行为，**永久将其标记为「红杏（走代理）」**。
      * 将更新后的数据重新回写到 `localStorage` 中并重新渲染 IP 列表板块。
 
 ---

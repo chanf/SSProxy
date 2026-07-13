@@ -131,7 +131,7 @@ graph TD
 flowchart TD
     Start["局域网内设备"] --> Step1{"软路由是否开启了 TUN 模式<br/>或 DNS 劫持模式？"}
     
-    Step1 -- "是 (开启任一模式)" --> Proxy["防火墙规则/分流规则判断<br/>(走 Mihomo 流程)"]
+    Step1 -- "是 (开启任一模式)" --> Proxy["进入 Mihomo 流程<br/>(TProxy 或 TUN 接管)"]
     Step1 -- "否" --> Step2{"是否开启了白名单功能<br/>(acl_mode = 'whitelist')？"}
     
     Step2 -- "没有开启 (all 模式)" --> Proxy
