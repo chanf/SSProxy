@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-101"
+PKG_VERSION = "1.0.0-102"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -2302,6 +2302,10 @@ return view.extend({
 					E('tr', {}, [
 						E('td', {}, _('已安装核心版本')),
 						E('td', {}, E('strong', {}, core_ver))
+					]),
+					E('tr', {}, [
+						E('td', {}, _('插件版本')),
+						E('td', {}, E('strong', {}, '__PKG_VERSION__'))
 					])
 				]),
 				
@@ -2577,6 +2581,8 @@ def create_source_tree(src_dir):
         if rel_path == "CONTROL/control":
             import re
             content = re.sub(r'Version:\s*.*', f'Version: {PKG_VERSION}', content)
+        # Bake the current package version into views that use the __PKG_VERSION__ placeholder
+        content = content.replace('__PKG_VERSION__', PKG_VERSION)
             
         with open(full_path, "w", encoding="utf-8") as f:
             f.write(content)
