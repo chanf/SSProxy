@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-117"
+PKG_VERSION = "1.0.0-121"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -1058,10 +1058,14 @@ del_access_rule() {
 }
 
 import_rules() {
-	local text="$1"
+	local text="$1" mode="$2"
 	local imported=0 skipped=0 duplicates=0 skipped_samples=""
 	local tmpin tmpex tmpclean
 	tmpin=$(mktemp); tmpex=$(mktemp); tmpclean=$(mktemp)
+	if [ "$mode" = "overwrite" ]; then
+		local _n=0
+		while [ $_n -lt 1000 ]; do uci -q delete mihomo.@mihomo_rule[0] || break; _n=$((_n+1)); done
+	fi
 	echo "$text" > "$tmpin"
 	sed -e 's/[[:space:]]*$//' -e 's/^[[:space:]]*//' -e "s/^-[[:space:]]*//" -e "s/^'//" -e "s/'$//" "$tmpin" | grep -v -E '^(#|$|rules:)' > "$tmpclean"
 	uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=mihomo_rule$/\\1/p' | while read -r sid; do
@@ -1210,7 +1214,7 @@ case "$1" in
 		del_access_rule "$2"
 		;;
 	import_rules)
-		import_rules "$2"
+		import_rules "$2" "$3"
 		;;
 	*)
 		echo "Usage: $0 {get_arch|check_core|download_core|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|add_access_rule|del_access_rule|import_rules|test_node_delay|test_all_nodes}"
@@ -1894,69 +1898,26 @@ return view.extend({
 		]);
 
 
-		var import_form = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
 
-			E('h3', { 'style': 'margin-top: 0; margin-bottom: 10px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, _('批量导入规则')),
+		function doImport(mode) {			var txt = document.getElementById('rule_import').value.trim();			if (!txt) { ui.addNotification(null, E('p', _('请粘贴规则内容。')), 'danger'); return; }			return fs.exec('/usr/share/mihomo/helper.sh', ['import_rules', txt, mode]).then(function(res) {				var msg;				try {					var j = JSON.parse((res.stdout || '').trim());					msg = _('已导入 ') + j.imported + _(' 条；跳过 ') + j.skipped + _(' 条（非域名规则）') + (j.duplicates ? _('；重复 ') + j.duplicates + _(' 条') : '') + (j.skipped_samples && j.skipped_samples.length ? '：' + j.skipped_samples.join(', ') : '');				} catch (e) { msg = _('导入完成：') + (res.stdout || res.stderr || ''); }				if (res.code === 0) {					ui.addNotification(null, E('p', msg), 'info');					document.getElementById('rule_import').value = '';					self.load().then(function(new_results) {						var nr_raw = (new_results[0] && new_results[0].stdout) ? new_results[0].stdout.trim() : '[]';						try { rules = JSON.parse(nr_raw); } catch (e) { rules = []; }						render_rules();					});				} else {					ui.addNotification(null, E('p', _('导入失败：') + (res.stderr || res.stdout || '')), 'danger');				}			}).catch(function(err) {				ui.addNotification(null, E('p', _('通信错误：') + err.message), 'danger');			});		}
 
-			E('p', { 'style': 'color:#666;font-size:13px;margin-bottom:10px;' }, _('粘贴 Mihomo 规则，每行一条（如 DOMAIN-SUFFIX,example.com,DIRECT）。仅导入 DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD；IP-CIDR / GEOIP / MATCH 等会跳过。')),
+		var import_form = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [			E('h3', { 'style': 'margin-top: 0; margin-bottom: 10px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, _('批量导入规则')),			E('p', { 'style': 'color:#666;font-size:13px;margin-bottom:10px;' }, _('粘贴 Mihomo 规则，每行一条（如 DOMAIN-SUFFIX,example.com,DIRECT）。仅导入 DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD，IP-CIDR / GEOIP / MATCH 等会跳过。覆盖导入=先清空全部现有 UCI 规则再导入；追加导入=保留现有规则。')),			E('textarea', { 'id': 'rule_import', 'class': 'cbi-input-textarea', 'style': 'width:100%;height:160px;font-family:monospace;font-size:12px;margin-bottom:10px;', 'placeholder': 'DOMAIN-SUFFIX,apple.com,DIRECT' }),			btn(_('覆盖导入'), 'cbi-button-reset', function() { doImport('overwrite'); }),			btn(_('追加导入'), 'cbi-button-add', function() { doImport('append'); })		]);
 
-			E('textarea', { 'id': 'rule_import', 'class': 'cbi-input-textarea', 'style': 'width:100%;height:160px;font-family:monospace;font-size:12px;margin-bottom:10px;', 'placeholder': 'DOMAIN-SUFFIX,apple.com,DIRECT' }),
-
-			btn(_('导入'), 'cbi-button-add', function() {
-
-				var txt = document.getElementById('rule_import').value.trim();
-
-				if (!txt) { ui.addNotification(null, E('p', _('请粘贴规则内容。')), 'danger'); return; }
-
-				return fs.exec('/usr/share/mihomo/helper.sh', ['import_rules', txt]).then(function(res) {
-
-					var msg;
-
-					try {
-
-						var j = JSON.parse((res.stdout || '').trim());
-
-						msg = _('已导入 ') + j.imported + _(' 条；跳过 ') + j.skipped + _(' 条（非域名规则）') + (j.duplicates ? _('；重复 ') + j.duplicates + _(' 条') : '') + (j.skipped_samples && j.skipped_samples.length ? '：' + j.skipped_samples.join(', ') : '');
-
-					} catch (e) { msg = _('导入完成：') + (res.stdout || res.stderr || ''); }
-
-					if (res.code === 0) {
-
-						ui.addNotification(null, E('p', msg), 'info');
-
-						document.getElementById('rule_import').value = '';
-
-						self.load().then(function(new_results) {
-
-							var nr_raw = (new_results[0] && new_results[0].stdout) ? new_results[0].stdout.trim() : '[]';
-
-							try { rules = JSON.parse(nr_raw); } catch (e) { rules = []; }
-
-							render_rules();
-
-						});
-
-					} else {
-
-						ui.addNotification(null, E('p', _('导入失败：') + (res.stderr || res.stdout || '')), 'danger');
-
-					}
-
-				}).catch(function(err) {
-
-					ui.addNotification(null, E('p', _('通信错误：') + err.message), 'danger');
-
-				});
-
-			})
-
-		]);
-
-		var view_html = E('div', { 'class': 'cbi-map' }, [
+var view_html = E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, _('Mihomo 访问规则管理')),
 			E('p', {}, _('配置并管理局域网设备的特定域名代理规则。用户规则会被注入到核心配置文件 rules 列表的最顶部以优先匹配。规则保存在 UCI，需重启核心后才能生效。')),
 
-			E('div', { 'class': 'cbi-section' }, [
+			E('button', { 'id': 'btn_uci_toggle', 'class': 'cbi-button cbi-button-action', 'style': 'margin-bottom: 15px;', 'click': function(ev) {
+				ev.preventDefault();
+				var sec = document.getElementById('uci_rules_section');
+				var tg = document.getElementById('btn_uci_toggle');
+				if (!sec) return;
+				var open = sec.style.display !== 'none';
+				sec.style.display = open ? 'none' : 'block';
+				if (tg) tg.textContent = open ? _('UCI模式编辑') : _('收起 UCI 列表');
+				if (!open) render_rules();
+			} }, _('UCI模式编辑')),
+			E('div', { 'id': 'uci_rules_section', 'class': 'cbi-section', 'style': 'display: none;' }, [
 				E('h3', {}, _('自定义规则列表')),
 				E('div', { 'style': 'max-height: 400px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px; margin-bottom: 15px;' }, [
 					E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
