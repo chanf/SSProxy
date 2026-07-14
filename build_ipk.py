@@ -6,7 +6,7 @@ import shutil
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-123"
+PKG_VERSION = "1.0.0-125"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -1140,6 +1140,14 @@ get_op_state() {
 	fi
 	echo "{\\"state\\":\\"$state\\",\\"op\\":\\"$op\\",\\"elapsed\\":$elapsed,\\"running\\":$ctrl,\\"result\\":\\"$result\\"}"
 }
+clear_access_rules() {
+	local _n=0
+	while [ $_n -lt 1000 ]; do uci -q delete mihomo.@mihomo_rule[0] || break; _n=$((_n+1)); done
+	uci commit mihomo
+	logger -t mihomo "access_rules cleared ($_n)"
+	echo "OK:$_n"
+}
+
 case "$1" in
 	get_arch)
 		get_arch
@@ -1213,11 +1221,14 @@ case "$1" in
 	del_access_rule)
 		del_access_rule "$2"
 		;;
+	clear_access_rules)
+		clear_access_rules
+		;;
 	import_rules)
 		import_rules "$2" "$3"
 		;;
 	*)
-		echo "Usage: $0 {get_arch|check_core|download_core|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|add_access_rule|del_access_rule|import_rules|test_node_delay|test_all_nodes}"
+		echo "Usage: $0 {get_arch|check_core|download_core|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes}"
 		exit 1
 		;;
 esac
@@ -1914,6 +1925,19 @@ var view_html = E('div', { 'class': 'cbi-map' }, [
 				if (tg) tg.textContent = open ? _('UCI模式编辑') : _('收起 UCI 列表');
 				if (!open) loadRules();
 			} }, _('UCI模式编辑')),
+			E('button', { 'id': 'btn_clear_rules', 'class': 'cbi-button cbi-button-reset', 'style': 'margin-bottom: 15px; margin-left: 8px;', 'click': function(ev) {
+				ev.preventDefault();
+				if (!confirm(_('确定清空所有自定义规则？此操作不可撤销，需重启核心后生效。'))) return;
+				return fs.exec('/usr/share/mihomo/helper.sh', ['clear_access_rules']).then(function(res) {
+					if (res.code === 0) {
+						ui.addNotification(null, E('p', _('已清空所有规则（需重启核心后生效）。')), 'info');
+						rules = [];
+						render_rules();
+					} else {
+						ui.addNotification(null, E('p', _('清空失败：') + (res.stderr || res.stdout || '')), 'danger');
+					}
+				}).catch(function(err) { ui.addNotification(null, E('p', _('通信错误：') + err.message), 'danger'); });
+			} }, _('清空所有规则')),
 			E('div', { 'id': 'uci_rules_section', 'class': 'cbi-section', 'style': 'display: none;' }, [
 				E('h3', {}, _('自定义规则列表')),
 				E('div', { 'style': 'max-height: 400px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px; margin-bottom: 15px;' }, [
