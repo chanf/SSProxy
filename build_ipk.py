@@ -7,7 +7,7 @@ import tarfile
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-134"
+PKG_VERSION = "1.0.0-135"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -66,6 +66,11 @@ config mihomo 'config'
 	option auto_update '0'
 	option update_interval '24'
 	option last_update ''
+	option secret ''
+	option geo_auto_update '1'
+	option geo_update_interval '24'
+	option geoip_mirror_url 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat'
+	option geosite_mirror_url 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat'
 """,
     # System Init Script managed by procd with TProxy/nftables/Dnsmasq redirection
     "root/etc/init.d/mihomo": """#!/bin/sh /etc/rc.common
@@ -407,6 +412,50 @@ download_core() {
 	return 0
 }
 
+update_geox() {
+	local work_dir=$(uci -q get mihomo.config.work_dir || echo "/etc/mihomo")
+	local geoip_url=$(uci -q get mihomo.config.geoip_mirror_url)
+	local geosite_url=$(uci -q get mihomo.config.geosite_mirror_url)
+	# Optional overrides: $1 = geoip URL, $2 = geosite URL
+	[ -n "$1" ] && geoip_url="$1"
+	[ -n "$2" ] && geosite_url="$2"
+
+	if [ -z "$geoip_url" ] && [ -z "$geosite_url" ]; then
+		echo "ERROR: No GeoIP/GeoSite mirror URL configured" >&2
+		return 1
+	fi
+
+	mkdir -p "$work_dir"
+	local tmpd=$(mktemp -d)
+	local ok=0 failed=""
+	for pair in "geoip.dat:$geoip_url" "geosite.dat:$geosite_url"; do
+		local fname="${pair%%:*}" url="${pair#*:}"
+		[ -z "$url" ] && continue
+		echo "Downloading $fname from $url..."
+		if curl -fsSL -k -o "$tmpd/$fname" "$url"; then
+			mv "$tmpd/$fname" "$work_dir/$fname"
+			ok=$((ok + 1))
+		else
+			failed="$failed $fname"
+		fi
+	done
+	rm -rf "$tmpd"
+
+	if [ -n "$failed" ]; then
+		echo "ERROR: Failed to download:$failed" >&2
+		return 1
+	fi
+
+	# Ask the running core to reload geo databases via the controller API.
+	if pidof mihomo >/dev/null 2>&1; then
+		mihomo_curl -s -X PUT "http://127.0.0.1:${API_PORT}/configs?force=true" >/dev/null 2>&1 || true
+		logger -t mihomo "geo databases reloaded via controller"
+	fi
+	logger -t mihomo "GeoIP/GeoSite updated in $work_dir ($ok files)"
+	echo "SUCCESS: GeoIP/GeoSite updated in $work_dir ($ok files)"
+	return 0
+}
+
 update_subscription() {
 	local url="$1"
 	if [ -z "$url" ]; then
@@ -603,6 +652,22 @@ prepare_config() {
 	local tproxy_port=$(uci -q get mihomo.config.tproxy_port || echo "7893")
 	local mix_port=$(uci -q get mihomo.config.mix_port || echo "7890")
 	local tun_enabled=$(uci -q get mihomo.config.tun_enabled || echo "0")
+
+	# Controller secret: auto-generate a random one on first run and persist it,
+	# so the external-controller is never left unauthenticated (commercial-grade
+	# default). get_api_config picks this up so mihomo_curl keeps working.
+	local secret=$(uci -q get mihomo.config.secret)
+	if [ -z "$secret" ]; then
+		secret=$(head -c 24 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' | head -c 32)
+		[ -z "$secret" ] && secret="mihomo-$(date +%s)-$$"
+		uci -q set mihomo.config.secret="$secret"
+		uci -q commit mihomo
+	fi
+	local geo_auto_update=$(uci -q get mihomo.config.geo_auto_update || echo "1")
+	local geo_update_interval=$(uci -q get mihomo.config.geo_update_interval || echo "24")
+	[ "$geo_update_interval" -lt 1 ] 2>/dev/null && geo_update_interval=24
+	local geoip_url=$(uci -q get mihomo.config.geoip_mirror_url)
+	local geosite_url=$(uci -q get mihomo.config.geosite_mirror_url)
 	
 	if [ ! -f "$src_config" ]; then
 		echo "ERROR: Source configuration file $src_config not found" >&2
@@ -621,7 +686,7 @@ prepare_config() {
 	mv "${run_config}.tmp" "$run_config"
 	
 	# Strip top-level ports to avoid conflicts
-	sed -i '/^mixed-port:/d; /^tproxy-port:/d; /^port:/d; /^socks-port:/d; /^allow-lan:/d; /^external-controller:/d' "$run_config"
+	sed -i '/^mixed-port:/d; /^tproxy-port:/d; /^port:/d; /^socks-port:/d; /^allow-lan:/d; /^external-controller:/d; /^secret:/d; /^profile:/d; /^geox-url:/d; /^geo-auto-update:/d; /^geo-update-interval:/d' "$run_config"
 	
 	# Prepend our controlled settings at the top
 	cat <<EOF > "${run_config}.tmp"
@@ -629,9 +694,26 @@ mixed-port: $mix_port
 tproxy-port: $tproxy_port
 allow-lan: true
 external-controller: 0.0.0.0:9090
+secret: "$secret"
+profile:
+  store-selected: true
+  store-fake-ip: true
 EOF
 	cat "$run_config" >> "${run_config}.tmp"
 	mv "${run_config}.tmp" "$run_config"
+
+	# GeoIP/GeoSite source: point the core at the (China-friendly) mirror and let
+	# it auto-update on a schedule, so GEOIP/GEOSITE rules work even on a fresh
+	# or offline first run instead of relying on the core's default GitHub fetch.
+	if [ "$geo_auto_update" = "1" ] && [ -n "$geoip_url" ] && [ -n "$geosite_url" ]; then
+		cat <<EOF >> "$run_config"
+geox-url:
+  geoip: $geoip_url
+  geosite: $geosite_url
+geo-auto-update: true
+geo-update-interval: $geo_update_interval
+EOF
+	fi
 	
 	# Append controlled DNS block
 	cat <<EOF >> "$run_config"
@@ -1212,6 +1294,9 @@ case "$1" in
 	download_core)
 		download_core "$2"
 		;;
+	update_geox)
+		update_geox "$2" "$3"
+		;;
 	update_subscription)
 		update_subscription "$2"
 		;;
@@ -1285,7 +1370,7 @@ case "$1" in
 		import_rules "$2" "$3"
 		;;
 	*)
-		echo "Usage: $0 {get_arch|check_core|download_core|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes}"
+		echo "Usage: $0 {get_arch|check_core|download_core|update_geox|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes}"
 		exit 1
 		;;
 esac
@@ -2784,6 +2869,54 @@ return view.extend({
 		o = s.option(form.Value, 'dns_port', _('DNS 端口'), _('Mihomo 本地 DNS 解析器监听端口。'));
 		o.placeholder = '1053';
 		o.rmempty = false;
+
+		// --- 安全与 Geo（商业化加固）---
+		o = s.option(form.Value, 'secret', _('控制器密钥 (Secret)'), _('外部控制器的访问密钥。留空将在下次启动核心时自动生成随机密钥（推荐）。使用第三方面板（metacubexd 等）时需填入此密钥。'));
+		o.rmempty = true;
+		o.password = true;
+
+		o = s.option(form.Flag, 'geo_auto_update', _('自动更新 Geo 数据库'), _('让核心从下方镜像地址获取 GeoIP/GeoSite 并按周期自动更新，保证 GEOIP/GEOSITE 分流规则在离线/首次启动时也可用。'));
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'geo_update_interval', _('Geo 更新间隔 (小时)'), _('GeoIP/GeoSite 自动更新的周期。'));
+		o.placeholder = '24';
+		o.rmempty = false;
+		o.depends('geo_auto_update', '1');
+
+		o = s.option(form.Value, 'geoip_mirror_url', _('GeoIP 镜像地址'), _('GeoIP 数据库下载地址，国内可改为加速镜像（如 jsDelivr/ghproxy）。'));
+		o.placeholder = 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat';
+		o.rmempty = true;
+		o.depends('geo_auto_update', '1');
+
+		o = s.option(form.Value, 'geosite_mirror_url', _('GeoSite 镜像地址'), _('GeoSite 数据库下载地址，国内可改为加速镜像。'));
+		o.placeholder = 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat';
+		o.rmempty = true;
+		o.depends('geo_auto_update', '1');
+
+		// 立即更新 Geo 数据库：独立按钮，直接调 helper.sh，不触发表单保存/核心重启
+		o = s.option(form.DummyValue, '_geo_btn', _('立即更新 Geo 数据库'), _('从上方镜像地址立即下载最新的 GeoIP/GeoSite 数据库。'));
+		o.rawhtml = true;
+		o.cfgvalue = function(section_id) {
+			return E('button', {
+				'class': 'cbi-button cbi-button-action',
+				'click': function(ev) {
+					ev.preventDefault();
+					var btn = ev.target;
+					btn.disabled = true;
+					fs.exec('/usr/share/mihomo/helper.sh', ['update_geox']).then(function(res) {
+						btn.disabled = false;
+						if (res.code === 0) {
+							ui.addNotification(null, E('p', {}, _('Geo 数据库更新成功：') + ' ' + (res.stdout || '')));
+						} else {
+							ui.addNotification(null, E('p', {}, _('更新失败：') + ' ' + (res.stderr || res.stdout || '')), 'error');
+						}
+					}).catch(function(err) {
+						btn.disabled = false;
+						ui.addNotification(null, E('p', {}, _('通信错误：') + ' ' + err.message), 'error');
+					});
+				}
+			}, _('立即更新 Geo'));
+		};
 
 		return m.render().then(function(node) {
 			setTimeout(function() {
