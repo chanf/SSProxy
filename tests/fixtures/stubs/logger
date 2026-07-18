@@ -1,0 +1,4 @@
+#!/bin/sh
+# Test stub for `logger`: swallow syslog calls, optionally record them.
+[ -n "$LOGGER_FILE" ] && printf '%s\n' "$*" >> "$LOGGER_FILE"
+exit 0

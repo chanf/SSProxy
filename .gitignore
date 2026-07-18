@@ -2,3 +2,7 @@
 build/
 dist/
 src/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

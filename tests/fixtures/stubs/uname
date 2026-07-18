@@ -1,0 +1,8 @@
+#!/bin/sh
+# Test stub for `uname`: `uname -m` returns $UNAME_M when set, else the real
+# machine so helper.sh's other uname usages are unaffected.
+if [ "$1" = "-m" ] && [ -n "$UNAME_M" ]; then
+	printf '%s\n' "$UNAME_M"
+	exit 0
+fi
+exec /usr/bin/uname "$@"

@@ -1,12 +1,13 @@
-import os
-import tarfile
+import gzip
 import io
-import time
+import os
+import re
 import shutil
+import tarfile
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-125"
+PKG_VERSION = "1.0.0-134"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -182,11 +183,14 @@ EOF
 		return 1
 	fi
 	
-	# Start Daemon
+	# Start Daemon — capture the core's real stdout/stderr (incl. FATAL errors)
+	# to a dedicated file so the dashboard can surface startup failures.
+	# Truncated per clean start; procd respawns append, so a crash loop stays visible.
+	: > /tmp/mihomo_core.log
 	procd_open_instance
-	procd_set_param command "$core_path" -d "$work_dir" -f "/tmp/mihomo_run.yaml"
-	procd_set_param stdout 1
-	procd_set_param stderr 1
+	# Wrap in sh -c so we can redirect output to the log file (procd execs directly,
+	# no shell, so '>' must live inside the sh -c script). $0=mihomo, $1=core, $2=workdir.
+	procd_set_param command sh -c '"$1" -d "$2" -f /tmp/mihomo_run.yaml >> /tmp/mihomo_core.log 2>&1' mihomo "$core_path" "$work_dir"
 	procd_set_param respawn
 	procd_close_instance
 	
@@ -246,6 +250,7 @@ stop_service() {
 	disable_dns_hijack "$dns_port"
 	
 	rm -f /tmp/mihomo_run.yaml
+	rm -f /tmp/mihomo_core.log
 	logger -t mihomo "Mihomo service stopped"
 }
 
@@ -534,13 +539,30 @@ get_schedule() {
 			next=$((last + interval * 3600))
 		fi
 	fi
-	echo "{\"auto_update\":\"$enabled\",\"interval\":\"$interval\",\"last_update\":\"$last\",\"next_update\":\"$next\",\"has_url\":\"$([ -n "$url" ] && echo 1 || echo 0)\"}"
+	echo "{\\"auto_update\\":\\"$enabled\\",\\"interval\\":\\"$interval\\",\\"last_update\\":\\"$last\\",\\"next_update\\":\\"$next\\",\\"has_url\\":\\"$([ -n "$url" ] && echo 1 || echo 0)\\"}"
 }
 
 # Emit controlled access rules (from UCI mihomo_rule) as YAML rule lines.
 # Note: Mihomo rules are GLOBAL and cannot be scoped per source IP. The recorded
 # src_ip is kept only for management/traceability; the rule applies to all devices.
 emit_access_rules_yaml() {
+	# $1 = source config file, used to validate that a rule's target group actually
+	# exists. A rule pointing at a non-existent group makes the core fatal-exit on
+	# startup (taking down the whole proxy), so we skip such rules and warn instead.
+	local config_file="${1:-$(uci -q get mihomo.config.config_path || echo /etc/mihomo/config.yaml)}"
+	# Return 0 if $1 is a usable rule target: a built-in, or a name that appears as
+	# some `name:` in the config. If the config is missing/unreadable, fail OPEN
+	# (keep the rule) so we never silently drop a valid rule due to a parse glitch.
+	rule_target_exists() {
+		case "$1" in
+			DIRECT|REJECT|REJECT-DROP|PASS|COMPATIBLE) return 0 ;;
+		esac
+		[ -n "$1" ] || return 0
+		[ -f "$config_file" ] || return 0
+		local esc
+		esc=$(printf '%s' "$1" | sed 's/[][\.\\*^$(){}?+|]/\\&/g')
+		grep -qE "name:[[:space:]]+[\\"']?${esc}[\\"']?[,}[:space:]]" "$config_file"
+	}
 	uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=mihomo_rule$/\\1/p' | while read -r sid; do
 		local enabled domain action group rule_type rtype
 		enabled=$(uci -q get mihomo.$sid.enabled)
@@ -560,7 +582,14 @@ emit_access_rules_yaml() {
 			proxy)
 				local g
 				g=$(uci -q get mihomo.$sid.group)
-				[ -n "$g" ] && echo "  - '$rtype,$domain,$g'"
+				if [ -z "$g" ]; then
+					continue
+				fi
+				if rule_target_exists "$g"; then
+					echo "  - '$rtype,$domain,$g'"
+				else
+					logger -t mihomo "access_rule skipped (invalid target): domain=$domain group=$g not found in current proxies/groups"
+				fi
 				;;
 		esac
 	done
@@ -634,7 +663,7 @@ EOF
 
 	# Inject controlled access rules from UCI (highest priority, first-match).
 	local rules_file="${run_config}.rules"
-	emit_access_rules_yaml > "$rules_file"
+	emit_access_rules_yaml "$src_config" > "$rules_file"
 	if [ -s "$rules_file" ]; then
 		if grep -q '^rules:' "$run_config"; then
 			local tmpf="${run_config}.rules2"
@@ -650,6 +679,20 @@ EOF
 		logger -t mihomo "Prepared config with UCI access rules"
 	fi
 	rm -f "$rules_file"
+
+	# Normalize the rules block to a single 2-space indent. Subscription configs
+	# and UCI-injected rules may use different indents (e.g. 4 vs 2 spaces); mixing
+	# them is invalid YAML ("did not find expected '-' indicator") and the core
+	# fatal-exits on startup. Re-indent every rule item uniformly to 2 spaces.
+	if grep -q '^rules:' "$run_config"; then
+		local normf="${run_config}.norm"
+		awk '
+			/^rules:[[:space:]]*$/ { in_rules = 1; print; next }
+			in_rules && /^[A-Za-z]/ { in_rules = 0 }
+			in_rules && /^[[:space:]]*-/ { sub(/^[[:space:]]*/, "  "); print; next }
+			{ print }
+		' "$run_config" > "$normf" && mv "$normf" "$run_config"
+	fi
 
 	echo "SUCCESS: Prepared configuration at $run_config"
 	return 0
@@ -754,9 +797,9 @@ get_proxies() {
 	if [ "$nodes" = "[]" ] || [ "$nodes" = "[
 ]" ]; then
 		if grep -q "proxies: \\[\\]" "$config_path"; then
-			echo "{\"error\":\"no_nodes\", \"msg\":\"订阅更新成功，但服务器返回了空的节点列表（已过滤 Hysteria2 等不兼容节点，或订阅已过期）。\"}"
+			echo "{\\"error\\":\\"no_nodes\\", \\"msg\\":\\"订阅更新成功，但服务器返回了空的节点列表（已过滤 Hysteria2 等不兼容节点，或订阅已过期）。\\"}"
 		else
-			echo "{\"error\":\"parse_failed\", \"msg\":\"未能解析出任何代理节点，请确认订阅内容是否为合法的 Clash/Mihomo 配置。\"}"
+			echo "{\\"error\\":\\"parse_failed\\", \\"msg\\":\\"未能解析出任何代理节点，请确认订阅内容是否为合法的 Clash/Mihomo 配置。\\"}"
 		fi
 	else
 		echo "$nodes"
@@ -1140,6 +1183,17 @@ get_op_state() {
 	fi
 	echo "{\\"state\\":\\"$state\\",\\"op\\":\\"$op\\",\\"elapsed\\":$elapsed,\\"running\\":$ctrl,\\"result\\":\\"$result\\"}"
 }
+get_core_log() {
+	# Tail the core's real stdout/stderr (captured by init.d). Falls back to syslog
+	# (init.d's own logger -t mihomo lines) when the file is missing or empty.
+	local logfile="/tmp/mihomo_core.log"
+	local lines="${1:-300}"
+	if [ -s "$logfile" ]; then
+		tail -n "$lines" "$logfile" 2>/dev/null
+	else
+		logread -e mihomo 2>/dev/null | tail -n "$lines"
+	fi
+}
 clear_access_rules() {
 	local _n=0
 	while [ $_n -lt 1000 ]; do uci -q delete mihomo.@mihomo_rule[0] || break; _n=$((_n+1)); done
@@ -1212,6 +1266,9 @@ case "$1" in
 	get_op_state)
 		get_op_state
 		;;
+	get_core_log)
+		get_core_log "$2"
+		;;
 	get_access_rules)
 		get_access_rules
 		;;
@@ -1228,7 +1285,7 @@ case "$1" in
 		import_rules "$2" "$3"
 		;;
 	*)
-		echo "Usage: $0 {get_arch|check_core|download_core|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes}"
+		echo "Usage: $0 {get_arch|check_core|download_core|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes}"
 		exit 1
 		;;
 esac
@@ -1984,7 +2041,7 @@ return view.extend({
 		return uci.load('mihomo').then(function() {
 			return Promise.all([
 				fs.exec('/usr/share/mihomo/helper.sh', ['check_core']).catch(function() { return { stdout: '' }; }),
-				fs.exec('/sbin/logread', ['-e', 'mihomo']).catch(function() { return { stdout: '' }; }),
+				fs.exec('/usr/share/mihomo/helper.sh', ['get_core_log']).catch(function() { return { stdout: '' }; }),
 				rpc.declare({
 					object: 'service',
 					method: 'list',
@@ -2058,11 +2115,16 @@ return view.extend({
 
 		var status_badge;
 		if (controller_up) {
-			status_badge = '<span class="label success" style="background-color: #2ed573; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;">RUNNING</span>';
+			status_badge = E('span', { 'class': 'label success', 'style': 'background-color: #2ed573; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;' }, 'RUNNING');
 		} else if (is_running) {
-			status_badge = '<span class="label" style="background-color: #ffa502; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;">运行异常</span>';
+			status_badge = E('span', { 'class': 'label', 'style': 'background-color: #ffa502; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;' }, '运行异常');
 		} else {
-			status_badge = '<span class="label danger" style="background-color: #ff4757; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;">STOPPED</span>';
+			status_badge = E('span', { 'class': 'label danger', 'style': 'background-color: #ff4757; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold;' }, 'STOPPED');
+		}
+		// 运行异常：procd 在拉起进程但控制器未就绪——提示用户去看下方红色错误日志
+		var status_cell = E('td', {}, status_badge);
+		if (!controller_up && is_running) {
+			status_cell.appendChild(E('span', { 'style': 'margin-left: 10px; color: #e03131; font-size: 12px;' }, _('核心进程在运行但控制器未就绪，请查看下方「系统代理日志」中的红色错误行排查配置。')));
 		}
 
 		var perform_download = function(ev) {
@@ -2429,16 +2491,39 @@ return view.extend({
 			node_list_body = E('div', { 'style': 'padding: 15px; text-align: center; color: #999;' }, _('暂无可用节点信息，请先输入订阅链接并点击立即更新订阅。'));
 		}
 
-		var logs_textarea = E('textarea', {
-			'style': 'width: 100%; height: 250px; font-family: monospace; padding: 12px; border-radius: 6px; border: 1px solid rgba(0,0,0,0.12); background: rgba(0,0,0,0.02); resize: vertical; margin-bottom: 12px; font-size: 13px; line-height: 1.5;',
-			'readonly': 'readonly'
-		}, logs);
+		// 系统代理日志：逐行渲染，错误/致命行红色加粗，告警行橙色
+		var logs_pre = document.createElement('pre');
+		logs_pre.setAttribute('style', 'width: 100%; height: 250px; overflow-y: auto; font-family: monospace; padding: 12px; border-radius: 6px; border: 1px solid rgba(0,0,0,0.12); background: rgba(0,0,0,0.02); resize: vertical; margin-bottom: 12px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;');
+		function renderLogs(text) {
+			while (logs_pre.firstChild) { logs_pre.removeChild(logs_pre.firstChild); }
+			var lines = String(text || '').split('\\n');
+			if (lines.length === 0 || (lines.length === 1 && lines[0] === '')) {
+				var empty = document.createElement('div');
+				empty.textContent = _('暂无日志记录。');
+				empty.style.color = '#999';
+				logs_pre.appendChild(empty);
+				return;
+			}
+			for (var i = 0; i < lines.length; i++) {
+				var line = lines[i];
+				var row = document.createElement('div');
+				row.textContent = line;
+				if (/\\b(FATAL|FAT|ERROR|ERR|PANIC)\\b|\\blevel=(fatal|error)\\b/i.test(line)) {
+					row.style.color = '#e03131';
+					row.style.fontWeight = 'bold';
+				} else if (/\\b(WARN|WARNING)\\b|\\blevel=warning\\b/i.test(line)) {
+					row.style.color = '#e8590c';
+				}
+				logs_pre.appendChild(row);
+			}
+		}
+		renderLogs(logs);
 		var clear_logs_btn = E('button', {
 			'class': 'cbi-button cbi-button-neutral',
 			'style': 'margin: 0;',
 			'click': function(ev) {
 				ev.preventDefault();
-				logs_textarea.value = '';
+				while (logs_pre.firstChild) { logs_pre.removeChild(logs_pre.firstChild); }
 			}
 		}, _('清空'));
 
@@ -2492,7 +2577,7 @@ return view.extend({
 				E('table', { 'class': 'table' }, [
 					E('tr', {}, [
 						E('td', { 'width': '33%' }, _('守护进程状态')),
-						E('td', {}, status_badge)
+						status_cell
 					]),
 					E('tr', {}, [
 						E('td', {}, _('已安装核心版本')),
@@ -2534,11 +2619,22 @@ return view.extend({
 					E('h3', { 'style': 'margin: 0;' }, _('系统代理日志')),
 					clear_logs_btn
 				]),
-				logs_textarea
+				logs_pre
 			])
 		]);
 
+		// 日志每 5s 自动刷新，便于实时观察核心启动报错
+		this._logTimer = setInterval(function() {
+			fs.exec('/usr/share/mihomo/helper.sh', ['get_core_log']).then(function(res) {
+				renderLogs((res.stdout || '').trim());
+			}).catch(function() {});
+		}, 5000);
+
 		return view_html;
+	},
+
+	unload: function() {
+		if (this._logTimer) { clearInterval(this._logTimer); this._logTimer = null; }
 	}
 });
 """,
@@ -2736,6 +2832,45 @@ return view.extend({
 """
 }
 
+def _bump_version_string(current_ver):
+    """Return the next version string after ``current_ver``.
+
+    Revision form ``MAJOR.MINOR.PATCH-N`` bumps the revision (``N -> N+1``);
+    plain dotted form bumps the last numeric segment. Non-numeric tails fall
+    back to appending ``.1`` (revision form) or ``-1`` (dotted form).
+    """
+    if '-' in current_ver:
+        ver_part, rev_part = current_ver.rsplit('-', 1)
+        try:
+            new_rev = int(rev_part) + 1
+            return f"{ver_part}-{new_rev}"
+        except ValueError:
+            return current_ver + ".1"
+    else:
+        parts = current_ver.split('.')
+        try:
+            parts[-1] = str(int(parts[-1]) + 1)
+            return '.'.join(parts)
+        except ValueError:
+            return current_ver + "-1"
+
+
+def _compute_file_mode(rel_path, basename, is_control):
+    """Return the tar entry mode for a regular file.
+
+    In a control tarball, only the maintainer scripts
+    (postinst/postrm/preinst/prerm) are executable. In the data tarball, the
+    init.d scripts and ``helper.sh`` are executable. Everything else is 0o644.
+    """
+    if is_control:
+        if basename in ("postinst", "postrm", "preinst", "prerm"):
+            return 0o755
+        return 0o644
+    if "etc/init.d/" in rel_path or "usr/share/mihomo/helper.sh" in rel_path:
+        return 0o755
+    return 0o644
+
+
 def create_source_tree(src_dir):
     """Writes all source files into the specified directory to allow user editing."""
     print(f"Creating source tree in '{src_dir}'...")
@@ -2748,7 +2883,6 @@ def create_source_tree(src_dir):
         
         # Override the version in CONTROL/control dynamically
         if rel_path == "CONTROL/control":
-            import re
             content = re.sub(r'Version:\s*.*', f'Version: {PKG_VERSION}', content)
         # Bake the current package version into views that use the __PKG_VERSION__ placeholder
         content = content.replace('__PKG_VERSION__', PKG_VERSION)
@@ -2763,7 +2897,11 @@ def create_source_tree(src_dir):
 def make_tar_gz(source_dir, output_filename, is_control=False):
     """Generates a reproducible tar.gz archive with root:root ownership and correct modes, including directories and using './' prefix."""
     print(f"Archiving '{source_dir}' -> '{output_filename}'...")
-    with tarfile.open(output_filename, "w:gz") as tar:
+    # Pin the gzip header (fixed mtime, no embedded filename) so two builds of
+    # the same inputs produce byte-identical archives.
+    _raw = open(output_filename, "wb")
+    _gz = gzip.GzipFile(filename="", fileobj=_raw, mode="wb", mtime=1700000000)
+    with tarfile.open(fileobj=_gz, mode="w") as tar:
         all_entries = []
         for root, dirs, files in os.walk(source_dir):
             for d in dirs:
@@ -2802,24 +2940,19 @@ def make_tar_gz(source_dir, output_filename, is_control=False):
                 tar.addfile(tarinfo)
             else:
                 tarinfo.type = tarfile.REGTYPE
-                if is_control:
-                    if os.path.basename(full_path) in ["postinst", "postrm", "preinst", "prerm"]:
-                        tarinfo.mode = 0o755
-                    else:
-                        tarinfo.mode = 0o644
-                else:
-                    if "etc/init.d/" in rel_path or "usr/share/mihomo/helper.sh" in rel_path:
-                        tarinfo.mode = 0o755
-                    else:
-                        tarinfo.mode = 0o644
+                tarinfo.mode = _compute_file_mode(rel_path, os.path.basename(full_path), is_control)
                         
                 with open(full_path, "rb") as f:
                     tar.addfile(tarinfo, f)
+    _gz.close()
+    _raw.close()
 
 def write_tar_gz_outer_archive(archive_path, file_list):
     """Writes the final .ipk as a gzipped tarball containing the three components."""
     print(f"Creating IPK archive (tar.gz format) '{archive_path}'...")
-    with tarfile.open(archive_path, "w:gz") as tar:
+    _raw = open(archive_path, "wb")
+    _gz = gzip.GzipFile(filename="", fileobj=_raw, mode="wb", mtime=1700000000)
+    with tarfile.open(fileobj=_gz, mode="w") as tar:
         for name, data in file_list:
             arcname = "./" + name
             tarinfo = tarfile.TarInfo(name=arcname)
@@ -2832,36 +2965,28 @@ def write_tar_gz_outer_archive(archive_path, file_list):
             tarinfo.mode = 0o644
             tarinfo.type = tarfile.REGTYPE
             tar.addfile(tarinfo, io.BytesIO(data))
+    _gz.close()
+    _raw.close()
 
-def increment_version():
-    """Increments the PKG_VERSION in the script file dynamically and updates memory variables."""
+def increment_version(script_path=None):
+    """Increments the PKG_VERSION in the script file dynamically and updates memory variables.
+
+    When ``script_path`` is omitted it defaults to this script (``__file__``);
+    tests pass an explicit path to avoid mutating the real builder.
+    """
     global PKG_VERSION, IPK_FILENAME
     
-    script_path = __file__
+    script_path = script_path or __file__
     with open(script_path, "r", encoding="utf-8") as f:
         content = f.read()
         
-    import re
     match = re.search(r'PKG_VERSION\s*=\s*["\']([^"\']+)["\']', content)
     if not match:
         print("Warning: PKG_VERSION variable not found in script.")
         return
         
     current_ver = match.group(1)
-    if '-' in current_ver:
-        ver_part, rev_part = current_ver.rsplit('-', 1)
-        try:
-            new_rev = int(rev_part) + 1
-            new_ver = f"{ver_part}-{new_rev}"
-        except ValueError:
-            new_ver = current_ver + ".1"
-    else:
-        parts = current_ver.split('.')
-        try:
-            parts[-1] = str(int(parts[-1]) + 1)
-            new_ver = '.'.join(parts)
-        except ValueError:
-            new_ver = current_ver + "-1"
+    new_ver = _bump_version_string(current_ver)
             
     # Replace in file content
     new_line = f'PKG_VERSION = "{new_ver}"'

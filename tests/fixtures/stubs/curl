@@ -1,0 +1,7 @@
+#!/bin/sh
+# Test stub for the controller `curl` (called via helper.sh's mihomo_curl).
+# Echoes $CURL_RESPONSE verbatim so callers that grep its output see canned data.
+if [ -n "$CURL_RESPONSE" ]; then
+	printf '%s\n' "$CURL_RESPONSE"
+fi
+exit 0

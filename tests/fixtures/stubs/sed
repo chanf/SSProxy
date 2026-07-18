@@ -1,0 +1,14 @@
+#!/bin/sh
+# GNU-sed-compatible wrapper around macOS BSD sed. Only the in-place form used
+# by helper.sh (`sed -i 'script' file`, no backup extension) needs translation;
+# every other invocation passes through to the real /usr/bin/sed unchanged.
+if [ "$1" = "-i" ]; then
+	shift
+	script=$1
+	shift
+	for f in "$@"; do
+		/usr/bin/sed "$script" "$f" > "$f.__sedtmp__" && mv "$f.__sedtmp__" "$f"
+	done
+	exit 0
+fi
+exec /usr/bin/sed "$@"

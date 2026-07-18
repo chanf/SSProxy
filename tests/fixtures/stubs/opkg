@@ -1,0 +1,7 @@
+#!/bin/sh
+# Test stub for `opkg`: `opkg print-architecture` echoes $OPKG_ARCH_OUT when set.
+if [ "$1" = "print-architecture" ] && [ -n "$OPKG_ARCH_OUT" ]; then
+	printf '%s\n' "$OPKG_ARCH_OUT"
+	exit 0
+fi
+exit 0

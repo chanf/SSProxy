@@ -1,0 +1,48 @@
+#!/bin/sh
+# Test stub for OpenWrt `uci`. Driven entirely by data files whose paths are
+# passed in the environment, so each test controls the UCI state:
+#
+#   UCI_SHOW_FILE    lines like `mihomo.<sid>=mihomo_rule`   (for `uci show`)
+#   UCI_GET_FILE     lines like `<dotted.key>=<value>`       (for `uci -q get`)
+#   UCI_OPS_FILE     append-only recorder of set/commit/delete (for assertions)
+#   UCI_ADD_COUNTER  monotonic counter backing synthesized section ids
+#
+# Supported verbs: show, -q get, add, -q set, commit, -q delete.
+for a in "$@"; do
+	if [ "$a" = "show" ]; then
+		[ -f "$UCI_SHOW_FILE" ] && cat "$UCI_SHOW_FILE"
+		exit 0
+	fi
+done
+
+is_get=0
+last=""
+for a in "$@"; do
+	[ "$a" = "get" ] && is_get=1
+	last="$a"
+done
+if [ "$is_get" = "1" ]; then
+	if [ -f "$UCI_GET_FILE" ]; then
+		line=$(grep "^$last=" "$UCI_GET_FILE" | head -n 1)
+		if [ -n "$line" ]; then
+			printf '%s\n' "${line#*=}"
+			exit 0
+		fi
+	fi
+	exit 1   # -q get miss → empty output, non-zero
+fi
+
+for a in "$@"; do
+	if [ "$a" = "add" ]; then
+		n=0
+		[ -f "$UCI_ADD_COUNTER" ] && n=$(cat "$UCI_ADD_COUNTER" 2>/dev/null)
+		n=$((n + 1))
+		printf '%s' "$n" > "$UCI_ADD_COUNTER" 2>/dev/null
+		printf 'cfg%04d\n' "$n"
+		exit 0
+	fi
+done
+
+# Everything else (set / commit / delete) → record the invocation and succeed.
+[ -n "$UCI_OPS_FILE" ] && printf '%s\n' "$*" >> "$UCI_OPS_FILE"
+exit 0
