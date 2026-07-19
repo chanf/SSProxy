@@ -7,7 +7,7 @@ import tarfile
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-149"
+PKG_VERSION = "1.0.0-150"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -1043,10 +1043,16 @@ collect_loop() {
 # per-main-domain bucket (/etc/mihomo/.traffic_domains, clearable). Host-less
 # proxy connections are bucketed as "其他". One awk pass does all the math.
 collect_traffic() {
-	local raw statef totalf domf tmpd
+	local raw statef totalf domf tmpd dayf monf bkday bkmon
 	statef="/tmp/mihomo_traffic_state"
 	totalf="/etc/mihomo/.traffic_total"
 	domf="/etc/mihomo/.traffic_domains"
+	dayf="/etc/mihomo/.traffic_daily"
+	monf="/etc/mihomo/.traffic_monthly"
+	# Beijing time (UTC+8) keys for the never-cleared daily/monthly summary
+	# buckets. POSIX TZ offset sign is inverted: "UTC-8" == 8h east of UTC.
+	bkday=$(TZ=UTC-8 date +%Y-%m-%d)
+	bkmon=$(TZ=UTC-8 date +%Y-%m)
 	raw=$(mihomo_curl -s --connect-timeout 2 "http://127.0.0.1:${API_PORT}/connections" 2>/dev/null)
 	[ -z "$raw" ] && return 0
 	tmpd=$(mktemp -d)
@@ -1055,8 +1061,8 @@ collect_traffic() {
 	printf '%s' "$raw" | jsonfilter -e '$.connections[@].metadata.host' 2>/dev/null > "$tmpd/host"
 	printf '%s' "$raw" | jsonfilter -e '$.connections[@].upload' 2>/dev/null > "$tmpd/up"
 	printf '%s' "$raw" | jsonfilter -e '$.connections[@].download' 2>/dev/null > "$tmpd/dn"
-	touch "$statef" "$totalf" "$domf"
-	awk -v statef="$statef" -v totalf="$totalf" -v domf="$domf" -v now="$(date +%s)" '
+	touch "$statef" "$totalf" "$domf" "$dayf" "$monf"
+	awk -v statef="$statef" -v totalf="$totalf" -v domf="$domf" -v now="$(date +%s)" -v dayf="$dayf" -v monf="$monf" -v curday="$bkday" -v curmon="$bkmon" '
 		BEGIN {
 			comp = " com.cn net.cn org.cn gov.cn edu.cn ac.cn com.hk com.tw com.jp co.jp co.uk co.kr com.au com.sg com.br com.mx "
 			total = 0; since = 0
@@ -1065,6 +1071,10 @@ collect_traffic() {
 			if (since == 0) since = now
 			while ((getline ln < domf) > 0) { if (split(ln, a, "\\t") >= 2 && a[1] != "") dom[a[1]] = a[2]+0 }
 			close(domf)
+			while ((getline ln < dayf) > 0) { if (split(ln, a, "\\t") >= 2 && a[1] != "") daily[a[1]] = a[2]+0 }
+			close(dayf)
+			while ((getline ln < monf) > 0) { if (split(ln, a, "\\t") >= 2 && a[1] != "") monthly[a[1]] = a[2]+0 }
+			close(monf)
 			while ((getline ln < statef) > 0) { if (split(ln, a, "\\t") >= 2 && a[1] != "") st[a[1]] = a[2]+0 }
 			close(statef)
 		}
@@ -1093,6 +1103,8 @@ collect_traffic() {
 					}
 				}
 				dom[md] += delta
+				daily[curday] += delta
+				monthly[curmon] += delta
 			}
 			for (k in seen) print k "\\t" st[k] > statef
 			close(statef)
@@ -1100,6 +1112,10 @@ collect_traffic() {
 			close(totalf)
 			for (k in dom) if (dom[k] > 0) print k "\\t" dom[k] > domf
 			close(domf)
+			for (k in daily) if (daily[k] > 0) print k "\\t" daily[k] > dayf
+			close(dayf)
+			for (k in monthly) if (monthly[k] > 0) print k "\\t" monthly[k] > monf
+			close(monf)
 		}
 	' "$tmpd/id" "$tmpd/ch" "$tmpd/host" "$tmpd/up" "$tmpd/dn"
 	rm -rf "$tmpd"
@@ -1113,10 +1129,12 @@ traffic_loop() {
 	done
 }
 
-# Emit traffic stats as JSON: {total, since, domains:[{domain,bytes}]} (top 30 by
-# bytes). Front end formats bytes to human units.
+# Emit traffic stats as JSON: {total, since, domains:[{domain,bytes}] (top 30 by
+# bytes), daily:[{date,bytes}], monthly:[{month,bytes}]} -- daily/monthly are
+# full, never-truncated Beijing-time (UTC+8) summaries. Front end formats bytes.
 get_traffic() {
 	local totalf="/etc/mihomo/.traffic_total" domf="/etc/mihomo/.traffic_domains"
+	local dayf="/etc/mihomo/.traffic_daily" monf="/etc/mihomo/.traffic_monthly"
 	local total=0 since=0
 	read -r total since 2>/dev/null < "$totalf" || true
 	total=${total:-0}; since=${since:-0}
@@ -1128,6 +1146,26 @@ get_traffic() {
 			[ "$_first" -eq 0 ] && printf ','
 			_first=0
 			printf '{"domain":"%s","bytes":%d}' "$_d" "${_b:-0}"
+		done
+	fi
+	printf '],"daily":['
+	if [ -s "$dayf" ]; then
+		local _first=1 _k _b
+		sort -k1 -r "$dayf" 2>/dev/null | while IFS='	' read -r _k _b; do
+			[ -z "$_k" ] && continue
+			[ "$_first" -eq 0 ] && printf ','
+			_first=0
+			printf '{"date":"%s","bytes":%d}' "$_k" "${_b:-0}"
+		done
+	fi
+	printf '],"monthly":['
+	if [ -s "$monf" ]; then
+		local _first=1 _k _b
+		sort -k1 -r "$monf" 2>/dev/null | while IFS='	' read -r _k _b; do
+			[ -z "$_k" ] && continue
+			[ "$_first" -eq 0 ] && printf ','
+			_first=0
+			printf '{"month":"%s","bytes":%d}' "$_k" "${_b:-0}"
 		done
 	fi
 	printf ']}'
@@ -3145,8 +3183,26 @@ return view.extend({
 		var tbody = E('tbody', {}, []);
 		var domainTh = E('th', { 'style': 'cursor: pointer; background: rgba(0,0,0,0.02);', 'click': function() { setSort('domain'); } }, _('域名'));
 		var bytesTh = E('th', { 'style': 'cursor: pointer; background: rgba(0,0,0,0.02);', 'click': function() { setSort('bytes'); } }, _('流量 ▼'));
+		var dailyTbody = E('tbody', {}, []);
+		var monthlyTbody = E('tbody', {}, []);
+		var fillSummary = function(body, items, keyField) {
+			while (body.firstChild) body.removeChild(body.firstChild);
+			var arr = (items || []).slice();
+			if (!arr.length) {
+				body.appendChild(E('tr', {}, [ E('td', { 'colspan': 2, 'style': 'padding: 16px; color: #999; text-align: center;' }, _('暂无数据（稍候刷新）')) ]));
+				return;
+			}
+			for (var i = 0; i < arr.length; i++) {
+				body.appendChild(E('tr', {}, [
+					E('td', { 'style': 'font-weight: bold; vertical-align: middle; padding: 8px;' }, arr[i][keyField]),
+					E('td', { 'style': 'vertical-align: middle; padding: 8px;' }, fmtBytes(arr[i].bytes))
+				]));
+			}
+		};
 		var renderRows = function() {
 			var data = self._lastData || { domains: [] };
+			fillSummary(dailyTbody, data.daily, 'date');
+			fillSummary(monthlyTbody, data.monthly, 'month');
 			totalEl.textContent = fmtBytes(data.total || 0);
 			if (data.since) {
 				var dt = new Date(data.since * 1000);
@@ -3201,6 +3257,32 @@ return view.extend({
 				E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
 					E('thead', {}, [ E('tr', {}, [ domainTh, bytesTh ]) ]),
 					tbody
+				])
+			]),
+			E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 18px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
+				E('h3', { 'style': 'margin: 0 0 4px; font-size: 16px;' }, _('按天汇总')),
+				E('p', { 'style': 'color: #888; font-size: 12px; margin: 0 0 12px;' }, _('按北京时间（UTC+8）汇总，永久存储，不会清零。')),
+				E('div', { 'style': 'max-height: 400px; overflow-y: auto;' }, [
+					E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
+						E('thead', {}, [ E('tr', {}, [
+							E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('日期')),
+							E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('流量'))
+						]) ]),
+						dailyTbody
+					])
+				])
+			]),
+			E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 18px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
+				E('h3', { 'style': 'margin: 0 0 4px; font-size: 16px;' }, _('按月汇总')),
+				E('p', { 'style': 'color: #888; font-size: 12px; margin: 0 0 12px;' }, _('按北京时间（UTC+8）汇总，永久存储，不会清零。')),
+				E('div', { 'style': 'max-height: 400px; overflow-y: auto;' }, [
+					E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
+						E('thead', {}, [ E('tr', {}, [
+							E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('月份')),
+							E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('流量'))
+						]) ]),
+						monthlyTbody
+					])
 				])
 			])
 		]);
