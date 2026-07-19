@@ -1,0 +1,57 @@
+#!/bin/sh
+# Test stub for the Linux `ip` command. Emulates only the few
+# `ip -o addr show ...` / `ip -o route show default` forms that get_lan_ip and
+# get_lan_ip6 in helper.sh use. Canned data comes from env vars so each test
+# controls the "kernel" view:
+#
+#   IPV4_BR_LAN         e.g. "192.168.1.1/24"   (br-lan primary IPv4)
+#   IPV4_ANY            e.g. "10.0.0.1/24"      (first global IPv4 on the box)
+#   IPV4_DEFAULT_SRC    e.g. "192.168.1.1"      (default-route `src`)
+#   IPV6_LL             e.g. "fe80::1/64"       (br-lan link-local v6)
+#   IPV6_GUA            e.g. "2001:db8::1/64"   (br-lan global v6)
+#
+# Output mimics `ip -o ...`: fields are whitespace-separated so the callers'
+# `awk '{print $4}' | cut -d/ -f1` extracts the address as expected.
+
+fam=""
+for a in "$@"; do
+	[ "$a" = "-4" ] && fam=4
+	[ "$a" = "-6" ] && fam=6
+done
+
+has_br_lan=0
+echo "$*" | grep -q 'br-lan' && has_br_lan=1
+has_link=0
+echo "$*" | grep -q 'scope link' && has_link=1
+has_global=0
+echo "$*" | grep -q 'scope global' && has_global=1
+
+if echo "$*" | grep -q 'addr show'; then
+	if [ "$fam" = "4" ]; then
+		if [ "$has_br_lan" = "1" ] && [ -n "$IPV4_BR_LAN" ]; then
+			echo "3: br-lan    inet $IPV4_BR_LAN brd 192.168.1.255 scope global br-lan\\"
+		elif [ "$has_br_lan" = "0" ] && [ -n "$IPV4_ANY" ]; then
+			echo "5: eth0    inet $IPV4_ANY scope global eth0\\"
+		fi
+	elif [ "$fam" = "6" ]; then
+		if [ "$has_br_lan" = "1" ]; then
+			if [ "$has_link" = "1" ] && [ -n "$IPV6_LL" ]; then
+				echo "3: br-lan    inet6 $IPV6_LL scope link br-lan\\"
+			elif [ "$has_global" = "1" ] && [ -n "$IPV6_GUA" ]; then
+				echo "3: br-lan    inet6 $IPV6_GUA scope global br-lan\\"
+			fi
+		elif [ "$has_br_lan" = "0" ] && [ "$has_global" = "1" ] && [ -n "$IPV6_GUA" ]; then
+			echo "5: eth0    inet6 $IPV6_GUA scope global eth0\\"
+		fi
+	fi
+	exit 0
+fi
+
+if echo "$*" | grep -q 'route show default'; then
+	if [ "$fam" = "4" ] && [ -n "$IPV4_DEFAULT_SRC" ]; then
+		echo "default via 192.168.1.1 dev br-lan src $IPV4_DEFAULT_SRC"
+	fi
+	exit 0
+fi
+
+exit 0

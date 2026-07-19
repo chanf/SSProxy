@@ -20,7 +20,7 @@ if _REPO_ROOT not in sys.path:
 import build_ipk  # noqa: E402
 
 _STUBS_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures", "stubs")
-_STUB_NAMES = ["uci", "logger", "sed", "uname", "opkg", "curl"]
+_STUB_NAMES = ["uci", "logger", "sed", "uname", "opkg", "curl", "ip"]
 
 
 @pytest.fixture(scope="session")

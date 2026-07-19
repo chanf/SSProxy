@@ -9,7 +9,7 @@ import tarfile
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-151"
+PKG_VERSION = "1.0.0-158"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -18,7 +18,7 @@ src_files = {
     # Package metadata
     "CONTROL/control": """Package: luci-app-mihomo
 Version: 1.0.0-1
-Depends: luci-base, ip-full, kmod-nft-tproxy, curl
+Depends: luci-base, ip-full, kmod-nft-tproxy, kmod-nft-nat, curl
 Architecture: all
 Maintainer: Antigravity
 Section: luci
@@ -57,6 +57,8 @@ config mihomo 'config'
 	option enabled '0'
 	option core_path '/usr/bin/mihomo'
 	option config_path '/etc/mihomo/config.yaml'
+	option config_mode 'subscription'
+	option custom_config_path '/etc/mihomo/custom.yaml'
 	option work_dir '/etc/mihomo'
 	option mix_port '7890'
 	option tproxy_port '7893'
@@ -81,36 +83,34 @@ START=95
 USE_PROCD=1
 
 enable_tproxy() {
-	local tproxy_port="$1"
-	local acl_mode="$2"
-	local acl_ips="$3"
-	
-	# 1. Add routing table 100
+	local tproxy_port="$1" acl_mode="$2" acl_v4="$3" acl_v6="$4"
+	local dns_hijack="$5" dns_port="$6" rip_v4="$7" rip_v6="$8"
+
+	# 1. Policy routing for tproxy (fwmark 1 → table 100 → local route), IPv4 + IPv6.
 	ip rule add fwmark 1 table 100 2>/dev/null
 	ip route add local default dev lo table 100 2>/dev/null
-	
-	# 2. Add nftables redirection rules (delete table first to ensure clean state)
+	ip -6 rule add fwmark 1 table 100 2>/dev/null
+	ip -6 route add local default dev lo table 100 2>/dev/null
+
+	# 2. nftables redirection. Drop our tables first (tolerant), then apply the
+	# additive ruleset from emit_tproxy_rules. In whitelist+dns_hijack mode that
+	# ruleset also installs the source-scoped DNS DNAT (table inet mihomo_dns).
 	nft delete table inet mihomo 2>/dev/null
-	nft add table inet mihomo
-	nft add chain inet mihomo prerouting { type filter hook prerouting priority mangle \\; }
-	nft add rule inet mihomo prerouting ip daddr { 127.0.0.0/8, 10.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } return
-	nft add rule inet mihomo prerouting ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } return
-	
-	if [ "$acl_mode" = "whitelist" ] && [ -n "$acl_ips" ]; then
-		nft add rule inet mihomo prerouting ip saddr != { "$acl_ips" } return
-	fi
-	
-	nft add rule inet mihomo prerouting meta l4proto { tcp, udp } tproxy to :"$tproxy_port" meta mark set 1
-	
-	logger -t mihomo "TProxy redirect rules enabled on port $tproxy_port (acl_mode: $acl_mode)"
+	nft delete table inet mihomo_dns 2>/dev/null
+	/usr/share/mihomo/helper.sh emit_tproxy_rules "$tproxy_port" "$acl_mode" "$acl_v4" "$acl_v6" "$dns_hijack" "$dns_port" "$rip_v4" "$rip_v6" | nft -f -
+
+	logger -t mihomo "TProxy redirect rules enabled on port $tproxy_port (acl_mode: $acl_mode, dns_hijack: $dns_hijack)"
 }
 
 disable_tproxy() {
-	# Remove nftables table and routing rules
+	# Remove nftables tables and routing rules (IPv4 + IPv6)
 	nft delete table inet mihomo 2>/dev/null
+	nft delete table inet mihomo_dns 2>/dev/null
 	ip rule del fwmark 1 table 100 2>/dev/null
 	ip route del local default dev lo table 100 2>/dev/null
-	
+	ip -6 rule del fwmark 1 table 100 2>/dev/null
+	ip -6 route del local default dev lo table 100 2>/dev/null
+
 	logger -t mihomo "TProxy redirect rules disabled"
 }
 
@@ -143,10 +143,12 @@ start_service() {
 	echo "start $(date +%s)" > /tmp/mihomo_op.state
 	/usr/share/mihomo/helper.sh restore_subscription_url
 	
-	local core_path config_path work_dir dns_port dns_hijack tproxy_port tun_enabled acl_mode
+	local core_path config_path work_dir dns_port dns_hijack tproxy_port tun_enabled acl_mode config_mode custom_config_path
 	
 	config_get core_path config core_path "/usr/bin/mihomo"
 	config_get config_path config config_path "/etc/mihomo/config.yaml"
+	config_get config_mode config config_mode "subscription"
+	config_get custom_config_path config custom_config_path "/etc/mihomo/custom.yaml"
 	config_get work_dir config work_dir "/etc/mihomo"
 	config_get dns_port config dns_port "1053"
 	config_get_bool dns_hijack config dns_hijack 1
@@ -160,7 +162,9 @@ start_service() {
 	
 	mkdir -p "$work_dir"
 	
-	if [ ! -f "$config_path" ]; then
+	# In custom-only mode the subscription file is irrelevant; never create a stub
+	# subscription there (the source config is the user's custom_config_path).
+	if [ "$config_mode" != "custom" ] && [ ! -f "$config_path" ]; then
 		mkdir -p "$(dirname "$config_path")"
 		cat <<EOF > "$config_path"
 port: 7890
@@ -204,23 +208,39 @@ EOF
 	
 	# Apply network redirections
 	if [ "$tun_enabled" -ne 1 ]; then
-		local acl_mode acl_ips=""
+		local acl_mode acl_v4="" acl_v6=""
 		config_get acl_mode config acl_mode "all"
-		
-		# If DNS hijack is enabled, force acl_mode to "all" to prevent Fake-IP bypass conflicts
-		if [ "$dns_hijack" -eq 1 ]; then
-			acl_mode="all"
-		fi
-		
+
+		# Collect acl_ips and split by family: a ':' marks IPv6, anything else
+		# (a single addr or an IPv4 CIDR like 192.168.1.0/24) is IPv4.
 		append_acl_ip() {
-			[ -n "$1" ] && acl_ips="${acl_ips:+$acl_ips,}$1"
+			[ -n "$1" ] || return 0
+			case "$1" in
+				*:*) acl_v6="${acl_v6:+$acl_v6,}$1" ;;
+				*) acl_v4="${acl_v4:+$acl_v4,}$1" ;;
+			esac
 		}
 		config_list_foreach config acl_ips append_acl_ip
-		
-		enable_tproxy "$tproxy_port" "$acl_mode" "$acl_ips"
+
+		# whitelist+dns_hijack: redirect only whitelisted clients' DNS to Mihomo
+		# (source-scoped nft DNAT) instead of the global dnsmasq hijack. Detect the
+		# router's LAN addresses as the DNAT target; fall back to the global hijack
+		# if we can't find them or the acl is empty.
+		local rip_v4="" rip_v6="" src_dns=0
+		if [ "$acl_mode" = "whitelist" ] && [ "$dns_hijack" -eq 1 ] && { [ -n "$acl_v4" ] || [ -n "$acl_v6" ]; }; then
+			rip_v4=$(/usr/share/mihomo/helper.sh get_lan_ip 2>/dev/null)
+			rip_v6=$(/usr/share/mihomo/helper.sh get_lan_ip6 2>/dev/null)
+			{ [ -n "$rip_v4" ] || [ -n "$rip_v6" ]; } && src_dns=1
+			[ "$src_dns" = "0" ] && logger -t mihomo "WARN: LAN IP not detected; falling back to global DNS hijack"
+		fi
+
+		enable_tproxy "$tproxy_port" "$acl_mode" "$acl_v4" "$acl_v6" "$dns_hijack" "$dns_port" "$rip_v4" "$rip_v6"
 	fi
-	
-	if [ "$dns_hijack" -eq 1 ]; then
+
+	# Global dnsmasq hijack: 'all' mode, TUN mode, or whitelist mode without a
+	# working source-scoped DNAT. Skipped when the source-scoped nft DNAT is
+	# active so non-whitelisted clients keep the router's real DNS upstream.
+	if [ "$dns_hijack" -eq 1 ] && [ "$src_dns" != "1" ]; then
 		enable_dns_hijack "$dns_port"
 	fi
 
@@ -470,6 +490,11 @@ update_geox() {
 
 update_subscription() {
 	local url="$1"
+	# Custom-only mode has no subscription; refuse to overwrite the user's config.
+	if [ "$(uci -q get mihomo.config.config_mode || echo subscription)" = "custom" ]; then
+		echo "ERROR: 当前为「仅自定义配置」模式，无法下载订阅。请切换到订阅/混合模式后再更新订阅。" >&2
+		return 1
+	fi
 	if [ -z "$url" ]; then
 		url=$(uci -q get mihomo.config.subscription_url)
 	fi
@@ -538,6 +563,11 @@ update_subscription() {
 # preserved so the user can re-fetch later. If the core is running it is
 # restarted so the deletion takes effect immediately.
 clear_subscription() {
+	# Custom-only mode has no subscription to clear.
+	if [ "$(uci -q get mihomo.config.config_mode || echo subscription)" = "custom" ]; then
+		echo '{"success":false,"msg":"当前为「仅自定义配置」模式，没有可清空的订阅节点"}'
+		return 0
+	fi
 	local config_path=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
 	# Back up the current subscription before deleting, so it can be restored if a
 	# later re-download fails (e.g. the subscription host is only reachable via the
@@ -702,10 +732,152 @@ emit_builtin_bypass_rules() {
 	echo "  - 'IP-CIDR6,ff00::/8,DIRECT,no-resolve'"
 }
 
+# Merge a custom config on top of the prepared running config. Behaviour:
+#   * Controlled (UCI-managed) keys (dns/tun/ports/secret/geo/...) are ignored.
+#   * "Appendable" list blocks (rules/proxy-groups/proxies/providers) have their
+#     items ADDED to the existing base block (custom supplements the subscription).
+#   * Any other top-level key in custom REPLACES the base block (custom overrides).
+# This implements the "mixed" mode: subscription as base, custom as a supplement.
+apply_custom_overlay() {
+	local base="$1" custom="$2"
+	[ -f "$custom" ] || { logger -t mihomo "apply_custom_overlay: custom file $custom not found"; return 0; }
+	local tmpd
+	tmpd=$(mktemp -d)
+
+	# Split the overlay into one file per top-level block (key + its indented body).
+	# Controlled (UCI-managed) blocks are dropped whole in the loop below, which
+	# keeps their bodies from leaking into the previous block.
+	awk -v p="${tmpd}/blk" '
+		function flush(){ if (f!="") { close(f); f="" } }
+		/^[ \t]/ { if (f!="") print >> f; next }
+		/^$/ { if (f!="") print >> f; next }
+		{
+			flush()
+			key=$0; sub(/:.*/,"",key)
+			gsub(/[^A-Za-z0-9_@.\-]/,"_",key)
+			f = p "." key
+			print > f
+		}
+		END { flush() }
+	' "$custom"
+
+	local APPENDABLE=" rules proxy-groups proxies proxy-providers rule-providers "
+
+	for blk in "${tmpd}"/blk.*; do
+		[ -f "$blk" ] || continue
+		local first ckey
+		first=$(head -n1 "$blk")
+		ckey=$(printf '%s' "$first" | sed 's/:.*//')
+		case "$ckey" in
+			dns|tun|mixed-port|tproxy-port|port|socks-port|allow-lan|external-controller|secret|profile|geox-url|geo-auto-update|geo-update-interval)
+				logger -t mihomo "custom overlay: ignored controlled key '$ckey' (managed via UCI)"
+				continue ;;
+		esac
+		if [ "$ckey" = "rules" ]; then
+			# rules 是顺序敏感列表：custom 项必须插在兜底规则 (MATCH/FINAL)
+			# 之前，否则落在 MATCH 之后永不命中。其余列表型 key (proxies/groups
+			# 等) 不顺序敏感，仍走 merge_append_list 末尾追加。
+			merge_rules_before_catchall "$base" "$blk"
+		elif echo " $APPENDABLE " | grep -q " $ckey "; then
+			merge_append_list "$base" "$ckey" "$blk"
+		else
+			merge_replace_block "$base" "$ckey" "$blk"
+		fi
+	done
+
+	rm -rf "$tmpd"
+	return 0
+}
+
+# Append the list items of an overlay block onto the end of the matching base
+# block (creating the block if the base doesn't have one yet).
+merge_append_list() {
+	local base="$1" ckey="$2" blk="$3"
+	local itemsf; itemsf=$(mktemp)
+	tail -n +2 "$blk" > "$itemsf"
+	if grep -q "^${ckey}:" "$base"; then
+		awk -v key="^${ckey}:" -v items="$itemsf" '
+			$0 ~ key && !started { started=1; print; next }
+			started && /^[A-Za-z0-9_@.\-]+:/ && $0 !~ key { system("cat " items); started=0; print; next }
+			{ print }
+			END { if (started) system("cat " items) }
+		' "$base" > "${base}.tmp" && mv "${base}.tmp" "$base"
+	else
+		printf '\n%s\n' "$(cat "$blk")" >> "$base"
+	fi
+	rm -f "$itemsf"
+}
+
+# Insert custom rule items BEFORE the subscription's catch-all (MATCH/FINAL).
+# rules is order-sensitive: items appended *after* MATCH never match, so we splice
+# the overlay rules in front of the first MATCH/FINAL line; if there is no
+# catch-all, fall back to appending at the end of the rules block.
+merge_rules_before_catchall() {
+	local base="$1" blk="$2"
+	local itemsf; itemsf=$(mktemp)
+	tail -n +2 "$blk" > "$itemsf"
+	if grep -q '^rules:' "$base"; then
+		awk -v items="$itemsf" '
+			/^rules:[[:space:]]*$/ { inr=1; print; next }
+			inr && /^[A-Za-z0-9_@.\-]+:/ { if (!done) { system("cat " items); done=1 } inr=0; print; next }
+			inr && !done && /^[[:space:]]*-.*(MATCH|FINAL),/ { system("cat " items); done=1 }
+			{ print }
+			END { if (inr && !done) system("cat " items) }
+		' "$base" > "${base}.tmp" && mv "${base}.tmp" "$base"
+	else
+		printf '\nrules:\n' >> "$base"
+		cat "$itemsf" >> "$base"
+	fi
+	rm -f "$itemsf"
+}
+
+# Replace the base block for ckey with the overlay version (or add it if missing).
+merge_replace_block() {
+	local base="$1" ckey="$2" blk="$3"
+	if grep -q "^${ckey}:" "$base"; then
+		awk -v key="^${ckey}:" '
+			$0 ~ key { skip=1; next }
+			skip && /^[ \t]/ { next }
+			skip && /^[A-Za-z0-9_@.\-]+:/ { skip=0 }
+			{ print }
+		' "$base" > "${base}.tmp" && mv "${base}.tmp" "$base"
+	fi
+	printf '\n%s\n' "$(cat "$blk")" >> "$base"
+}
+
+# Re-indent the rules block uniformly to 2 spaces so that list items from
+# different sources (subscription / UCI rules / custom overlay) never mix indents
+# into invalid YAML (which makes the core fatal-exit on startup).
+normalize_rules() {
+	local f="$1"
+	if grep -q '^rules:' "$f"; then
+		local normf="${f}.norm"
+		awk '
+			/^rules:[[:space:]]*$/ { in_rules = 1; print; next }
+			in_rules && /^[A-Za-z]/ { in_rules = 0 }
+			in_rules && /^[[:space:]]*-/ { sub(/^[[:space:]]*/, "  "); print; next }
+			{ print }
+		' "$f" > "$normf" && mv "$normf" "$f"
+	fi
+}
+
 prepare_config() {
-	local src_config=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
+	local config_mode=$(uci -q get mihomo.config.config_mode || echo "subscription")
+	local sub_config=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
+	local custom_config=$(uci -q get mihomo.config.custom_config_path || echo "/etc/mihomo/custom.yaml")
 	local run_config="/tmp/mihomo_run.yaml"
-	
+
+	# Select the base source config according to the mode.
+	local src_config
+	if [ "$config_mode" = "custom" ]; then
+		src_config="$custom_config"
+	elif [ "$config_mode" = "mixed" ]; then
+		src_config="$sub_config"
+	else
+		config_mode="subscription"
+		src_config="$sub_config"
+	fi
+
 	local dns_port=$(uci -q get mihomo.config.dns_port || echo "1053")
 	local tproxy_port=$(uci -q get mihomo.config.tproxy_port || echo "7893")
 	local mix_port=$(uci -q get mihomo.config.mix_port || echo "7890")
@@ -726,15 +898,15 @@ prepare_config() {
 	[ "$geo_update_interval" -lt 1 ] 2>/dev/null && geo_update_interval=24
 	local geoip_url=$(uci -q get mihomo.config.geoip_mirror_url)
 	local geosite_url=$(uci -q get mihomo.config.geosite_mirror_url)
-	
+
 	if [ ! -f "$src_config" ]; then
-		echo "ERROR: Source configuration file $src_config not found" >&2
+		echo "ERROR: Source configuration file $src_config not found (mode=$config_mode)" >&2
 		return 1
 	fi
-	
+
 	# Copy source config to temp running config
 	cp "$src_config" "$run_config"
-	
+
 	# Strip existing dns and tun blocks to avoid duplicate key errors
 	awk -v in_block=0 '
 	/^dns:/ || /^tun:/ { in_block=1; next }
@@ -742,10 +914,10 @@ prepare_config() {
 	!in_block { print }
 	' "$run_config" > "${run_config}.tmp"
 	mv "${run_config}.tmp" "$run_config"
-	
+
 	# Strip top-level ports to avoid conflicts
 	sed -i '/^mixed-port:/d; /^tproxy-port:/d; /^port:/d; /^socks-port:/d; /^allow-lan:/d; /^external-controller:/d; /^secret:/d; /^profile:/d; /^geox-url:/d; /^geo-auto-update:/d; /^geo-update-interval:/d' "$run_config"
-	
+
 	# Prepend our controlled settings at the top
 	cat <<EOF > "${run_config}.tmp"
 mixed-port: $mix_port
@@ -772,12 +944,12 @@ geo-auto-update: true
 geo-update-interval: $geo_update_interval
 EOF
 	fi
-	
+
 	# Append controlled DNS block
 	cat <<EOF >> "$run_config"
 dns:
   enable: true
-  ipv6: false
+  ipv6: true
   listen: 0.0.0.0:$dns_port
   enhanced-mode: fake-ip
   nameserver:
@@ -826,17 +998,16 @@ EOF
 	# and UCI-injected rules may use different indents (e.g. 4 vs 2 spaces); mixing
 	# them is invalid YAML ("did not find expected '-' indicator") and the core
 	# fatal-exits on startup. Re-indent every rule item uniformly to 2 spaces.
-	if grep -q '^rules:' "$run_config"; then
-		local normf="${run_config}.norm"
-		awk '
-			/^rules:[[:space:]]*$/ { in_rules = 1; print; next }
-			in_rules && /^[A-Za-z]/ { in_rules = 0 }
-			in_rules && /^[[:space:]]*-/ { sub(/^[[:space:]]*/, "  "); print; next }
-			{ print }
-		' "$run_config" > "$normf" && mv "$normf" "$run_config"
+	normalize_rules "$run_config"
+
+	# Mixed mode: overlay the user's custom config on top of the subscription base.
+	if [ "$config_mode" = "mixed" ]; then
+		apply_custom_overlay "$run_config" "$custom_config"
+		# Re-normalize rules since the overlay may have added more rule items.
+		normalize_rules "$run_config"
 	fi
 
-	echo "SUCCESS: Prepared configuration at $run_config"
+	echo "SUCCESS: Prepared configuration at $run_config (mode=$config_mode)"
 	return 0
 }
 
@@ -875,7 +1046,17 @@ select_node() {
 
 get_proxies() {
 	restore_subscription_url
-	local config_path=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
+	# Prefer the final merged run config (accurate for all 3 modes). Fall back to
+	# the per-mode source file so the node list is still available before a start.
+	local config_path="/tmp/mihomo_run.yaml"
+	if [ ! -f "$config_path" ]; then
+		local config_mode=$(uci -q get mihomo.config.config_mode || echo "subscription")
+		if [ "$config_mode" = "custom" ]; then
+			config_path=$(uci -q get mihomo.config.custom_config_path || echo "/etc/mihomo/custom.yaml")
+		else
+			config_path=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
+		fi
+	fi
 	if [ ! -f "$config_path" ]; then
 		logger -t mihomo "get_proxies: config file not found at $config_path"
 		echo "{\\"error\\":\\"not_found\\", \\"msg\\":\\"本地尚未下载任何订阅配置文件，请点击下方按钮更新订阅。\\"}"
@@ -1515,9 +1696,107 @@ clear_access_rules() {
 	echo "OK:$_n"
 }
 
+# Detect this router's LAN IPv4 address — used as the DNAT target for the
+# source-scoped DNS redirect in whitelist+dns_hijack mode. Priority: UCI →
+# br-lan interface → any global-scope address → default-route source.
+get_lan_ip() {
+	local ip
+	ip=$(uci -q get network.lan.ipaddr 2>/dev/null | awk '{print $1}')
+	[ -n "$ip" ] && { echo "$ip"; return 0; }
+	ip=$(ip -4 -o addr show br-lan 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+	[ -n "$ip" ] && { echo "$ip"; return 0; }
+	ip=$(ip -4 -o addr show scope global 2>/dev/null | awk 'NR==1{print $4}' | cut -d/ -f1)
+	[ -n "$ip" ] && { echo "$ip"; return 0; }
+	ip=$(ip -4 -o route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n1)
+	[ -n "$ip" ] && { echo "$ip"; return 0; }
+	return 1
+}
+
+# Detect a LAN IPv6 address for the v6 source-scoped DNS DNAT. Prefer br-lan
+# link-local fe80:: (on-link, stable within a boot), fall back to a global v6.
+get_lan_ip6() {
+	local ip
+	ip=$(ip -6 -o addr show br-lan scope link 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+	[ -n "$ip" ] && { echo "$ip"; return 0; }
+	ip=$(ip -6 -o addr show br-lan scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+	[ -n "$ip" ] && { echo "$ip"; return 0; }
+	ip=$(ip -6 -o addr show scope global 2>/dev/null | awk 'NR==1{print $4}' | cut -d/ -f1)
+	[ -n "$ip" ] && { echo "$ip"; return 0; }
+	return 1
+}
+
+# Emit the nft ruleset for TProxy redirection plus (in whitelist+dns_hijack mode)
+# a source-scoped DNS DNAT so only whitelisted clients reach Mihomo's fake-ip DNS.
+# Pure: prints additive rules to stdout, no side effects. The caller pre-deletes
+# any existing tables, then pipes this into `nft -f -`.
+# Args: tproxy_port acl_mode acl_ips_v4 acl_ips_v6 dns_hijack dns_port router_ip_v4 router_ip_v6
+emit_tproxy_rules() {
+	local tproxy_port="$1" acl_mode="$2" acl_v4="$3" acl_v6="$4"
+	local dns_hijack="$5" dns_port="$6" rip_v4="$7" rip_v6="$8"
+
+	local dns_scope=0
+	if [ "$acl_mode" = "whitelist" ] && [ "$dns_hijack" = "1" ] && [ -n "$dns_port" ] && { [ -n "$acl_v4" ] || [ -n "$acl_v6" ]; } && { [ -n "$rip_v4" ] || [ -n "$rip_v6" ]; }; then
+		dns_scope=1
+	fi
+
+	echo "add table inet mihomo"
+	echo "add chain inet mihomo prerouting { type filter hook prerouting priority mangle; }"
+	echo "add rule inet mihomo prerouting ip daddr { 127.0.0.0/8, 10.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } return"
+	echo "add rule inet mihomo prerouting ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } return"
+
+	# Let whitelisted clients' DNS fall through to the nat DNAT (must precede the
+	# bypass rule below, otherwise their DNS gets tproxy'd to the tproxy port).
+	if [ "$dns_scope" = "1" ]; then
+		if [ -n "$acl_v4" ]; then
+			echo "add rule inet mihomo prerouting ip saddr { $acl_v4 } tcp dport 53 return"
+			echo "add rule inet mihomo prerouting ip saddr { $acl_v4 } udp dport 53 return"
+		fi
+		if [ -n "$acl_v6" ]; then
+			echo "add rule inet mihomo prerouting ip6 saddr { $acl_v6 } tcp dport 53 return"
+			echo "add rule inet mihomo prerouting ip6 saddr { $acl_v6 } udp dport 53 return"
+		fi
+	fi
+
+	# Whitelist bypass: non-whitelisted sources skip tproxy entirely (direct route).
+	if [ "$acl_mode" = "whitelist" ]; then
+		if [ -n "$acl_v4" ]; then
+			echo "add rule inet mihomo prerouting ip saddr != { $acl_v4 } return"
+		fi
+		if [ -n "$acl_v6" ]; then
+			echo "add rule inet mihomo prerouting ip6 saddr != { $acl_v6 } return"
+		fi
+	fi
+
+	echo "add rule inet mihomo prerouting meta l4proto { tcp, udp } tproxy to :$tproxy_port meta mark set 1"
+
+	# Source-scoped DNS DNAT: only whitelisted clients' port-53 → Mihomo DNS.
+	# dnat (not redirect) so hardcoded-DNS clients are caught regardless of dst.
+	if [ "$dns_scope" = "1" ]; then
+		echo "add table inet mihomo_dns"
+		echo "add chain inet mihomo_dns prerouting { type nat hook prerouting priority dstnat; }"
+		if [ -n "$acl_v4" ] && [ -n "$rip_v4" ]; then
+			echo "add rule inet mihomo_dns prerouting ip saddr { $acl_v4 } udp dport 53 dnat ip to $rip_v4:$dns_port"
+			echo "add rule inet mihomo_dns prerouting ip saddr { $acl_v4 } tcp dport 53 dnat ip to $rip_v4:$dns_port"
+		fi
+		if [ -n "$acl_v6" ] && [ -n "$rip_v6" ]; then
+			echo "add rule inet mihomo_dns prerouting ip6 saddr { $acl_v6 } udp dport 53 dnat ip6 to [$rip_v6]:$dns_port"
+			echo "add rule inet mihomo_dns prerouting ip6 saddr { $acl_v6 } tcp dport 53 dnat ip6 to [$rip_v6]:$dns_port"
+		fi
+	fi
+}
+
 case "$1" in
 	get_arch)
 		get_arch
+		;;
+	get_lan_ip)
+		get_lan_ip
+		;;
+	get_lan_ip6)
+		get_lan_ip6
+		;;
+	emit_tproxy_rules)
+		emit_tproxy_rules "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"
 		;;
 	check_core)
 		check_core
@@ -1613,7 +1892,7 @@ case "$1" in
 		import_rules "$2" "$3"
 		;;
 	*)
-		echo "Usage: $0 {get_arch|check_core|download_core|update_geox|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes|test_connectivity|traffic_loop|get_traffic|reset_traffic_domains}"
+		echo "Usage: $0 {get_arch|get_lan_ip|get_lan_ip6|emit_tproxy_rules|check_core|download_core|update_geox|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes|test_connectivity|traffic_loop|get_traffic|reset_traffic_domains}"
 		exit 1
 		;;
 esac
@@ -3314,12 +3593,28 @@ return view.extend({
 		s = m.section(form.TypedSection, 'mihomo', _('常规设置'));
 		s.anonymous = true;
 
+		o = s.option(form.ListValue, 'config_mode', _('配置模式'), _('选择配置来源：使用订阅配置 / 仅使用自定义配置 / 订阅与自定义混合（自定义作为订阅的补充，可追加节点组、规则等）。'));
+		o.value('subscription', _('仅使用订阅配置'));
+		o.value('custom', _('仅使用自定义配置'));
+		o.value('mixed', _('混合：订阅 + 自定义（自定义补充订阅）'));
+		o.default = 'subscription';
+
+		o = s.option(form.Value, 'custom_config_path', _('自定义配置文件路径'), _('你的自定义 YAML 配置文件绝对路径（如 /etc/mihomo/custom.yaml）。仅在「仅自定义」或「混合」模式下生效，受 UCI 管理的端口/DNS/TUN 设置不会被此文件覆盖。'));
+		o.placeholder = '/etc/mihomo/custom.yaml';
+		o.rmempty = true;
+		o.depends('config_mode', 'custom');
+		o.depends('config_mode', 'mixed');
+
 		o = s.option(form.Value, 'subscription_url', _('订阅链接'), _('用于下载节点配置的 Clash 兼容订阅链接。'));
 		o.rmempty = true;
+		o.depends('config_mode', 'subscription');
+		o.depends('config_mode', 'mixed');
 
 		// 订阅管理按钮，直接放在订阅链接下方
 		o = s.option(form.DummyValue, '_update_btn', _('订阅管理'));
 		o.rawhtml = true;
+		o.depends('config_mode', 'subscription');
+		o.depends('config_mode', 'mixed');
 		o.cfgvalue = function(section_id) {
 			var update_btn = E('button', {
 				'class': 'cbi-button cbi-button-action',
@@ -3364,6 +3659,8 @@ return view.extend({
 
 		o = s.option(form.Flag, 'auto_update', _('定时更新订阅'), _('开启后，系统会每小时检查一次，并按下方设置的时间间隔自动重新下载订阅节点（需已配置订阅链接）。'));
 	o.rmempty = false;
+	o.depends('config_mode', 'subscription');
+	o.depends('config_mode', 'mixed');
 
 	o = s.option(form.Value, 'update_interval', _('更新间隔（小时）'), _('自动更新订阅的时间间隔，单位：小时。例如填 24 表示每天更新一次，填 6 表示每 6 小时更新一次。'));
 	o.rmempty = true;
@@ -3376,6 +3673,8 @@ return view.extend({
 
 	o = s.option(form.DummyValue, '_clear_btn', _('节点管理'));
 	o.rawhtml = true;
+	o.depends('config_mode', 'subscription');
+	o.depends('config_mode', 'mixed');
 	o.cfgvalue = function(section_id) {
 		var clear_btn = E('button', {
 			'class': 'cbi-button cbi-button-reset',
@@ -3403,16 +3702,15 @@ return view.extend({
 		o = s.option(form.Flag, 'tun_enabled', _('启用 TUN 模式'), _('使用虚拟网卡 (TUN) 接口进行全局流量接管。接管更彻底但会消耗略高 CPU。'));
 		o.rmempty = false;
 
-		o = s.option(form.Flag, 'dns_hijack', _('劫持系统 DNS'), _('将本地所有 DNS 请求劫持并转发给 Mihomo 内置的 DNS 服务。'));
+		o = s.option(form.Flag, 'dns_hijack', _('劫持系统 DNS'), _('将 DNS 请求转发给 Mihomo 内置 DNS。配合「仅允许列表中的设备」时，仅列表内设备的 DNS 会被按源地址重定向到 Mihomo（fake-ip），其余设备继续使用路由器真实 DNS 直连。'));
 		o.rmempty = false;
 
-		o = s.option(form.ListValue, 'acl_mode', _('IP 转发控制模式'), _('选择走 Mihomo 代理转发的局域网设备范围。'));
+		o = s.option(form.ListValue, 'acl_mode', _('IP 转发控制模式'), _('选择走 Mihomo 代理转发的局域网设备范围。开启「劫持系统 DNS」时可与「仅允许列表」共存：仅列表内设备走代理，其余设备直连。'));
 		o.value('all', _('所有设备'));
 		o.value('whitelist', _('仅允许列表中的设备'));
 		o.default = 'all';
 
-		o = s.option(form.DynamicList, 'acl_ips', _('受控 IP 列表'), _('填入需要走代理的设备 IP 地址或 CIDR 网段（如 192.168.1.100 或 192.168.1.0/24）。非列表中的设备流量将直接旁路，不走代理。'));
-		o.datatype = 'ipaddr';
+		o = s.option(form.DynamicList, 'acl_ips', _('受控 IP 列表'), _('填入需要走代理的设备 IPv4/IPv6 地址或 CIDR 网段（如 192.168.1.100、192.168.1.0/24 或 fd00::1）。非列表中的设备流量将直接旁路，不走代理；其 DNS 也不会被劫持。'));
 		o.depends('acl_mode', 'whitelist');
 
 		// Advanced Section
@@ -3426,6 +3724,8 @@ return view.extend({
 		o = s.option(form.Value, 'config_path', _('订阅配置文件路径'), _('保存订阅节点和分流规则的 YAML 配置文件路径。'));
 		o.placeholder = '/etc/mihomo/config.yaml';
 		o.rmempty = false;
+		o.depends('config_mode', 'subscription');
+		o.depends('config_mode', 'mixed');
 
 		o = s.option(form.Value, 'work_dir', _('工作目录'), _('Mihomo (Clash Meta) 工作数据库与配置根目录。'));
 		o.placeholder = '/etc/mihomo';
@@ -3501,7 +3801,7 @@ return view.extend({
 					
 					var is_dns_hijack = dns_hijack_el && dns_hijack_el.checked;
 					var is_tun_enabled = tun_enabled_el && tun_enabled_el.checked;
-					var disable_whitelist = is_dns_hijack || is_tun_enabled;
+					var disable_whitelist = is_tun_enabled;
 					
 					if (acl_mode_el) {
 						acl_mode_el.disabled = disable_whitelist;
