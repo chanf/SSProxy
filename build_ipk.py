@@ -1,13 +1,15 @@
+import datetime
 import gzip
 import io
 import os
 import re
 import shutil
+import subprocess
 import tarfile
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-150"
+PKG_VERSION = "1.0.0-151"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -3704,6 +3706,118 @@ def increment_version(script_path=None):
     PKG_VERSION = new_ver
     IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
+
+def _git(args):
+    """Run a git command in the repo root; return stripped stdout, or '' on failure.
+
+    Returns empty string for any error (not a repo, git missing, non-zero exit,
+    timeout) so callers can treat git as best-effort.
+    """
+    workspace = os.path.dirname(os.path.abspath(__file__))
+    try:
+        result = subprocess.run(
+            ["git"] + args,
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def generate_release_note(dist_dir):
+    """Write ``dist/releaseNote.md`` describing this build's changes.
+
+    Lists git commits since the last build (tracked via ``.release_baseline``
+    in the repo root) and flags uncommitted working-tree changes -- important
+    because this project's loop often builds *before* committing. Fully
+    automatic: if git is unavailable or this isn't a repo, the note still
+    records version / date / package name. Not part of the reproducible .ipk
+    artifact, so a real build date is fine here.
+    """
+    workspace = os.path.dirname(os.path.abspath(__file__))
+    note_path = os.path.join(dist_dir, "releaseNote.md")
+    baseline_path = os.path.join(workspace, ".release_baseline")
+
+    head = _git(["rev-parse", "HEAD"])
+    baseline = ""
+    if os.path.exists(baseline_path):
+        with open(baseline_path, "r", encoding="utf-8") as f:
+            baseline = f.read().strip()
+
+    log_lines = []
+    note = ""
+    if not head:
+        note = "（当前目录非 git 仓库，无法提取提交记录）"
+    elif baseline and baseline != head:
+        raw = _git(["log", "--pretty=format:%h %s", f"{baseline}..HEAD"])
+        if raw:
+            log_lines = raw.splitlines()
+            note = "自上次打包以来的提交"
+        else:
+            # baseline commit unreachable; fall back to recent history
+            raw = _git(["log", "--pretty=format:%h %s", "-15"])
+            log_lines = raw.splitlines() if raw else []
+            note = "（上次基准不可达，列出最近提交）"
+    elif baseline == head:
+        note = "（自上次打包以来无新提交）"
+    else:
+        raw = _git(["log", "--pretty=format:%h %s", "-15"])
+        log_lines = raw.splitlines() if raw else []
+        note = "（首次打包基准，列出最近提交）"
+
+    dirty = _git(["status", "--porcelain"])
+    today = datetime.date.today().isoformat()
+
+    out = []
+    out.append(f"# Release Note — {PKG_NAME}")
+    out.append("")
+    out.append(f"**版本：** v{PKG_VERSION}")
+    out.append(f"**发布日期：** {today}")
+    out.append(f"**安装包：** `{IPK_FILENAME}`")
+    out.append("")
+    out.append("## 变更记录")
+    out.append("")
+    out.append(f"_{note}_")
+    out.append("")
+    if log_lines:
+        for ln in log_lines:
+            out.append(f"- {ln}")
+    else:
+        out.append("- （无）")
+    out.append("")
+    if dirty:
+        out.append("## ⚠️ 未提交改动")
+        out.append("")
+        out.append("本次打包时工作树含未提交改动（未进入 git 提交，但已打进 ipk）：")
+        out.append("")
+        out.append("```")
+        for ln in dirty.splitlines():
+            out.append(ln)
+        out.append("```")
+        out.append("")
+    out.append("## 安装")
+    out.append("")
+    out.append("```bash")
+    out.append("python3 build_ipk.py && ./deploy.sh")
+    out.append("```")
+    out.append("")
+
+    with open(note_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out))
+
+    # Record this build's HEAD as the baseline for the next build.
+    if head:
+        with open(baseline_path, "w", encoding="utf-8") as f:
+            f.write(head)
+
+    print(f"Release note generated at: {note_path}")
+
+
 def main():
     # 1. Automatically increment the package version number
     increment_version()
@@ -3749,6 +3863,9 @@ def main():
     
     print("\nSUCCESS!")
     print(f"Packaged IPK file created at: {ipk_tar_gz_path}")
+
+    # 6. Generate dist/releaseNote.md (auto-extracted from git commits)
+    generate_release_note(dist_dir)
 
 if __name__ == "__main__":
     main()

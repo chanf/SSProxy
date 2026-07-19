@@ -6,3 +6,4 @@ src/
 __pycache__/
 *.pyc
 .pytest_cache/
+.release_baseline

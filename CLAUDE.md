@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 python build_ipk.py
 ```
 
-- 仅依赖 Python 3 标准库（`os, tarfile, io, shutil, re`），无需虚拟环境或第三方包
+- 仅依赖 Python 3 标准库（`os, tarfile, io, shutil, re, subprocess, datetime`），无需虚拟环境或第三方包；每次构建除产出 `.ipk` 外，还自动生成 `dist/releaseNote.md`（从 git 提交自动提取变更，基线记录在仓库根 `.release_baseline`）
 - 产出 `dist/luci-app-mihomo_<version>_all.ipk`；中间产物 `build/control.tar.gz`、`build/data.tar.gz`
 - 没有测试套件、没有 lint 配置
 
