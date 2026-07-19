@@ -2,26 +2,23 @@
 
 # ==============================================================================
 # 软路由 IPK 自动部署与安装脚本
-# 
+#
 # 功能说明：
 #   1. 自动寻找本地 dist/ 目录下最新构建生成的 luci-app-ssproxy_*.ipk 软件包。
-#   2. 使用 macOS 系统自带的 expect 自动化交互工具，安全自动地填充密码。
+#   2. 通过 SSH key 免密认证（需事先 ssh-copy-id 配置好），无需密码与 expect。
 #   3. 通过 SCP 命令将软件包上传到软路由的临时目录 /tmp/。
 #   4. 通过 SSH 命令在软路由上远程执行 opkg 安装，并自动重启 mihomo 服务使其即时生效。
 # ==============================================================================
 
 # 基础连接配置信息
-# 密码不再硬编码：优先读环境变量 MIHOMO_DEPLOY_PASSWORD，未设置则交互式读取，
-# 避免明文密码进入版本库。历史中曾硬编码的密码应已清除，请务必更改路由器密码。
-if [ -z "$MIHOMO_DEPLOY_PASSWORD" ]; then
-    read -s -p "请输入软路由 root 密码: " PASSWORD
-    echo
-else
-    PASSWORD="$MIHOMO_DEPLOY_PASSWORD"
-fi
 ROUTER_IP="192.168.66.1"       # 软路由 LAN IP 地址
 ROUTER_USER="root"             # SSH/SCP 登录用户名
 ROUTER_PATH="/tmp/"            # 文件上传的目标临时目录
+
+# SSH 公共选项：
+#   BatchMode=yes                纯 key 免密认证，禁用任何交互式密码提示（key 未授权则立即失败，不挂起）。
+#   StrictHostKeyChecking=accept-new  首次连接自动接受并记录主机指纹，避免 yes/no 交互。
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new"
 
 # ------------------------------------------------------------------------------
 # 步骤 1：扫描并寻找最新构建生成的 .ipk 软件包
@@ -40,64 +37,34 @@ IPK_BASENAME=$(basename "$LATEST_IPK")
 
 echo "=================================================="
 echo "发现最新构建包 : $LATEST_IPK"
-echo "目标路由器 IP   : $ROUTER_USER@$ROUTER_IP"
-echo "软路由临时路径  : $ROUTER_PATH"
+echo "目标路由器     : $ROUTER_USER@$ROUTER_IP"
+echo "软路由临时路径 : $ROUTER_PATH"
 echo "=================================================="
 
 # ------------------------------------------------------------------------------
-# 步骤 2：使用 expect 自动化上传 IPK 文件到软路由
+# 步骤 2：通过 SCP 上传 IPK 文件到软路由（SSH key 免密）
 # ------------------------------------------------------------------------------
 echo "正在上传 $IPK_BASENAME 到软路由..."
 
-# 启动 expect 执行内嵌交互逻辑：
-# - spawn: 启动 scp 子进程进行网络文件拷贝。
-# - expect {...}: 捕获控制台输出。
-#   - "*yes/no*": 若是首次连接，捕获到 SSH 密钥指纹确认，自动输入 yes 并回车，接着继续等待密码（exp_continue）。
-#   - "*password:*": 捕获到密码输入提示时，自动输入密码并回车。
-# - expect eof: 等待 SCP 进程传输结束。
-# - catch wait result: 捕获子进程的退出状态列表。
-# - exit [lindex \$result 3]: 返回状态列表中第四个元素（即子进程的退出状态码）。
-#   注意：在双引号内，必须使用 \$result 逃逸，防止 bash 尝试解析。
-expect -c "
-spawn scp \"$LATEST_IPK\" \"$ROUTER_USER@$ROUTER_IP:$ROUTER_PATH\"
-expect {
-    \"*yes/no*\" { send \"yes\r\"; exp_continue }
-    \"*password:*\" { send \"$PASSWORD\r\" }
-}
-expect eof
-catch wait result
-exit [lindex \$result 3]
-"
-# 获取上面 expect 语句块执行退出后的状态码
+scp $SSH_OPTS "$LATEST_IPK" "$ROUTER_USER@$ROUTER_IP:$ROUTER_PATH"
 SCP_STATUS=$?
 
 # 判断上传状态是否成功，若失败则提前终止执行
 if [ $SCP_STATUS -ne 0 ]; then
-    echo "错误：SCP 上传文件失败，请检查网络或密码。"
+    echo "错误：SCP 上传文件失败，请检查 SSH key 是否已授权（ssh-copy-id）或网络是否可达。"
     exit $SCP_STATUS
 fi
 echo "成功：软件包上传完成。"
 
 # ------------------------------------------------------------------------------
-# 步骤 3：连接 SSH 执行安装命令并重启服务
+# 步骤 3：通过 SSH 执行安装命令并重启服务（SSH key 免密）
 # ------------------------------------------------------------------------------
 echo "--------------------------------------------------"
 echo "正在软路由上安装该软件包并重启代理服务..."
 
-# 使用 expect 自动化 SSH 连接并执行远程命令：
 # - opkg install: 强制覆盖安装刚刚上传的 IPK 包。
 # - /etc/init.d/mihomo restart: 重启 Mihomo 服务载入最新 helper.sh 后端和 TProxy 拦截规则。
-expect -c "
-spawn ssh \"$ROUTER_USER@$ROUTER_IP\" \"opkg install /tmp/$IPK_BASENAME && /etc/init.d/mihomo restart\"
-expect {
-    \"*yes/no*\" { send \"yes\r\"; exp_continue }
-    \"*password:*\" { send \"$PASSWORD\r\" }
-}
-expect eof
-catch wait result
-exit [lindex \$result 3]
-"
-# 获取上面 SSH 命令执行的退出状态码
+ssh $SSH_OPTS "$ROUTER_USER@$ROUTER_IP" "opkg install /tmp/$IPK_BASENAME && /etc/init.d/mihomo restart"
 SSH_STATUS=$?
 
 # 输出最终的安装及部署状态

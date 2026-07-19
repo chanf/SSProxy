@@ -77,7 +77,7 @@ python3 build_ipk.py            # 产出 dist/luci-app-ssproxy_<version>_all.ipk
 
 ### 一键部署到软路由（macOS）
 
-`deploy.sh` 用系统自带 `expect` 处理密码，SCP 上传 → `opkg install` → 重启服务：
+`deploy.sh` 通过 SSH key 免密（需先 `ssh-copy-id` 授权到软路由），SCP 上传 → `opkg install` → 重启服务：
 
 ```bash
 python3 build_ipk.py && ./deploy.sh
@@ -99,7 +99,7 @@ python3 build_ipk.py && ./deploy.sh
 ```
 .
 ├── build_ipk.py        # 唯一源文件：构建器 + 内嵌交付物（src_files）
-├── deploy.sh           # expect 自动部署（scp + opkg + 重启）
+├── deploy.sh           # SSH key 免密自动部署（scp + opkg + 重启）
 ├── tests/              # pytest 套件（构建器 + helper.sh 黑盒）
 ├── docs/               # 设计文档与测试用例
 │   ├── 产品设计文档.md              # 整体产品设计（权威）
