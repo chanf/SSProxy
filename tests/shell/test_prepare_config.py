@@ -57,6 +57,9 @@ def test_substitutes_controlled_ports_and_dns(run, uci_env, tmp_path):
     # Controlled DNS block appended with the configured port.
     assert "listen: 0.0.0.0:1053" in out
     assert "enhanced-mode: fake-ip" in out
+    # IPv6 enabled so whitelisted v6 clients get AAAA for tproxy.
+    assert "ipv6: true" in out
+    assert "ipv6: false" not in out
     # Original top-level ports / controller stripped.
     assert "127.0.0.1:9999" not in out
     assert "socks-port:" not in out
