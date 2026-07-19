@@ -68,7 +68,7 @@ def test_non_executable_files_have_no_exec_bit(builder, tmp_path):
     for rel_path in [
         "CONTROL/control",            # explicitly excluded from the chmod predicate
         "root/etc/config/mihomo",
-        "root/usr/share/luci/menu.d/luci-app-mihomo.json",
+        "root/usr/share/luci/menu.d/luci-app-ssproxy.json",
         "root/www/luci-static/resources/view/mihomo/dashboard.js",
     ]:
         mode = stat.S_IMODE((src_dir / rel_path).stat().st_mode)

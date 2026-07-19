@@ -1,6 +1,6 @@
-# 豆豉代理 (luci-app-mihomo) 数据流向与系统架构设计文档
+# 水杉代理 (luci-app-ssproxy) 数据流向与系统架构设计文档
 
-本文档深入梳理了**豆豉代理**（原 `luci-app-mihomo`）在 OpenWrt/iStoreOS 软路由系统下的网络流量接管、分流处理、DNS 解析以及 LuCI Web GUI 访问日志的业务数据流向。
+本文档深入梳理了**水杉代理**（原 `luci-app-ssproxy`）在 OpenWrt/iStoreOS 软路由系统下的网络流量接管、分流处理、DNS 解析以及 LuCI Web GUI 访问日志的业务数据流向。
 
 ---
 
@@ -43,7 +43,7 @@ graph TD
     end
 
     subgraph WebGUI ["浏览器管理页面 (LuCI Web GUI)"]
-        douchi_gui["豆豉代理 Web UI"]
+        shuishan_gui["水杉代理 Web UI"]
         local_store[("localStorage<br/>(设备活跃/红杏状态缓存)")]
     end
 
@@ -79,9 +79,9 @@ graph TD
     rule_engine -- "直连规则" --> direct_wan
 
     %% Web UI Control and Logs Flow
-    douchi_gui -- "每 5s 轮询 get_connections" --> controller_api
-    douchi_gui -- "读写设备分类状态" --> local_store
-    controller_api -- "返回实时连接与策略" --> douchi_gui
+    shuishan_gui -- "每 5s 轮询 get_connections" --> controller_api
+    shuishan_gui -- "读写设备分类状态" --> local_store
+    controller_api -- "返回实时连接与策略" --> shuishan_gui
 ```
 
 ---
@@ -187,7 +187,7 @@ Web 管理面和运行日志的数据采集与展示完全基于前端 JS 和单
 Mihomo 核心运行  --> (连接状态) -- [Helper.sh collect_loop] (每15秒增量写入) --> /tmp/mihomo_access.log
                                                                                        |
 [ 浏览器前台交互 ]                                                                      v
-豆豉代理 Web UI  -- (fs.exec 每 5 秒轮询) --> [Helper.sh get_history / get_connections] 
+水杉代理 Web UI  -- (fs.exec 每 5 秒轮询) --> [Helper.sh get_history / get_connections] 
       |
       +---> (计算连接策略，分类状态)
       |

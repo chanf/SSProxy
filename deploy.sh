@@ -4,7 +4,7 @@
 # 软路由 IPK 自动部署与安装脚本
 # 
 # 功能说明：
-#   1. 自动寻找本地 dist/ 目录下最新构建生成的 luci-app-mihomo_*.ipk 软件包。
+#   1. 自动寻找本地 dist/ 目录下最新构建生成的 luci-app-ssproxy_*.ipk 软件包。
 #   2. 使用 macOS 系统自带的 expect 自动化交互工具，安全自动地填充密码。
 #   3. 通过 SCP 命令将软件包上传到软路由的临时目录 /tmp/。
 #   4. 通过 SSH 命令在软路由上远程执行 opkg 安装，并自动重启 mihomo 服务使其即时生效。
@@ -19,8 +19,8 @@ ROUTER_PATH="/tmp/"            # 文件上传的目标临时目录
 # ------------------------------------------------------------------------------
 # 步骤 1：扫描并寻找最新构建生成的 .ipk 软件包
 # ------------------------------------------------------------------------------
-# 使用 ls -t 命令按“修改时间”从新到旧排列，匹配最新的 luci-app-mihomo_*.ipk 文件并取第一行
-LATEST_IPK=$(ls -t dist/luci-app-mihomo_*.ipk 2>/dev/null | head -n 1)
+# 使用 ls -t 命令按“修改时间”从新到旧排列，匹配最新的 luci-app-ssproxy_*.ipk 文件并取第一行
+LATEST_IPK=$(ls -t dist/luci-app-ssproxy_*.ipk 2>/dev/null | head -n 1)
 
 # 若没有找到任何 IPK 文件，提示用户需要先执行编译构建脚本
 if [ -z "$LATEST_IPK" ]; then

@@ -1,4 +1,4 @@
-# 自动化闭环开发流程（luci-app-mihomo）
+# 自动化闭环开发流程（luci-app-ssproxy）
 
 本仓库的开发在一个"构建 → 部署 → 自检 → 改 → 再循环"的闭环上进行。本文记录这条流水线、关键坑点、以及常用自检命令，方便复现与排障。
 
@@ -21,7 +21,7 @@ SSH 自检（免密 ssh root@192.168.66.1）  # 看日志 / 跑 helper.sh / curl
 
 ## 2. 构建与部署
 
-- `python3 build_ipk.py` —— 仅用 Python3 标准库。`main()` 第一步 `increment_version()` 会**原地改写 `PKG_VERSION`**（如 `1.0.0-145 → 1.0.0-146`），所以构建后 `build_ipk.py` 一定有 diff，属预期。产出 `dist/luci-app-mihomo_<ver>_all.ipk`。
+- `python3 build_ipk.py` —— 仅用 Python3 标准库。`main()` 第一步 `increment_version()` 会**原地改写 `PKG_VERSION`**（如 `1.0.0-145 → 1.0.0-146`），所以构建后 `build_ipk.py` 一定有 diff，属预期。产出 `dist/luci-app-ssproxy_<ver>_all.ipk`。
 - `./deploy.sh` —— 用 macOS 自带 `expect` 自动输 root 密码，把最新 ipk `scp` 到路由器 `/tmp/`，再 `opkg install` + `/etc/init.d/mihomo restart`。
 - 合并：`python3 build_ipk.py && ./deploy.sh`。
 
@@ -45,7 +45,7 @@ SEC=$(ssh root@192.168.66.1 'uci -q get mihomo.config.secret')
 
 ```sh
 # 版本 / 进程
-ssh root@192.168.66.1 'opkg list-installed luci-app-mihomo; pgrep -a mihomo'
+ssh root@192.168.66.1 'opkg list-installed luci-app-ssproxy; pgrep -a mihomo'
 
 # 核心日志（mihomo stdout，init.d 重定向到此）
 ssh root@192.168.66.1 'tail -80 /tmp/mihomo_core.log'

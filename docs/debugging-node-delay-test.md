@@ -1,8 +1,8 @@
-# luci-app-mihomo 节点延时测试调试全记录
+# luci-app-ssproxy 节点延时测试调试全记录
 
 ## 项目背景
 
-luci-app-mihomo 是 OpenWrt/iStoreOS 上的 LuCI 应用，集成了 Mihomo (Clash Meta) 透明代理客户端。节点列表提供实时延时测试功能——点击「测试」按钮后，前端逐个调用后端 `helper.sh test_node_delay`，通过 Mihomo 外部控制器 API (`http://127.0.0.1:9090/proxies/<name>/delay`) 获取每个节点的网络延迟。
+luci-app-ssproxy 是 OpenWrt/iStoreOS 上的 LuCI 应用，集成了 Mihomo (Clash Meta) 透明代理客户端。节点列表提供实时延时测试功能——点击「测试」按钮后，前端逐个调用后端 `helper.sh test_node_delay`，通过 Mihomo 外部控制器 API (`http://127.0.0.1:9090/proxies/<name>/delay`) 获取每个节点的网络延迟。
 
 本文记录了从「测试全部失败」到「全部通过」的完整调试过程，涉及 7 类不同根因，横跨 shell 编码、LuCI 前端架构、BusyBox 兼容性、订阅数据解析等多个层面。
 

@@ -19,8 +19,8 @@ import build_ipk
         ("usr/share/mihomo/helper.sh", "helper.sh", False, 0o755),
         ("etc/config/mihomo", "mihomo", False, 0o644),
         ("www/luci-static/resources/view/mihomo/dashboard.js", "dashboard.js", False, 0o644),
-        ("usr/share/luci/menu.d/luci-app-mihomo.json", "luci-app-mihomo.json", False, 0o644),
-        ("usr/share/rpcd/acl.d/luci-app-mihomo.json", "luci-app-mihomo.json", False, 0o644),
+        ("usr/share/luci/menu.d/luci-app-ssproxy.json", "luci-app-ssproxy.json", False, 0o644),
+        ("usr/share/rpcd/acl.d/luci-app-ssproxy.json", "luci-app-ssproxy.json", False, 0o644),
     ],
 )
 def test_compute_file_mode(builder, rel_path, basename, is_control, expected):

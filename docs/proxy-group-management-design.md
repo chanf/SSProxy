@@ -1,7 +1,7 @@
 # Mihomo 分流策略组管理 设计文档
 
 > 状态：**已实现（随「运行状态」仪表盘一并提供，早于访问日志模块）**
-> 模块：`luci-app-mihomo` → 「运行状态」页面内的「分流策略组管理」区
+> 模块：`luci-app-ssproxy` → 「运行状态」页面内的「分流策略组管理」区
 > 适用：OpenWrt + LuCI，依赖 Mihomo 核心已启动且外部控制器 `127.0.0.1:9090` 可达
 
 ---
@@ -164,7 +164,7 @@
 
 ## 10. 权限与 ACL
 
-`root/usr/share/rpcd/acl.d/luci-app-mihomo.json` 已覆盖所需权限，无需新增：
+`root/usr/share/rpcd/acl.d/luci-app-ssproxy.json` 已覆盖所需权限，无需新增：
 - `write.file.exec` 含 `/usr/share/mihomo/helper.sh`（`get_proxy_groups`/`select_node` 均经此执行）。
 - 不需要 `read.uci`/`write.uci`（本功能不读写 UCI）。
 
@@ -173,7 +173,7 @@
 ## 11. 构建与部署
 
 - 所有交付文件内嵌于 `build_ipk.py` 的 `src_files`；改实现就改对应字符串，**不要手改 `src/`**。
-- `python build_ipk.py` 产出 `dist/luci-app-mihomo_<version>_all.ipk`；`PKG_VERSION` 每次构建自增（预期 diff）。
+- `python build_ipk.py` 产出 `dist/luci-app-ssproxy_<version>_all.ipk`；`PKG_VERSION` 每次构建自增（预期 diff）。
 - 反斜杠转义约定见 §7.2 注意事项（与全仓一致）。
 
 ---

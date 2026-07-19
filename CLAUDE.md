@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概览
 
-`luci-app-mihomo` —— 面向 iStoreOS / OpenWrt (Firewall4 + nftables) 的 LuCI 应用，是 Mihomo (Clash Meta) 代理核心的前端，集成 TProxy 透明代理、Dnsmasq DNS 劫持、订阅自动更新、节点延时测试与访问日志/规则管理。整个仓库**只有一个源文件** `build_ipk.py`：它既是构建器，也以字符串形式内嵌了全部要打包的文件（shell 脚本、UCI 配置、LuCI JS 视图、JSON）。
+`luci-app-ssproxy` —— 面向 iStoreOS / OpenWrt (Firewall4 + nftables) 的 LuCI 应用，是 Mihomo (Clash Meta) 代理核心的前端，集成 TProxy 透明代理、Dnsmasq DNS 劫持、订阅自动更新、节点延时测试与访问日志/规则管理。整个仓库**只有一个源文件** `build_ipk.py`：它既是构建器，也以字符串形式内嵌了全部要打包的文件（shell 脚本、UCI 配置、LuCI JS 视图、JSON）。
 
 ## 构建
 
@@ -13,7 +13,7 @@ python build_ipk.py
 ```
 
 - 仅依赖 Python 3 标准库（`os, tarfile, io, shutil, re, subprocess, datetime`），无需虚拟环境或第三方包；每次构建除产出 `.ipk` 外，还自动生成 `dist/releaseNote.md`（从 git 提交自动提取变更，基线记录在仓库根 `.release_baseline`）
-- 产出 `dist/luci-app-mihomo_<version>_all.ipk`；中间产物 `build/control.tar.gz`、`build/data.tar.gz`
+- 产出 `dist/luci-app-ssproxy_<version>_all.ipk`；中间产物 `build/control.tar.gz`、`build/data.tar.gz`
 - 没有测试套件、没有 lint 配置
 
 ⚠️ **每次构建会自改 `build_ipk.py`**：`main()` 第一步调用 `increment_version()`，把 `PKG_VERSION`（如 `1.0.0-81` → `1.0.0-82`）原地重写并刷新 `IPK_FILENAME`。构建后一定有"源文件被改"的 diff，属预期；编辑该文件请以磁盘最新内容为准。

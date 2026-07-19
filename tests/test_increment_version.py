@@ -40,7 +40,7 @@ def test_bumps_revision(monkeypatch, tmp_path):
     assert 'PKG_VERSION = "1.0.0-82"' in text
     assert "1.0.0-81" not in text
     assert build_ipk.PKG_VERSION == "1.0.0-82"
-    assert build_ipk.IPK_FILENAME == "luci-app-mihomo_1.0.0-82_all.ipk"
+    assert build_ipk.IPK_FILENAME == "luci-app-ssproxy_1.0.0-82_all.ipk"
 
 
 def test_bumps_dotted_form(monkeypatch, tmp_path):

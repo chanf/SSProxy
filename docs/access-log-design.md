@@ -1,7 +1,7 @@
 # Mihomo 访问日志 产品设计文档
 
 > 状态：**已实现并重构（v1.0.0-90 拆分为独立页面）**
-> 模块：`luci-app-mihomo` → 「访问日志」页面（`admin/services/mihomo/accesslog`）与「规则管理」页面（`admin/services/mihomo/rules`）
+> 模块：`luci-app-ssproxy` → 「访问日志」页面（`admin/services/mihomo/accesslog`）与「规则管理」页面（`admin/services/mihomo/rules`）
 > 适用：OpenWrt + LuCI，依赖 Mihomo（Clash Meta）核心经 TProxy / TUN 透明接管流量
 
 ---
@@ -190,7 +190,7 @@ config mihomo_rule
 
 为提升用户体验并将“高频交互（日志查看）”与“低频配置（规则修改）”分离，系统重构为两个平级的子页面。
 
-### 8.1 菜单定义（`menu.d/luci-app-mihomo.json`）
+### 8.1 菜单定义（`menu.d/luci-app-ssproxy.json`）
 ```json
 "admin/services/mihomo/accesslog": {
     "title": "访问日志",
@@ -241,7 +241,7 @@ config mihomo_rule
 
 ## 10. 权限与 ACL
 
-`root/usr/share/rpcd/acl.d/luci-app-mihomo.json` 已覆盖所需权限，无需新增：
+`root/usr/share/rpcd/acl.d/luci-app-ssproxy.json` 已覆盖所需权限，无需新增：
 - `read.uci: ["mihomo"]`、`write.uci: ["mihomo"]`：规则读写。
 - `write.file.exec` 含 `/usr/share/mihomo/helper.sh`（新子命令均经此执行）、`/etc/init.d/mihomo`（重启核心）、`/sbin/logread`。
 
@@ -250,7 +250,7 @@ config mihomo_rule
 ## 11. 构建与部署
 
 - 所有交付文件内嵌于 `build_ipk.py` 的 `src_files` 字典；**不要手改 `src/`**（构建会先删后建）。
-- `python build_ipk.py` 产出 `dist/luci-app-mihomo_<version>_all.ipk`；`PKG_VERSION` 每次构建自动递增（属预期 diff）。
+- `python build_ipk.py` 产出 `dist/luci-app-ssproxy_<version>_all.ipk`；`PKG_VERSION` 每次构建自动递增（属预期 diff）。
 - 反斜杠转义约定见 §7.7 注意事项。
 - JSON 缩进：菜单 JSON 用 4 空格风格，本模块沿用该文件既有风格。
 

@@ -1,4 +1,4 @@
-# luci-app-mihomo
+# luci-app-ssproxy
 
 OpenWrt LuCI 应用：轻量级 Mihomo (Clash Meta) 客户端，集成 Firewall4 (nftables) 透明代理。
 
@@ -11,7 +11,7 @@ python build_ipk.py
 - 仅依赖 Python 3 标准库，无需虚拟环境或第三方包
 - 没有测试套件、没有 lint 配置
 - 版本号 (`PKG_VERSION`) **每次构建自动递增**并原地重写脚本文件——构建后出现 "modified" diff 属预期行为
-- 产出：`dist/luci-app-mihomo_<version>_all.ipk`
+- 产出：`dist/luci-app-ssproxy_<version>_all.ipk`
 - 构建会**完全重建** `src/` 目录（先删后建），**永远不要手动编辑 `src/` 下的文件**
 
 ## 源码结构

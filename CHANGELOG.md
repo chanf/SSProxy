@@ -1,6 +1,6 @@
 # CHANGELOG
 
-`luci-app-mihomo`（豆豉代理）所有重要变更记录于此，按时间倒序排列。
+`luci-app-ssproxy`（水杉代理）所有重要变更记录于此，按时间倒序排列。
 
 版本号遵循 `1.0.0-N`，每次构建由 `build_ipk.py` 自动递增（详见 `CLAUDE.md`）。本项目无正式 release tag，下方以「日期 + 当日触及的版本区间」作为分节。
 

@@ -36,7 +36,7 @@ def _build_root_tree(base):
         "etc/init.d/mihomo": "#!/bin/sh /etc/rc.common\n",
         "etc/config/mihomo": "config mihomo 'main'\n",
         "usr/share/mihomo/helper.sh": "#!/bin/sh\n",
-        "usr/share/luci/menu.d/luci-app-mihomo.json": "{}\n",
+        "usr/share/luci/menu.d/luci-app-ssproxy.json": "{}\n",
         "www/luci-static/resources/view/mihomo/dashboard.js": "view{}\n",
     }
     for rel, body in layout.items():
@@ -117,7 +117,7 @@ def test_data_mode_policy(builder, tmp_path):
     # everything else in the data tarball is 0o644
     for name in [
         "./etc/config/mihomo",
-        "./usr/share/luci/menu.d/luci-app-mihomo.json",
+        "./usr/share/luci/menu.d/luci-app-ssproxy.json",
         "./www/luci-static/resources/view/mihomo/dashboard.js",
     ]:
         assert modes[name] == 0o644, (name, oct(modes[name]))

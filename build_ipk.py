@@ -8,15 +8,15 @@ import subprocess
 import tarfile
 
 # Define configuration for the OpenClash replacement
-PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-160"
+PKG_NAME = "luci-app-ssproxy"
+PKG_VERSION = "1.0.0-163"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
 # File contents mapping
 src_files = {
     # Package metadata
-    "CONTROL/control": """Package: luci-app-mihomo
+    "CONTROL/control": """Package: luci-app-ssproxy
 Version: 1.0.0-1
 Depends: luci-base, ip-full, kmod-nft-tproxy, kmod-nft-nat, curl
 Architecture: all
@@ -1899,9 +1899,9 @@ esac
 """,
 
     # LuCI Menu definition (JSON)
-    "root/usr/share/luci/menu.d/luci-app-mihomo.json": """{
+    "root/usr/share/luci/menu.d/luci-app-ssproxy.json": """{
     "admin/services/mihomo": {
-        "title": "豆豉代理",
+        "title": "水杉代理",
         "order": 50,
         "action": {
             "type": "firstchild"
@@ -1951,8 +1951,8 @@ esac
 """,
 
     # RPCD ACL Permissions for Web UI execution
-    "root/usr/share/rpcd/acl.d/luci-app-mihomo.json": """{
-	"luci-app-mihomo": {
+    "root/usr/share/rpcd/acl.d/luci-app-ssproxy.json": """{
+	"luci-app-ssproxy": {
 		"description": "Grant access to Mihomo config, services and helpers",
 		"read": {
 			"uci": [ "mihomo" ],
@@ -2269,7 +2269,7 @@ return view.extend({
 		}
 
 		var view_html = E('div', { 'class': 'cbi-map' }, [
-			E('h2', {}, _('豆豉代理访问日志')),
+			E('h2', {}, _('水杉代理访问日志')),
 			E('p', {}, _('监控局域网设备实时连接与历史访问。您可以点击操作按钮快速针对特定域名创建规则。')),
 
 			// IP列表板块（红杏 vs 设备）
@@ -3369,7 +3369,7 @@ return view.extend({
 		]);
 
 		var view_html = E('div', { 'class': 'cbi-map' }, [
-			E('h2', {}, _('豆豉代理仪表盘')),
+			E('h2', {}, _('水杉代理仪表盘')),
 			E('p', {}, _('管理 Mihomo 核心守护进程，监控运行状态并选择代理节点。')),
 
 			// Status panel
@@ -3589,7 +3589,7 @@ return view.extend({
 	render: function() {
 		var m, s, o;
 
-		m = new form.Map('mihomo', _('豆豉代理设置'),
+		m = new form.Map('mihomo', _('水杉代理设置'),
 			_('配置代理服务参数、DNS 解析器和订阅节点信息。'));
 		
 		m.restart = 'mihomo';
@@ -4132,7 +4132,7 @@ def main():
     dist_dir = os.path.join(workspace, "dist")
     
     # 2. Force recreate source tree on build update
-    print("Initializing source tree for luci-app-mihomo...")
+    print("Initializing source tree for luci-app-ssproxy...")
     create_source_tree(src_dir)
         
     # 3. Recreate build and dist directories
