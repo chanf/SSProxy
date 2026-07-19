@@ -11,7 +11,14 @@
 # ==============================================================================
 
 # 基础连接配置信息
-PASSWORD="REDACTED"           # 软路由 root 账户密码
+# 密码不再硬编码：优先读环境变量 MIHOMO_DEPLOY_PASSWORD，未设置则交互式读取，
+# 避免明文密码进入版本库。历史中曾硬编码的密码应已清除，请务必更改路由器密码。
+if [ -z "$MIHOMO_DEPLOY_PASSWORD" ]; then
+    read -s -p "请输入软路由 root 密码: " PASSWORD
+    echo
+else
+    PASSWORD="$MIHOMO_DEPLOY_PASSWORD"
+fi
 ROUTER_IP="192.168.66.1"       # 软路由 LAN IP 地址
 ROUTER_USER="root"             # SSH/SCP 登录用户名
 ROUTER_PATH="/tmp/"            # 文件上传的目标临时目录
