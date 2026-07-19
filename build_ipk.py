@@ -9,7 +9,7 @@ import tarfile
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-158"
+PKG_VERSION = "1.0.0-159"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -2586,6 +2586,10 @@ function loadRules() {
 var view_html = E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, _('Mihomo 访问规则管理')),
 			E('p', {}, _('配置并管理局域网设备的特定域名代理规则。用户规则会被注入到核心配置文件 rules 列表的最顶部以优先匹配。规则保存在 UCI，需重启核心后才能生效。')),
+			E('div', { 'style': 'background: #fff8e1; border: 1px solid #ffe082; border-radius: 6px; padding: 10px 14px; margin-bottom: 15px;' }, [
+				E('p', { 'style': 'margin: 0; font-size: 13px; color: #6d5b00; line-height: 1.6;' }, _('<b>此处只管理你手动添加的「自定义规则」</b>（保存于 UCI，注入运行配置 rules 段最前、优先匹配）。订阅自带的规则（含末尾兜底 MATCH）<b>不在此处管理</b>，随订阅更新而变化。')),
+				E('p', { 'style': 'margin: 8px 0 0; font-size: 13px; color: #6d5b00; line-height: 1.6;' }, _('如需大批量追加节点 / 规则组，或完全使用自己的配置，请改用「设置 → 配置模式」中的自定义配置文件（custom.yaml）。'))
+			]),
 
 			E('button', { 'id': 'btn_uci_toggle', 'class': 'cbi-button cbi-button-action', 'style': 'margin-bottom: 15px;', 'click': function(ev) {
 				ev.preventDefault();
