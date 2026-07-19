@@ -7,7 +7,7 @@ import tarfile
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-mihomo"
-PKG_VERSION = "1.0.0-135"
+PKG_VERSION = "1.0.0-149"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -91,7 +91,8 @@ enable_tproxy() {
 	nft delete table inet mihomo 2>/dev/null
 	nft add table inet mihomo
 	nft add chain inet mihomo prerouting { type filter hook prerouting priority mangle \\; }
-	nft add rule inet mihomo prerouting ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } return
+	nft add rule inet mihomo prerouting ip daddr { 127.0.0.0/8, 10.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } return
+	nft add rule inet mihomo prerouting ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } return
 	
 	if [ "$acl_mode" = "whitelist" ] && [ -n "$acl_ips" ]; then
 		nft add rule inet mihomo prerouting ip saddr != { "$acl_ips" } return
@@ -195,7 +196,7 @@ EOF
 	procd_open_instance
 	# Wrap in sh -c so we can redirect output to the log file (procd execs directly,
 	# no shell, so '>' must live inside the sh -c script). $0=mihomo, $1=core, $2=workdir.
-	procd_set_param command sh -c '"$1" -d "$2" -f /tmp/mihomo_run.yaml >> /tmp/mihomo_core.log 2>&1' mihomo "$core_path" "$work_dir"
+	procd_set_param command sh -c 'ulimit -Hn 65535; ulimit -n 65535; "$1" -d "$2" -f /tmp/mihomo_run.yaml >> /tmp/mihomo_core.log 2>&1' mihomo "$core_path" "$work_dir"
 	procd_set_param respawn
 	procd_close_instance
 	
@@ -225,6 +226,15 @@ EOF
 	# access-log history view. No-ops when the core controller is unreachable.
 	procd_open_instance
 	procd_set_param command /usr/share/mihomo/helper.sh collect_loop
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param respawn
+	procd_close_instance
+
+	# Traffic stats loop: every 5s accumulate proxy (chains[0]!=DIRECT) byte
+	# deltas into a never-cleared grand total + clearable per-domain buckets.
+	procd_open_instance
+	procd_set_param command /usr/share/mihomo/helper.sh traffic_loop
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_set_param respawn
@@ -471,11 +481,38 @@ update_subscription() {
 	mkdir -p "$work_dir"
 	logger -t mihomo "Updating subscription from $url"
 	echo "Fetching subscription..."
-	curl -fsSL -k -A "ClashMeta" -o "/tmp/mihomo_sub.yaml" "$url"
-	if [ $? -ne 0 ]; then
-		echo "ERROR: Failed to download subscription" >&2
-		logger -t mihomo 'Subscription update FAILED: download error'
+	# Bypass our own fake-ip DNS hijack: when dns_hijack is on, dnsmasq forwards to
+	# mihomo which returns 198.18.x.x for everything, so a plain curl would connect
+	# to a fake IP and fail. Resolve the host via a direct query to public resolvers
+	# (router-originated UDP bypasses tproxy/dnsmasq) and force the real IP.
+	local host realip resolve_arg=""
+	host="${url#*://}"; host="${host%%/*}"; host="${host##*@}"; host="${host%%:*}"
+	if [ -n "$host" ]; then
+		for ns in 223.5.5.5 119.29.29.29 1.1.1.1; do
+			realip=$(nslookup "$host" "$ns" 2>/dev/null | awk '/^Address:[[:space:]]/ {last=$NF} END {print last}')
+			# accept only a pure IPv4; reject server-style "1.2.3.4:53", CNAMEs, empty
+			case "$realip" in
+				*[!0-9.]*|"") realip="" ;;
+				*.*.*.*) break ;;
+				*) realip="" ;;
+			esac
+			[ -n "$realip" ] && break
+		done
+		[ -n "$realip" ] && resolve_arg="--resolve ${host}:443:${realip}"
+	fi
+	curl -fsSL -k -A "ClashMeta" $resolve_arg -o "/tmp/mihomo_sub.yaml" "$url"
+	if [ $? -ne 0 ] || ! grep -q "^proxies:" /tmp/mihomo_sub.yaml 2>/dev/null; then
+		echo "ERROR: Failed to download subscription (resolved=$realip)" >&2
+		logger -t mihomo "Subscription update FAILED: download error (resolved=$realip)"
 		rm -f /tmp/mihomo_sub.yaml
+		# Deadlock guard: if the live config has no proxies (stub/empty) but a backup
+		# exists, restore it so we're never left without any proxy.
+		if ! grep -q "^proxies:" "$config_path" 2>/dev/null && [ -s "${config_path}.bak" ]; then
+			cp "${config_path}.bak" "$config_path"
+			logger -t mihomo "Restored previous subscription from ${config_path}.bak"
+			echo "WARNING: download failed; restored previous subscription from backup" >&2
+			/etc/init.d/mihomo restart >/dev/null 2>&1
+		fi
 		return 1
 	fi
 
@@ -500,6 +537,13 @@ update_subscription() {
 # restarted so the deletion takes effect immediately.
 clear_subscription() {
 	local config_path=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
+	# Back up the current subscription before deleting, so it can be restored if a
+	# later re-download fails (e.g. the subscription host is only reachable via the
+	# proxy, which is now gone). update_subscription auto-restores this on failure.
+	if [ -s "$config_path" ]; then
+		cp "$config_path" "${config_path}.bak"
+		logger -t mihomo "Backed up subscription to ${config_path}.bak before clearing"
+	fi
 	rm -f "$config_path"
 	uci -q set mihomo.config.last_update=''
 	uci -q commit mihomo
@@ -644,6 +688,18 @@ emit_access_rules_yaml() {
 	done
 }
 
+# Built-in bypass rules: multicast / link-local discovery traffic cannot
+# traverse a proxy (it is LAN-scope broadcast/multicast). Force DIRECT so it
+# is not shoved through the final MATCH rule and wasted on doomed proxy dials
+# (seen in logs as e.g. "[UDP] ... --> [ff02::fb]:5353 match Match using FTQ[...]"
+# or "[ff02::1:3]:5355"). Emitted first, above UCI access rules.
+emit_builtin_bypass_rules() {
+	echo "  - 'DST-PORT,5353,DIRECT'"
+	echo "  - 'DST-PORT,5355,DIRECT'"
+	echo "  - 'IP-CIDR,224.0.0.0/4,DIRECT,no-resolve'"
+	echo "  - 'IP-CIDR6,ff00::/8,DIRECT,no-resolve'"
+}
+
 prepare_config() {
 	local src_config=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
 	local run_config="/tmp/mihomo_run.yaml"
@@ -743,9 +799,11 @@ tun:
 EOF
 	fi
 
-	# Inject controlled access rules from UCI (highest priority, first-match).
+	# Inject built-in bypass rules (multicast/LLMNR → DIRECT) first, then UCI
+	# access rules, at the top of the rules block (highest priority, first-match).
 	local rules_file="${run_config}.rules"
-	emit_access_rules_yaml "$src_config" > "$rules_file"
+	emit_builtin_bypass_rules > "$rules_file"
+	emit_access_rules_yaml "$src_config" >> "$rules_file"
 	if [ -s "$rules_file" ]; then
 		if grep -q '^rules:' "$run_config"; then
 			local tmpf="${run_config}.rules2"
@@ -758,7 +816,7 @@ EOF
 			printf 'rules:\n' >> "$run_config"
 			cat "$rules_file" >> "$run_config"
 		fi
-		logger -t mihomo "Prepared config with UCI access rules"
+		logger -t mihomo "Prepared config with bypass + UCI access rules"
 	fi
 	rm -f "$rules_file"
 
@@ -979,6 +1037,108 @@ collect_loop() {
 	done
 }
 
+# Proxy traffic stats. Every poll: take /connections, for each connection whose
+# chains[0] != DIRECT/REJECT, accumulate the byte delta (cur - last seen) into a
+# grand total (/etc/mihomo/.traffic_total, never auto-cleared) and into a
+# per-main-domain bucket (/etc/mihomo/.traffic_domains, clearable). Host-less
+# proxy connections are bucketed as "其他". One awk pass does all the math.
+collect_traffic() {
+	local raw statef totalf domf tmpd
+	statef="/tmp/mihomo_traffic_state"
+	totalf="/etc/mihomo/.traffic_total"
+	domf="/etc/mihomo/.traffic_domains"
+	raw=$(mihomo_curl -s --connect-timeout 2 "http://127.0.0.1:${API_PORT}/connections" 2>/dev/null)
+	[ -z "$raw" ] && return 0
+	tmpd=$(mktemp -d)
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].id' 2>/dev/null > "$tmpd/id"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].chains[0]' 2>/dev/null > "$tmpd/ch"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].metadata.host' 2>/dev/null > "$tmpd/host"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].upload' 2>/dev/null > "$tmpd/up"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].download' 2>/dev/null > "$tmpd/dn"
+	touch "$statef" "$totalf" "$domf"
+	awk -v statef="$statef" -v totalf="$totalf" -v domf="$domf" -v now="$(date +%s)" '
+		BEGIN {
+			comp = " com.cn net.cn org.cn gov.cn edu.cn ac.cn com.hk com.tw com.jp co.jp co.uk co.kr com.au com.sg com.br com.mx "
+			total = 0; since = 0
+			while ((getline ln < totalf) > 0) { split(ln, a, " "); total = a[1]+0; if (a[2] != "") since = a[2]+0 }
+			close(totalf)
+			if (since == 0) since = now
+			while ((getline ln < domf) > 0) { if (split(ln, a, "\\t") >= 2 && a[1] != "") dom[a[1]] = a[2]+0 }
+			close(domf)
+			while ((getline ln < statef) > 0) { if (split(ln, a, "\\t") >= 2 && a[1] != "") st[a[1]] = a[2]+0 }
+			close(statef)
+		}
+		FILENAME ~ /\/id$/   { id[FNR] = $0; if (FNR > maxn) maxn = FNR }
+		FILENAME ~ /\/ch$/   { ch[FNR] = $0 }
+		FILENAME ~ /\/host$/ { host[FNR] = $0 }
+		FILENAME ~ /\/up$/   { up[FNR] = $0 }
+		FILENAME ~ /\/dn$/   { dn[FNR] = $0 }
+		END {
+			for (i = 1; i <= maxn; i++) {
+				cid = id[i]; cch = ch[i]; chost = host[i]; cup = up[i]+0; cdn = dn[i]+0
+				if (cid == "" || cch == "DIRECT" || cch == "REJECT" || cch == "REJECT-DROP") continue
+				cur = cup + cdn
+				delta = (cid in st) ? (cur - st[cid]) : cur
+				if (delta < 0) delta = cur
+				st[cid] = cur; seen[cid] = 1
+				if (delta <= 0) continue
+				total += delta
+				md = "其他"
+				if (chost != "") {
+					gsub(/[:#].*/, "", chost); sub(/^\\./, "", chost)
+					nc = split(chost, lbl, ".")
+					if (nc >= 2) {
+						l2 = tolower(lbl[nc-1] "." lbl[nc])
+						md = (nc >= 3 && index(comp, " " l2 " ")) ? (lbl[nc-2] "." l2) : l2
+					}
+				}
+				dom[md] += delta
+			}
+			for (k in seen) print k "\\t" st[k] > statef
+			close(statef)
+			print total " " since > totalf
+			close(totalf)
+			for (k in dom) if (dom[k] > 0) print k "\\t" dom[k] > domf
+			close(domf)
+		}
+	' "$tmpd/id" "$tmpd/ch" "$tmpd/host" "$tmpd/up" "$tmpd/dn"
+	rm -rf "$tmpd"
+}
+
+traffic_loop() {
+	sleep 5
+	while true; do
+		collect_traffic
+		sleep 5
+	done
+}
+
+# Emit traffic stats as JSON: {total, since, domains:[{domain,bytes}]} (top 30 by
+# bytes). Front end formats bytes to human units.
+get_traffic() {
+	local totalf="/etc/mihomo/.traffic_total" domf="/etc/mihomo/.traffic_domains"
+	local total=0 since=0
+	read -r total since 2>/dev/null < "$totalf" || true
+	total=${total:-0}; since=${since:-0}
+	printf '{"total":%s,"since":%s,"domains":[' "$total" "$since"
+	if [ -s "$domf" ]; then
+		local _first=1 _d _b
+		sort -k2 -nr "$domf" 2>/dev/null | head -n 30 | while IFS='	' read -r _d _b; do
+			[ -z "$_d" ] && continue
+			[ "$_first" -eq 0 ] && printf ','
+			_first=0
+			printf '{"domain":"%s","bytes":%d}' "$_d" "${_b:-0}"
+		done
+	fi
+	printf ']}'
+}
+
+reset_traffic_domains() {
+	: > /etc/mihomo/.traffic_domains
+	logger -t mihomo "Traffic per-domain stats cleared"
+	echo '{"success":true}'
+}
+
 # URL-encode a string for use in an HTTP path (POSIX shell, no bashisms).
 urlencode() {
 	if command -v od >/dev/null 2>&1; then
@@ -1115,6 +1275,37 @@ test_all_nodes() {
 	done
 	echo "]"
 	rm -rf "$tmpd"
+}
+
+# One-click connectivity test: HEAD each site THROUGH the proxy mixed-port so
+# it exercises the real rule + selected-node path (same backend clients use).
+# delay = total request time in ms; code != "000" means reachable. Powers the
+# dashboard "网站连通性测试" panel — answers "why can't devices open foreign sites".
+test_connectivity() {
+	local mix_port=$(uci -q get mihomo.config.mix_port || echo "7890")
+	local proxy="http://127.0.0.1:${mix_port}"
+	local sites="百度|https://www.baidu.com
+Google|https://www.google.com
+YouTube|https://www.youtube.com
+Facebook|https://www.facebook.com
+TikTok|https://www.tiktok.com"
+	echo "["
+	first=1
+	printf '%s\n' "$sites" | while IFS='|' read -r name url; do
+		[ -z "$name" ] && continue
+		[ "$first" -eq 0 ] && echo ","
+		first=0
+		out=$(curl -x "$proxy" -I -m 6 -o /dev/null -s -w '%{http_code} %{time_total}' "$url" 2>/dev/null)
+		code=$(printf '%s' "$out" | awk '{print $1}')
+		delay=$(printf '%s' "$out" | awk '{print $2}')
+		if [ -n "$code" ] && [ "$code" != "000" ] && [ -n "$delay" ]; then
+			ms=$(awk -v t="$delay" 'BEGIN{ printf "%d", (t+0)*1000 }')
+			printf '{"name":"%s","delay":%s,"code":"%s","ok":true}' "$name" "$ms" "$code"
+		else
+			printf '{"name":"%s","delay":0,"code":"","ok":false,"msg":"timeout"}' "$name"
+		fi
+	done
+	echo "]"
 }
 
 get_history() {
@@ -1330,6 +1521,9 @@ case "$1" in
 	test_all_nodes)
 		test_all_nodes "$2"
 		;;
+	test_connectivity)
+		test_connectivity
+		;;
 	get_proxy_groups)
 		get_proxy_groups
 		;;
@@ -1344,6 +1538,15 @@ case "$1" in
 		;;
 	collect_loop)
 		collect_loop
+		;;
+	traffic_loop)
+		traffic_loop
+		;;
+	get_traffic)
+		get_traffic
+		;;
+	reset_traffic_domains)
+		reset_traffic_domains
 		;;
 	get_history)
 		get_history "$2"
@@ -1370,7 +1573,7 @@ case "$1" in
 		import_rules "$2" "$3"
 		;;
 	*)
-		echo "Usage: $0 {get_arch|check_core|download_core|update_geox|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes}"
+		echo "Usage: $0 {get_arch|check_core|download_core|update_geox|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes|test_connectivity|traffic_loop|get_traffic|reset_traffic_domains}"
 		exit 1
 		;;
 esac
@@ -1415,6 +1618,14 @@ esac
         "action": {
             "type": "view",
             "path": "mihomo/rules"
+        }
+    },
+    "admin/services/mihomo/traffic": {
+        "title": "流量统计",
+        "order": 5,
+        "action": {
+            "type": "view",
+            "path": "mihomo/traffic"
         }
     }
 }
@@ -2372,10 +2583,104 @@ return view.extend({
 			}
 		}
 
+		var auto_setup_btn = E('button', {
+			'class': 'cbi-button cbi-button-action',
+			'style': 'margin: 0;',
+			'click': function(ev) {
+				ev.preventDefault();
+				var selGroups = [];
+				var _gn = Object.keys(proxy_groups);
+				for (var i = 0; i < _gn.length; i++) {
+					var _g = proxy_groups[_gn[i]];
+					if (_g && _g.type === 'Selector' && _g.all && _g.all.length) {
+						selGroups.push({ name: _gn[i], now: _g.now, all: _g.all });
+					}
+				}
+				if (selGroups.length === 0) {
+					ui.addNotification(null, E('p', _('没有可自动切换的手动策略组。')), 'info');
+					return;
+				}
+				var close_btn = E('button', {
+					'class': 'cbi-button',
+					'style': 'display: none; margin-top: 10px;',
+					'click': function() { ui.hideModal(); }
+				}, _('关闭'));
+				var log_pre = E('pre', { 'id': 'auto_setup_log', 'style': 'max-height: 240px; overflow-y: auto; background: #222; color: #fff; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 12px; white-space: pre-wrap;' }, _('① 正在测试全部节点速度，请稍候…') + '\\n');
+				ui.showModal(_('自动设置代理'), [
+					E('p', {}, _('一键测速并自动把各手动策略组切换到最快健康节点。')),
+					log_pre,
+					E('div', { 'class': 'right' }, [close_btn])
+				]);
+				var log = function(line) {
+					var pre = document.getElementById('auto_setup_log');
+					if (pre) pre.textContent += line + '\\n';
+				};
+				fs.exec('/usr/share/mihomo/helper.sh', ['test_all_nodes']).then(function(res) {
+					var arr;
+					try { arr = JSON.parse((res.stdout || '[]').trim()); } catch(e) { arr = []; }
+					var delayMap = {};
+					var healthy = 0;
+					for (var i = 0; i < proxies.length; i++) {
+						var d = arr[i];
+						if (d && typeof d.delay === 'number' && d.delay >= 0) {
+							delayMap[proxies[i].name] = d.delay;
+							healthy++;
+						}
+					}
+					if (healthy === 0) {
+						log(_('✗ 未能测得任何健康节点。请确认核心服务已启动且节点服务器可达。'));
+						close_btn.style.display = 'inline-block';
+						return;
+					}
+					log(_('✓ 测得 ') + healthy + _(' 个健康节点，开始为各策略组选择最快节点…'));
+					var chain = Promise.resolve();
+					selGroups.forEach(function(sg) {
+						chain = chain.then(function() {
+							var best = null;
+							for (var k = 0; k < sg.all.length; k++) {
+								var nm = sg.all[k];
+								if (nm in delayMap && (!best || delayMap[nm] < best.delay)) {
+									best = { name: nm, delay: delayMap[nm] };
+								}
+							}
+							if (!best) {
+								log('• ' + sg.name + '：' + _('无健康节点，跳过'));
+								return;
+							}
+							if (best.name === sg.now) {
+								log('• ' + sg.name + ' → ' + best.name + ' (' + best.delay + 'ms) ' + _('已是最优，无需切换'));
+								return;
+							}
+							return fs.exec('/usr/share/mihomo/helper.sh', ['select_node', sg.name, best.name]).then(function(r) {
+								if (r.code === 0) {
+									log('✓ ' + sg.name + ' → ' + best.name + ' (' + best.delay + 'ms) ' + _('切换成功'));
+									var sel = document.querySelector('select[data-group="' + sg.name + '"]');
+									if (sel) sel.value = best.name;
+								} else {
+									log('✗ ' + sg.name + ' ' + _('切换失败：') + (r.stderr || r.stdout || ''));
+								}
+							}).catch(function(err) {
+								log('✗ ' + sg.name + ' ' + _('通信错误：') + err.message);
+							});
+						});
+					});
+					return chain.then(function() {
+						log(_('完成。'));
+						close_btn.style.display = 'inline-block';
+					});
+				}).catch(function(err) {
+					log(_('✗ 测试失败：') + err.message);
+					close_btn.style.display = 'inline-block';
+				});
+			}
+		}, _('自动设置代理'));
 		var proxy_groups_panel;
 		if (controller_up && selector_groups_count > 0) {
 			proxy_groups_panel = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
-				E('h3', { 'style': 'margin-top: 0; margin-bottom: 15px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, _('分流策略组管理 (实时切换节点)')),
+				E('div', { 'style': 'display: flex; align-items: center; justify-content: space-between; margin-top: 0; margin-bottom: 15px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, [
+					E('h3', { 'style': 'margin: 0;' }, _('分流策略组管理 (实时切换节点)')),
+					auto_setup_btn
+				]),
 				E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
 					E('thead', {}, [
 						E('tr', {}, [
@@ -2611,6 +2916,40 @@ return view.extend({
 				while (logs_pre.firstChild) { logs_pre.removeChild(logs_pre.firstChild); }
 			}
 		}, _('清空'));
+		var download_logs_btn = E('button', {
+			'class': 'cbi-button cbi-button-neutral',
+			'style': 'margin: 0;',
+			'click': function(ev) {
+				ev.preventDefault();
+				var orig = download_logs_btn.textContent;
+				download_logs_btn.disabled = true;
+				download_logs_btn.textContent = _('下载中…');
+				fs.exec('/usr/share/mihomo/helper.sh', ['get_core_log']).then(function(res) {
+					var text = (res && res.stdout) ? res.stdout : '';
+					if (!text || !text.trim()) {
+						ui.addNotification(null, E('p', _('当前无日志可下载。')), 'info');
+						return;
+					}
+					var d = new Date();
+					var p = function(n) { return (n < 10 ? '0' : '') + n; };
+					var ts = d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+					var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+					var url = URL.createObjectURL(blob);
+					var a = document.createElement('a');
+					a.href = url;
+					a.download = 'mihomo-core-' + ts + '.log';
+					document.body.appendChild(a);
+					a.click();
+					document.body.removeChild(a);
+					setTimeout(function() { URL.revokeObjectURL(url); }, 1500);
+				}).catch(function() {
+					ui.addNotification(null, E('p', _('下载日志失败，请稍后重试。')), 'danger');
+				}).then(function() {
+					download_logs_btn.disabled = false;
+					download_logs_btn.textContent = orig;
+				});
+			}
+		}, _('下载日志'));
 
 		var opBusy = (op_state.state === 'in_progress');
 		var opPollCount = 0;
@@ -2652,6 +2991,60 @@ return view.extend({
 			});
 		}
 		if (opBusy) { setOpBusy(true, _('操作进行中…')); setTimeout(pollOpState, 1000); }
+		// Connectivity test panel: one-click reachability of key sites through the proxy.
+		var conn_sites = ['百度', 'Google', 'YouTube', 'Facebook', 'TikTok'];
+		var conn_cells = {};
+		var conn_tbody = E('tbody', {}, []);
+		for (var ci = 0; ci < conn_sites.length; ci++) {
+			var cn = conn_sites[ci];
+			var cell = E('td', { 'style': 'vertical-align: middle; padding: 8px; color: #888;' }, _('—'));
+			conn_cells[cn] = cell;
+			conn_tbody.appendChild(E('tr', {}, [
+				E('td', { 'style': 'font-weight: bold; vertical-align: middle; padding: 8px;' }, cn),
+				cell
+			]));
+		}
+		var conn_btn = E('button', {
+			'class': 'cbi-button cbi-button-action',
+			'style': 'margin: 0;',
+			'click': function(ev) {
+				ev.preventDefault();
+				for (var ck in conn_cells) { conn_cells[ck].textContent = _('测试中…'); conn_cells[ck].style.color = '#888'; }
+				fs.exec('/usr/share/mihomo/helper.sh', ['test_connectivity']).then(function(res) {
+					var arr;
+					try { arr = JSON.parse((res.stdout || '[]').trim()); } catch(e) { arr = []; }
+					var byName = {};
+					for (var ai = 0; ai < arr.length; ai++) if (arr[ai] && arr[ai].name) byName[arr[ai].name] = arr[ai];
+					for (var ck2 in conn_cells) {
+						var d = byName[ck2];
+						var el = conn_cells[ck2];
+						if (d && d.ok && typeof d.delay === 'number') {
+							el.textContent = d.delay + ' ms';
+							el.style.color = (d.delay < 500) ? '#2f9e44' : '#e8590c';
+						} else {
+							el.textContent = _('不通');
+							el.style.color = '#e03131';
+						}
+					}
+				}).catch(function() {
+					for (var ck3 in conn_cells) { conn_cells[ck3].textContent = _('失败'); conn_cells[ck3].style.color = '#e03131'; }
+				});
+			}
+		}, _('一键测试'));
+		var connectivity_panel = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
+			E('div', { 'style': 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;' }, [
+				E('h3', { 'style': 'margin: 0;' }, _('网站连通性测试')),
+				conn_btn
+			]),
+			E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
+				E('thead', {}, [ E('tr', {}, [
+					E('th', { 'width': '50%', 'style': 'background: rgba(0,0,0,0.02);' }, _('网站')),
+					E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('延时'))
+				]) ]),
+				conn_tbody
+			])
+		]);
+
 		var view_html = E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, _('豆豉代理仪表盘')),
 			E('p', {}, _('管理 Mihomo 核心守护进程，监控运行状态并选择代理节点。')),
@@ -2684,6 +3077,9 @@ return view.extend({
 			// Proxy groups switching panel
 			proxy_groups_panel,
 
+			// Connectivity test panel
+			connectivity_panel,
+
 			// Nodes list panel
 			E('div', { 'class': 'cbi-section' }, [
 				node_list_header,
@@ -2702,7 +3098,7 @@ return view.extend({
 			E('div', { 'class': 'cbi-section' }, [
 				E('div', { 'style': 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;' }, [
 					E('h3', { 'style': 'margin: 0;' }, _('系统代理日志')),
-					clear_logs_btn
+					E('div', { 'style': 'display: flex; gap: 8px;' }, [ download_logs_btn, clear_logs_btn ])
 				]),
 				logs_pre
 			])
@@ -2715,6 +3111,8 @@ return view.extend({
 			}).catch(function() {});
 		}, 5000);
 
+		// Traffic stats: initial load + refresh every 15s
+
 		return view_html;
 	},
 
@@ -2723,6 +3121,97 @@ return view.extend({
 	}
 });
 """,
+    "root/www/luci-static/resources/view/mihomo/traffic.js": """'use strict';
+'require view';
+'require ui';
+'require fs';
+
+return view.extend({
+	_sortKey: 'bytes',
+	_sortDir: 'desc',
+
+	render: function() {
+		var self = this;
+		var fmtBytes = function(b) {
+			b = Number(b) || 0;
+			if (b < 1024) return b + ' B';
+			var u = ['KB', 'MB', 'GB', 'TB']; var i = -1;
+			do { b /= 1024; i++; } while (b >= 1024 && i < u.length - 1);
+			return b.toFixed(b >= 100 ? 0 : (b >= 10 ? 1 : 2)) + ' ' + u[i];
+		};
+		var totalEl = E('div', { 'style': 'font-size: 26px; font-weight: bold; color: #2f9e44; margin: 4px 0 2px;' }, _('—'));
+		var sinceEl = E('div', { 'style': 'color: #888; font-size: 12px; margin-bottom: 14px;' }, '');
+		var countEl = E('span', { 'style': 'color: #888; font-size: 12px;' }, '');
+		var tbody = E('tbody', {}, []);
+		var domainTh = E('th', { 'style': 'cursor: pointer; background: rgba(0,0,0,0.02);', 'click': function() { setSort('domain'); } }, _('域名'));
+		var bytesTh = E('th', { 'style': 'cursor: pointer; background: rgba(0,0,0,0.02);', 'click': function() { setSort('bytes'); } }, _('流量 ▼'));
+		var renderRows = function() {
+			var data = self._lastData || { domains: [] };
+			totalEl.textContent = fmtBytes(data.total || 0);
+			if (data.since) {
+				var dt = new Date(data.since * 1000);
+				sinceEl.textContent = _('自') + ' ' + dt.getFullYear() + '-' + ('0' + (dt.getMonth() + 1)).slice(-2) + '-' + ('0' + dt.getDate()).slice(-2) + _(' 起，仅统计走代理节点的流量（5s 轮询差分，极短连接可能漏计）');
+			}
+			var ds = (data.domains || []).slice();
+			var dir = (self._sortDir === 'asc') ? 1 : -1;
+			if (self._sortKey === 'bytes') ds.sort(function(a, b) { return ((a.bytes || 0) - (b.bytes || 0)) * dir; });
+			else ds.sort(function(a, b) { return String(a.domain).localeCompare(String(b.domain)) * dir; });
+			while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+			countEl.textContent = _('共 ') + ds.length + _(' 个域名');
+			if (!ds.length) {
+				tbody.appendChild(E('tr', {}, [ E('td', { 'colspan': 2, 'style': 'padding: 16px; color: #999; text-align: center;' }, _('暂无数据（稍候刷新）')) ]));
+				return;
+			}
+			for (var i = 0; i < ds.length; i++) {
+				tbody.appendChild(E('tr', {}, [
+					E('td', { 'style': 'font-weight: bold; vertical-align: middle; padding: 8px;' }, ds[i].domain),
+					E('td', { 'style': 'vertical-align: middle; padding: 8px;' }, fmtBytes(ds[i].bytes))
+				]));
+			}
+		};
+		function setSort(key) {
+			if (self._sortKey === key) self._sortDir = (self._sortDir === 'asc' ? 'desc' : 'asc');
+			else { self._sortKey = key; self._sortDir = (key === 'bytes' ? 'desc' : 'asc'); }
+			domainTh.textContent = _('域名') + (self._sortKey === 'domain' ? (self._sortDir === 'asc' ? ' ▲' : ' ▼') : '');
+			bytesTh.textContent = _('流量') + (self._sortKey === 'bytes' ? (self._sortDir === 'asc' ? ' ▲' : ' ▼') : '');
+			renderRows();
+		}
+		var loadTraffic = function() {
+			fs.exec('/usr/share/mihomo/helper.sh', ['get_traffic']).then(function(res) {
+				try { self._lastData = JSON.parse((res.stdout || '{}').trim()); } catch(e) {}
+				renderRows();
+			}).catch(function() {});
+		};
+		var refreshBtn = E('button', { 'class': 'cbi-button cbi-button-neutral', 'click': function(ev) { ev.preventDefault(); loadTraffic(); } }, _('刷新'));
+		var resetBtn = E('button', { 'class': 'cbi-button cbi-button-reset', 'click': function(ev) {
+			ev.preventDefault();
+			if (!confirm(_('确定清零"按域名"统计？累计总量保留不变。'))) return;
+			fs.exec('/usr/share/mihomo/helper.sh', ['reset_traffic_domains']).then(function() { loadTraffic(); });
+		} }, _('清零域名统计'));
+		loadTraffic();
+		this._timer = setInterval(loadTraffic, 15000);
+		return E('div', { 'class': 'cbi-map' }, [
+			E('h2', {}, _('代理流量统计')),
+			E('p', {}, _('仅统计经过代理节点（非直连）的流量，按主域名归并（如 map.google.com → google.com）。点击表头可排序。')),
+			E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 18px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
+				E('div', { 'style': 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;' }, [
+					E('div', {}, [ E('div', { 'style': 'color: #666; font-size: 13px;' }, _('累计代理流量')), totalEl, sinceEl ]),
+					E('div', { 'style': 'display: flex; gap: 8px; align-items: center;' }, [ countEl, refreshBtn, resetBtn ])
+				]),
+				E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
+					E('thead', {}, [ E('tr', {}, [ domainTh, bytesTh ]) ]),
+					tbody
+				])
+			])
+		]);
+	},
+
+	unload: function() {
+		if (this._timer) { clearInterval(this._timer); this._timer = null; }
+	}
+});
+""",
+
     "root/www/luci-static/resources/view/mihomo/settings.js": """'use strict';
 'require view';
 'require form';
