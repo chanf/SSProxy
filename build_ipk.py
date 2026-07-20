@@ -9,7 +9,7 @@ import tarfile
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-ssproxy"
-PKG_VERSION = "1.0.0-163"
+PKG_VERSION = "1.0.0-165"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -75,6 +75,7 @@ config mihomo 'config'
 	option geo_update_interval '24'
 	option geoip_mirror_url 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat'
 	option geosite_mirror_url 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat'
+	option adblock_enabled '0'
 """,
     # System Init Script managed by procd with TProxy/nftables/Dnsmasq redirection
     "root/etc/init.d/mihomo": """#!/bin/sh /etc/rc.common
@@ -720,6 +721,50 @@ emit_access_rules_yaml() {
 	done
 }
 
+# Emit adblock rule-providers block BODY (no top-level "rule-providers:" header;
+# prepare_config emits the header only when this output is non-empty). One entry
+# per enabled UCI adblock_source section. path MUST stay inside core -d work dir
+# (/etc/mihomo), so we use ./ruleset/<name>.yaml (relative). interval is fixed to
+# daily; the core auto-fetches on this schedule (no helper update loop needed).
+emit_adblock_rule_providers_yaml() {
+	uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=adblock_source$/\\1/p' | while read -r sid; do
+		local e name url behavior fmt
+		e=$(uci -q get mihomo.$sid.enabled); [ "$e" = "1" ] || continue
+		name=$(uci -q get mihomo.$sid.name); url=$(uci -q get mihomo.$sid.url)
+		[ -n "$name" ] && [ -n "$url" ] || continue
+		behavior=$(uci -q get mihomo.$sid.behavior || echo domain)
+		fmt=$(uci -q get mihomo.$sid.format || echo yaml)
+		echo "  $name:"
+		echo "    type: http"
+		echo "    behavior: $behavior"
+		echo "    format: $fmt"
+		echo "    url: \\"$url\\""
+		echo "    path: ./ruleset/$name.yaml"
+		echo "    interval: 86400"
+	done
+}
+
+# Emit RULE-SET,<name>,REJECT lines for every enabled adblock_source.
+emit_adblock_rules_yaml() {
+	uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=adblock_source$/\\1/p' | while read -r sid; do
+		local e name
+		e=$(uci -q get mihomo.$sid.enabled); [ "$e" = "1" ] || continue
+		name=$(uci -q get mihomo.$sid.name); [ -n "$name" ] || continue
+		echo "  - 'RULE-SET,$name,REJECT'"
+	done
+}
+
+# Return 0 if at least one enabled adblock_source uses domain behavior (needed to
+# decide whether DNS-layer nameserver-policy can reference rule-set).
+has_domain_adblock_source() {
+	uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=adblock_source$/\\1/p' | while read -r sid; do
+		local e b
+		e=$(uci -q get mihomo.$sid.enabled); [ "$e" = "1" ] || continue
+		b=$(uci -q get mihomo.$sid.behavior || echo domain)
+		[ "$b" = "domain" ] && echo yes
+	done | grep -q yes
+}
+
 # Built-in bypass rules: multicast / link-local discovery traffic cannot
 # traverse a proxy (it is LAN-scope broadcast/multicast). Force DIRECT so it
 # is not shoved through the final MATCH rule and wasted on doomed proxy dials
@@ -862,6 +907,9 @@ normalize_rules() {
 }
 
 prepare_config() {
+	# Seed built-in adblock sources on first run (idempotent uci add).
+	init_adblock_sources
+	local ad_enabled=$(uci -q get mihomo.config.adblock_enabled || echo 0)
 	local config_mode=$(uci -q get mihomo.config.config_mode || echo "subscription")
 	local sub_config=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
 	local custom_config=$(uci -q get mihomo.config.custom_config_path || echo "/etc/mihomo/custom.yaml")
@@ -956,6 +1004,20 @@ dns:
     - 223.5.5.5
     - 119.29.29.29
 EOF
+	# Adblock DNS-layer interception: send ad domains a null answer at resolve
+	# time (before fake-ip is even handed out). Only domain-behavior providers
+	# can be referenced by nameserver-policy rule-set.
+	if [ "$ad_enabled" = "1" ] && has_domain_adblock_source; then
+		echo "  nameserver-policy:" >> "$run_config"
+		uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=adblock_source$/\\1/p' | while read -r sid; do
+			local e n b
+			e=$(uci -q get mihomo.$sid.enabled); [ "$e" = "1" ] || continue
+			b=$(uci -q get mihomo.$sid.behavior || echo domain)
+			[ "$b" = "domain" ] || continue
+			n=$(uci -q get mihomo.$sid.name); [ -n "$n" ] || continue
+			echo "    \\"rule-set:$n\\": rcode://success" >> "$run_config"
+		done
+	fi
 
 	# Append controlled TUN block
 	if [ "$tun_enabled" -eq 1 ]; then
@@ -973,11 +1035,48 @@ tun:
 EOF
 	fi
 
+	# Adblock: merge a controlled rule-providers block, deduped against any
+	# same-named provider the subscription already defines (duplicate keys make
+	# the core fatal-exit on startup). The ssproxy-ad- prefix avoids collisions.
+	if [ "$ad_enabled" = "1" ]; then
+		local ad_provs="${run_config}.adprovs"
+		emit_adblock_rule_providers_yaml > "$ad_provs"
+		if [ -s "$ad_provs" ]; then
+			local ad_dedup="${run_config}.adprovs.dd"
+			: > "$ad_dedup"
+			local cur_name="" skip=0
+			while IFS= read -r line; do
+				case "$line" in
+					"  "*:)
+						cur_name=${line#  }; cur_name=${cur_name%:}
+						if grep -qE "^  ${cur_name}:" "$run_config"; then skip=1; else skip=0; fi
+						;;
+				esac
+				[ "$skip" = "0" ] && echo "$line" >> "$ad_dedup"
+			done < "$ad_provs"
+			if [ -s "$ad_dedup" ]; then
+				if grep -q '^rule-providers:' "$run_config"; then
+					awk -v body="$ad_dedup" '
+						/^rule-providers:[[:space:]]*$/ { print; while ((getline l < body) > 0) print l; next }
+						{ print }
+					' "$run_config" > "${run_config}.tmp" && mv "${run_config}.tmp" "$run_config"
+				else
+					{ echo "rule-providers:"; cat "$ad_dedup"; } >> "$run_config"
+				fi
+			fi
+			rm -f "$ad_dedup"
+		fi
+		rm -f "$ad_provs"
+	fi
+
 	# Inject built-in bypass rules (multicast/LLMNR → DIRECT) first, then UCI
 	# access rules, at the top of the rules block (highest priority, first-match).
 	local rules_file="${run_config}.rules"
 	emit_builtin_bypass_rules > "$rules_file"
 	emit_access_rules_yaml "$src_config" >> "$rules_file"
+	# Adblock REJECT rules go AFTER access rules so user whitelist (direct)
+	# entries always win over blanket ad blocking (prevents false positives).
+	emit_adblock_rules_yaml >> "$rules_file"
 	if [ -s "$rules_file" ]; then
 		if grep -q '^rules:' "$run_config"; then
 			local tmpf="${run_config}.rules2"
@@ -1594,6 +1693,91 @@ del_access_rule() {
 	echo "OK"
 }
 
+# --- Adblock rule-source management (UCI adblock_source sections) ---
+
+get_adblock_sources() {
+	echo "["
+	local first=1
+	uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=adblock_source$/\\1/p' | while read -r sid; do
+		local e name url behavior fmt
+		e=$(uci -q get mihomo.$sid.enabled)
+		name=$(uci -q get mihomo.$sid.name)
+		url=$(uci -q get mihomo.$sid.url)
+		behavior=$(uci -q get mihomo.$sid.behavior); [ -z "$behavior" ] && behavior="domain"
+		fmt=$(uci -q get mihomo.$sid.format); [ -z "$fmt" ] && fmt="yaml"
+		[ $first -eq 0 ] && printf ','
+		first=0
+		printf '{"sid":"%s","name":"%s","url":"%s","behavior":"%s","format":"%s","enabled":"%s"}' "$sid" "$name" "$url" "$behavior" "$fmt" "$e"
+	done
+	echo "]"
+}
+
+add_adblock_source() {
+	local name="$1" url="$2" behavior="$3" fmt="$4"
+	[ -z "$url" ] && { echo "ERROR: url required" >&2; return 1; }
+	[ -z "$name" ] && { echo "ERROR: name required" >&2; return 1; }
+	case "$name" in
+		ssproxy-ad-*) ;;
+		*) name="ssproxy-ad-$name" ;;
+	esac
+	[ -z "$behavior" ] && behavior="domain"
+	[ -z "$fmt" ] && fmt="yaml"
+	local sid
+	sid=$(uci add mihomo adblock_source)
+	uci -q set mihomo.$sid.name="$name"
+	uci -q set mihomo.$sid.url="$url"
+	uci -q set mihomo.$sid.behavior="$behavior"
+	uci -q set mihomo.$sid.format="$fmt"
+	uci -q set mihomo.$sid.enabled="1"
+	uci commit mihomo
+	logger -t mihomo "adblock_source added: name=$name url=$url behavior=$behavior"
+	echo "OK"
+}
+
+del_adblock_source() {
+	local sid="$1"
+	[ -z "$sid" ] && { echo "ERROR: sid required" >&2; return 1; }
+	uci -q delete mihomo.$sid
+	uci commit mihomo
+	logger -t mihomo "adblock_source deleted: $sid"
+	echo "OK"
+}
+
+toggle_adblock_source() {
+	local sid="$1" val="$2"
+	[ -z "$sid" ] && { echo "ERROR: sid required" >&2; return 1; }
+	uci -q set mihomo.$sid.enabled="${val:-0}"
+	uci commit mihomo
+	logger -t mihomo "adblock_source toggled: $sid enabled=${val:-0}"
+	echo "OK"
+}
+
+set_adblock_enabled() {
+	local val="$1"
+	[ -z "$val" ] && val="0"
+	uci -q set mihomo.config.adblock_enabled="$val"
+	uci commit mihomo
+	logger -t mihomo "adblock enabled=$val"
+	echo "OK"
+}
+
+# Idempotently seed built-in preset adblock sources on first run (only when no
+# adblock_source section exists yet). Presets default to disabled; the user opts
+# in via the UI. All presets use domain behavior so they feed both rule-layer
+# REJECT and DNS-layer nameserver-policy.
+init_adblock_sources() {
+	uci -q show mihomo.@adblock_source[0] >/dev/null 2>&1 && return 0
+	local sid
+	sid=$(uci add mihomo adblock_source)
+	uci -q set mihomo.$sid.name="ssproxy-ad-antiad"
+	uci -q set mihomo.$sid.url="https://anti-ad.net/clash.yaml"
+	uci -q set mihomo.$sid.behavior="domain"
+	uci -q set mihomo.$sid.format="yaml"
+	uci -q set mihomo.$sid.enabled="0"
+	uci commit mihomo
+	logger -t mihomo "adblock: preset sources initialized"
+}
+
 import_rules() {
 	local text="$1" mode="$2"
 	local imported=0 skipped=0 duplicates=0 skipped_samples=""
@@ -1891,8 +2075,23 @@ case "$1" in
 	import_rules)
 		import_rules "$2" "$3"
 		;;
+	get_adblock_sources)
+		get_adblock_sources
+		;;
+	add_adblock_source)
+		add_adblock_source "$2" "$3" "$4" "$5"
+		;;
+	del_adblock_source)
+		del_adblock_source "$2"
+		;;
+	toggle_adblock_source)
+		toggle_adblock_source "$2" "$3"
+		;;
+	set_adblock_enabled)
+		set_adblock_enabled "$2"
+		;;
 	*)
-		echo "Usage: $0 {get_arch|get_lan_ip|get_lan_ip6|emit_tproxy_rules|check_core|download_core|update_geox|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes|test_connectivity|traffic_loop|get_traffic|reset_traffic_domains}"
+		echo "Usage: $0 {get_arch|get_lan_ip|get_lan_ip6|emit_tproxy_rules|check_core|download_core|update_geox|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes|test_connectivity|traffic_loop|get_traffic|reset_traffic_domains|get_adblock_sources|add_adblock_source|del_adblock_source|toggle_adblock_source}"
 		exit 1
 		;;
 esac
@@ -1945,6 +2144,14 @@ esac
         "action": {
             "type": "view",
             "path": "mihomo/traffic"
+        }
+    },
+    "admin/services/mihomo/adblock": {
+        "title": "广告过滤",
+        "order": 6,
+        "action": {
+            "type": "view",
+            "path": "mihomo/adblock"
         }
     }
 }
@@ -2642,6 +2849,194 @@ var view_html = E('div', { 'class': 'cbi-map' }, [
 			render_rules();
 		}, 0);
 
+		return view_html;
+	}
+});
+""",
+
+    "root/www/luci-static/resources/view/mihomo/adblock.js": """'use strict';
+'require view';
+'require ui';
+'require fs';
+'require uci';
+
+return view.extend({
+	load: function() {
+		return uci.load('mihomo').then(function() {
+			return Promise.all([
+				fs.exec('/usr/share/mihomo/helper.sh', ['get_adblock_sources']).catch(function() { return { stdout: '[]' }; })
+			]);
+		});
+	},
+
+	render: function(results) {
+		var sources = [];
+		var raw = (results[0] && results[0].stdout) ? results[0].stdout.trim() : '[]';
+		try { sources = JSON.parse(raw); } catch (e) { sources = []; }
+		var ad_enabled = uci.get('mihomo', 'config', 'adblock_enabled') === '1';
+
+		function btn(label, cls, fn) {
+			return E('button', { 'class': 'cbi-button ' + cls, 'style': 'margin: 1px 2px; padding: 2px 8px;', 'click': function(ev) {
+				ev.preventDefault(); fn();
+			} }, label);
+		}
+		function notify(msg, level) { ui.addNotification(null, E('p', _(msg)), level || 'info'); }
+
+		function del_source(sid) {
+			return fs.exec('/usr/share/mihomo/helper.sh', ['del_adblock_source', sid]).then(function(res) {
+				if (res.code === 0) { notify('规则源已删除（需重启核心后生效）。'); loadSources(); }
+				else { notify('删除失败：' + (res.stderr || res.stdout || ''), 'danger'); }
+			}).catch(function(err) { notify('通信错误：' + err.message, 'danger'); });
+		}
+		function toggle_source(sid, val) {
+			return fs.exec('/usr/share/mihomo/helper.sh', ['toggle_adblock_source', sid, val]).then(function(res) {
+				if (res.code === 0) { notify(val === '1' ? '已启用（需重启核心后生效）。' : '已禁用（需重启核心后生效）。'); loadSources(); }
+				else { notify('操作失败：' + (res.stderr || res.stdout || ''), 'danger'); }
+			}).catch(function(err) { notify('通信错误：' + err.message, 'danger'); });
+		}
+		function toggle_master(val) {
+			return fs.exec('/usr/share/mihomo/helper.sh', ['set_adblock_enabled', val]).then(function(res) {
+				if (res.code === 0) { notify(val === '1' ? '广告过滤已开启（需重启核心后生效）。' : '广告过滤已关闭（需重启核心后生效）。'); }
+				else { notify('操作失败：' + (res.stderr || res.stdout || ''), 'danger'); }
+			}).catch(function(err) { notify('通信错误：' + err.message, 'danger'); });
+		}
+
+		function render_sources() {
+			var box = document.getElementById('src-body');
+			if (!box) return;
+			box.innerHTML = '';
+			if (!sources.length) {
+				box.appendChild(E('tr', {}, [
+					E('td', { 'colspan': 5, 'style': 'text-align:center;color:#999;padding:15px;' }, _('暂无规则源（首次启动会自动添加预设源，请刷新页面）'))
+				]));
+				return;
+			}
+			for (var i = 0; i < sources.length; i++) {
+				var s = sources[i];
+				var enabled = s.enabled !== '0';
+				box.appendChild(E('tr', {}, [
+					E('td', {}, s.name || ''),
+					E('td', { 'style': 'word-break:break-all;' }, s.url || ''),
+					E('td', {}, s.behavior || 'domain'),
+					E('td', { 'style': 'color:' + (enabled ? '#2ed573' : '#999') + ';' }, enabled ? _('启用') : _('禁用')),
+					E('td', {}, [
+						btn(enabled ? _('禁用') : _('启用'), enabled ? 'cbi-button-reset' : 'cbi-button-apply', (function(sid, v) {
+							return function() { toggle_source(sid, v); };
+						})(s.sid, enabled ? '0' : '1')),
+						btn(_('删除'), 'cbi-button-reset', (function(sid) {
+							return function() { if (confirm(_('确定删除此规则源？'))) del_source(sid); };
+						})(s.sid))
+					])
+				]));
+			}
+		}
+
+		var card = 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);';
+
+		var master_form = E('div', { 'class': 'cbi-section', 'style': card }, [
+			E('h3', { 'style': 'margin-top: 0; margin-bottom: 12px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, _('广告过滤总开关')),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('启用广告过滤')),
+				E('div', { 'class': 'cbi-value-field' }, [
+					E('input', { 'id': 'ad_master', 'type': 'checkbox', 'checked': ad_enabled, 'change': function(ev) {
+						toggle_master(ev.target.checked ? '1' : '0');
+					} }),
+					E('span', { 'style': 'margin-left: 8px; color: #666; font-size: 13px;' }, _('开启后，已启用规则源将通过规则层 REJECT + DNS 层 nameserver-policy 双重拦截广告域名。'))
+				])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('div', { 'class': 'cbi-value-field' }, [
+					btn(_('应用并重启核心'), 'cbi-button-apply', function(ev) {
+						ev.preventDefault();
+						return fs.exec('/etc/init.d/mihomo', ['restart']).then(function() {
+							notify('核心已重启，广告过滤配置已生效。');
+							setTimeout(function() { location.reload(); }, 1500);
+						}).catch(function(err) { notify('重启失败：' + err.message, 'danger'); });
+					})
+				])
+			])
+		]);
+
+		var add_form = E('div', { 'class': 'cbi-section', 'style': card }, [
+			E('h3', { 'style': 'margin-top: 0; margin-bottom: 12px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, _('新增广告规则源')),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('名称')),
+				E('div', { 'class': 'cbi-value-field' }, [
+					E('input', { 'id': 'src_name', 'type': 'text', 'class': 'cbi-input-text', 'placeholder': '如 antiad（自动加 ssproxy-ad- 前缀）', 'style': 'width: 60%;' })
+				])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('规则集 URL')),
+				E('div', { 'class': 'cbi-value-field' }, [
+					E('input', { 'id': 'src_url', 'type': 'text', 'class': 'cbi-input-text', 'placeholder': 'Mihomo 兼容的 rule-provider 订阅地址', 'style': 'width: 80%;' })
+				])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('behavior')),
+				E('div', { 'class': 'cbi-value-field' }, [
+					E('select', { 'id': 'src_behavior', 'class': 'cbi-input-select', 'style': 'width: 200px;' }, [
+						E('option', { 'value': 'domain' }, _('domain（推荐，支持 DNS 层拦截）')),
+						E('option', { 'value': 'classical' }, _('classical（仅规则层拦截）'))
+					])
+				])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('div', { 'class': 'cbi-value-field' }, [
+					btn(_('添加规则源'), 'cbi-button-add', function() {
+						var nm = document.getElementById('src_name').value.trim();
+						var u = document.getElementById('src_url').value.trim();
+						var bv = document.getElementById('src_behavior').value;
+						if (!u) { notify('请填写规则集 URL。', 'danger'); return; }
+						if (!nm) { nm = 'custom'; }
+						return fs.exec('/usr/share/mihomo/helper.sh', ['add_adblock_source', nm, u, bv, 'yaml']).then(function(res) {
+							if (res.code === 0) {
+								notify('规则源已添加（需重启核心后生效）。');
+								document.getElementById('src_name').value = '';
+								document.getElementById('src_url').value = '';
+								loadSources();
+							} else { notify('添加失败：' + (res.stderr || res.stdout || ''), 'danger'); }
+						}).catch(function(err) { notify('通信错误：' + err.message, 'danger'); });
+					})
+				])
+			])
+		]);
+
+		function loadSources() {
+			return fs.exec('/usr/share/mihomo/helper.sh', ['get_adblock_sources']).then(function(res) {
+				var rr = (res && res.stdout) ? res.stdout.trim() : '[]';
+				try { sources = JSON.parse(rr); } catch (e) { sources = []; }
+				render_sources();
+			}).catch(function () {});
+		}
+
+		var view_html = E('div', { 'class': 'cbi-map' }, [
+			E('h2', {}, _('广告过滤')),
+			E('p', {}, _('基于 Mihomo rule-provider 拦截广告/追踪域名。启用的规则源会在核心配置中生成 rule-providers + REJECT 规则，并对 domain 类型源在 DNS 层用 nameserver-policy 返回空解析，实现双重拦截。')),
+			E('div', { 'style': 'background: #fff8e1; border: 1px solid #ffe082; border-radius: 6px; padding: 10px 14px; margin-bottom: 15px;' }, [
+				E('p', { 'style': 'margin: 0; font-size: 13px; color: #6d5b00; line-height: 1.6;' }, _('<b>规则源需为 domain behavior</b> 才能同时参与 DNS 层拦截；classical 类型仅规则层 REJECT。任何修改都需点击「应用并重启核心」生效。'))
+			]),
+			master_form,
+			E('div', { 'class': 'cbi-section', 'style': 'margin-bottom: 20px;' }, [
+				E('h3', { 'style': 'margin-top: 0;' }, _('规则源列表')),
+				E('div', { 'style': 'max-height: 400px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px;' }, [
+					E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
+						E('thead', {}, [
+							E('tr', {}, [
+								E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('名称')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('URL')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('behavior')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('状态')),
+								E('th', { 'style': 'background: rgba(0,0,0,0.02);' }, _('操作'))
+							])
+						]),
+						E('tbody', { 'id': 'src-body' })
+					])
+				])
+			]),
+			add_form
+		]);
+
+		setTimeout(function() { render_sources(); }, 0);
 		return view_html;
 	}
 });
