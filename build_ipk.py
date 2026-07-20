@@ -9,7 +9,7 @@ import tarfile
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-ssproxy"
-PKG_VERSION = "1.0.0-165"
+PKG_VERSION = "1.0.0-172"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -689,7 +689,7 @@ emit_access_rules_yaml() {
 		esc=$(printf '%s' "$1" | sed 's/[][\.\\*^$(){}?+|]/\\&/g')
 		grep -qE "name:[[:space:]]+[\\"']?${esc}[\\"']?[,}[:space:]]" "$config_file"
 	}
-	uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=mihomo_rule$/\\1/p' | while read -r sid; do
+		uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=mihomo_rule$/\\1/p' | while read -r sid; do
 		local enabled domain action group rule_type rtype
 		enabled=$(uci -q get mihomo.$sid.enabled)
 		[ "$enabled" = "1" ] || continue
@@ -717,6 +717,30 @@ emit_access_rules_yaml() {
 					logger -t mihomo "access_rule skipped (invalid target): domain=$domain group=$g not found in current proxies/groups"
 				fi
 				;;
+		esac
+	done
+}
+
+# Emit SRC-IP-CIDR rules that bind a LAN device (by IP or CIDR) to a relay chain.
+# The chain is itself a relay proxy-group (airport -> landing ...), so the device's
+# traffic first traverses the subscribed airport node and then the landing hops.
+emit_relay_bind_rules_yaml() {
+	uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=relay_bind$/\\1/p' | while read -r sid; do
+		local enabled src_ip chain
+		enabled=$(uci -q get mihomo.$sid.enabled); [ "$enabled" = "1" ] || continue
+		src_ip=$(uci -q get mihomo.$sid.src_ip); [ -n "$src_ip" ] || continue
+		chain=$(uci -q get mihomo.$sid.chain); [ -n "$chain" ] || continue
+		# The target must be a defined & enabled relay chain (its relay group is
+		# injected by prepare_config, so validate against UCI rather than the file).
+		local found
+		found=$(uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=relay_chain$/\\1/p' | while read -r cs; do
+			[ "$(uci -q get mihomo.$cs.enabled)" = "1" ] || continue
+			[ "$(uci -q get mihomo.$cs.name)" = "$chain" ] && echo "$cs"
+		done)
+		[ -n "$found" ] || { logger -t mihomo "relay_bind '$src_ip' skipped: chain '$chain' not found/enabled"; continue; }
+		case "$src_ip" in
+			*/*) echo "  - 'SRC-IP-CIDR,$src_ip,$chain'" ;;
+			*)   echo "  - 'SRC-IP-CIDR,$src_ip/32,$chain'" ;;
 		esac
 	done
 }
@@ -1073,6 +1097,7 @@ EOF
 	# access rules, at the top of the rules block (highest priority, first-match).
 	local rules_file="${run_config}.rules"
 	emit_builtin_bypass_rules > "$rules_file"
+	emit_relay_bind_rules_yaml >> "$rules_file"
 	emit_access_rules_yaml "$src_config" >> "$rules_file"
 	# Adblock REJECT rules go AFTER access rules so user whitelist (direct)
 	# entries always win over blanket ad blocking (prevents false positives).
@@ -1106,8 +1131,80 @@ EOF
 		normalize_rules "$run_config"
 	fi
 
+	# Relay (链式代理): read enabled relay_chain UCI sections and inject relay
+	# proxy-groups so multiple nodes/groups can be chained as one selectable
+	# proxy. Spliced into any existing proxy-groups block, else appended.
+	local relay_yaml="${run_config}.relay"
+	emit_relay_groups_yaml "$run_config" > "$relay_yaml"
+	if [ -s "$relay_yaml" ]; then
+		if grep -q '^proxy-groups:' "$run_config"; then
+			awk -v body="$relay_yaml" '
+				/^proxy-groups:[[:space:]]*$/ { print; while ((getline l < body) > 0) print l; next }
+				{ print }
+			' "$run_config" > "${run_config}.tmp" && mv "${run_config}.tmp" "$run_config"
+		else
+			{ echo "proxy-groups:"; cat "$relay_yaml"; } >> "$run_config"
+		fi
+		logger -t mihomo "Injected relay proxy-groups from UCI relay_chain sections"
+	fi
+	rm -f "$relay_yaml"
+
 	echo "SUCCESS: Prepared configuration at $run_config (mode=$config_mode)"
 	return 0
+}
+
+# Collect every usable proxy name (node names from `proxies:` plus group names
+# from `proxy-groups:`) out of the running config, one per line. Relay chains
+# may reference either a concrete node or an existing proxy-group, so both
+# namespaces are returned.
+collect_proxy_names() {
+	local cfg="$1"
+	[ -z "$cfg" ] || [ ! -f "$cfg" ] && return 0
+	tr -d '\\r' < "$cfg" | awk '
+		function strip(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); gsub(/^"|"$/,"",s); return s }
+		/^proxies:/     { inb=1; next }
+		/^proxy-groups:/ { inb=1; next }
+		/^[a-zA-Z]/ && $0 !~ /^[[:space:]]/ { inb=0 }
+		inb && /^[[:space:]]*-[[:space:]]*name:/ { s=$0; sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/,"",s); print strip(s) }
+	'
+}
+
+# Emit relay proxy-group items (the list body under `proxy-groups:`) for every
+# enabled relay_chain UCI section whose hops all resolve to a known proxy/group
+# name. Items are printed WITHOUT the `proxy-groups:` header so the caller can
+# splice them into an existing block or append a fresh one. The candidate pool
+# for every hop is the full set of proxies/groups, giving the user freedom to
+# switch any hop to any node/group at runtime.
+emit_relay_groups_yaml() {
+	local cfg="$1"
+	[ -z "$cfg" ] && return 0
+	local chains
+	chains=$(uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=relay_chain$/\\1/p')
+	[ -z "$chains" ] && return 0
+	local pool
+	pool=$(collect_proxy_names "$cfg")
+	[ -z "$pool" ] && return 0
+
+	local sid en cname hops h valid
+	for sid in $chains; do
+		en=$(uci -q get mihomo.$sid.enabled); [ "$en" = "1" ] || continue
+		cname=$(uci -q get mihomo.$sid.name); [ -n "$cname" ] || continue
+		hops=$(uci -q get mihomo.$sid.hops); [ -n "$hops" ] || continue
+		valid=1
+		for h in $hops; do
+			if ! echo "$pool" | grep -qx "$h"; then
+				logger -t mihomo "relay chain '$cname' skipped: hop '$h' not found in proxies/groups"
+				valid=0; break
+			fi
+		done
+		[ "$valid" = "1" ] || continue
+		echo "  - name: \\"$cname\\""
+		echo "    type: relay"
+		echo "    proxies:"
+		echo "$pool" | while read -r p; do
+			[ -n "$p" ] && echo "      - \\"$p\\""
+		done
+	done
 }
 
 get_proxy_groups() {
@@ -1131,6 +1228,30 @@ select_node() {
 		-H "Content-Type: application/json" \\
 		-d "{\\"name\\":\\"${node_esc}\\"}" \\
 		"http://127.0.0.1:${API_PORT}/proxies/${group_enc}" 2>&1)
+	local code=$?
+	if [ $code -ne 0 ]; then
+		echo "Network error: $resp" >&2
+		return $code
+	fi
+	if [ -n "$resp" ]; then
+		echo "$resp" >&2
+		return 1
+	fi
+	return 0
+}
+
+select_relay() {
+	# Set a relay (chain) proxy group's full chain. $2 is a JSON array of node
+	# names, one per hop, in chain order, e.g. '["entry","mid","exit"]'.
+	local group="$1" arr="$2"
+	if [ -z "$group" ] || [ -z "$arr" ]; then
+		echo "ERROR: Group and chain (JSON array) must be specified" >&2
+		return 1
+	fi
+	local group_enc
+	group_enc=$(urlencode "$group")
+	local resp
+	resp=$(mihomo_curl -sS -X PUT -H "Content-Type: application/json" -d "{\\"name\\":$arr}" "http://127.0.0.1:${API_PORT}/proxies/${group_enc}" 2>&1)
 	local code=$?
 	if [ $code -ne 0 ]; then
 		echo "Network error: $resp" >&2
@@ -2033,6 +2154,9 @@ case "$1" in
 	select_node)
 		select_node "$2" "$3"
 		;;
+	select_relay)
+		select_relay "$2" "$3"
+		;;
 	get_connections)
 		get_connections
 		;;
@@ -2091,7 +2215,7 @@ case "$1" in
 		set_adblock_enabled "$2"
 		;;
 	*)
-		echo "Usage: $0 {get_arch|get_lan_ip|get_lan_ip6|emit_tproxy_rules|check_core|download_core|update_geox|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes|test_connectivity|traffic_loop|get_traffic|reset_traffic_domains|get_adblock_sources|add_adblock_source|del_adblock_source|toggle_adblock_source}"
+		echo "Usage: $0 {get_arch|get_lan_ip|get_lan_ip6|emit_tproxy_rules|check_core|download_core|update_geox|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|select_relay|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes|test_connectivity|traffic_loop|get_traffic|reset_traffic_domains|get_adblock_sources|add_adblock_source|del_adblock_source|toggle_adblock_source}"
 		exit 1
 		;;
 esac
@@ -3255,6 +3379,7 @@ return view.extend({
 		var group_rows = [];
 		var group_names = Object.keys(proxy_groups);
 		var selector_groups_count = 0;
+		var relay_groups_count = 0;
 
 		for (var i = 0; i < group_names.length; i++) {
 			var gname = group_names[i];
@@ -3296,9 +3421,54 @@ return view.extend({
 				group_rows.push(E('tr', {}, [
 					E('td', { 'style': 'font-weight: bold; vertical-align: middle; padding: 8px;' }, gname),
 					E('td', { 'style': 'vertical-align: middle; padding: 8px;' }, E('span', { 'class': 'label info', 'style': 'background-color: #17a2b8; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px;' }, g.type.toUpperCase())),
-					E('td', { 'style': 'vertical-align: middle; padding: 8px;' }, select_el)
-				]));
+				E('td', { 'style': 'vertical-align: middle; padding: 8px;' }, select_el)
+			]));
+		} else if (g && g.type === 'relay' && g.all && g.all.length) {
+			relay_groups_count++;
+
+			var nowArr = (g.now && typeof g.now === 'string') ? g.now.split(',') : [];
+			var hop_selects = [];
+			for (var h = 0; h < g.all.length; h++) {
+				var opts = [];
+				for (var k = 0; k < g.all[h].length; k++) {
+					var nm = g.all[h][k];
+					opts.push(E('option', {
+						'value': nm,
+						'selected': (nowArr[h] === nm) ? 'selected' : null
+					}, nm));
+				}
+				var sel = E('select', {
+					'class': 'cbi-input-select relay-hop',
+					'style': 'margin: 2px 4px 2px 0; min-width: 120px; padding: 4px; border-radius: 4px; border: 1px solid rgba(0,0,0,0.15); background: white;',
+					'data-group': gname,
+					'data-hop': h,
+					'change': function(ev) {
+						var grp = ev.target.getAttribute('data-group');
+						var sels = document.querySelectorAll('select.relay-hop[data-group="' + grp + '"]');
+						var arr = [];
+						for (var s = 0; s < sels.length; s++) arr.push(sels[s].value);
+						var payload = JSON.stringify(arr);
+						ui.addNotification(null, E('p', _('正在切换链路：') + grp), 'info');
+						return fs.exec('/usr/share/mihomo/helper.sh', ['select_relay', grp, payload]).then(function(res) {
+							if (res.code === 0) {
+								ui.addNotification(null, E('p', _('链路切换成功！')), 'info');
+							} else {
+								ui.addNotification(null, E('p', _('链路切换失败：') + (res.stderr || res.stdout || '')), 'danger');
+							}
+						}).catch(function(err) {
+							ui.addNotification(null, E('p', _('通信错误：') + err.message), 'danger');
+						});
+					}
+				}, opts);
+				hop_selects.push(sel);
 			}
+
+			group_rows.push(E('tr', {}, [
+				E('td', { 'style': 'font-weight: bold; vertical-align: middle; padding: 8px;' }, gname),
+				E('td', { 'style': 'vertical-align: middle; padding: 8px;' }, E('span', { 'class': 'label', 'style': 'background-color: #6c5ce7; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px;' }, 'RELAY')),
+				E('td', { 'style': 'vertical-align: middle; padding: 8px;' }, hop_selects)
+			]));
+		}
 		}
 
 		var auto_setup_btn = E('button', {
@@ -3393,7 +3563,7 @@ return view.extend({
 			}
 		}, _('自动设置代理'));
 		var proxy_groups_panel;
-		if (controller_up && selector_groups_count > 0) {
+		if (controller_up && (selector_groups_count + relay_groups_count) > 0) {
 			proxy_groups_panel = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
 				E('div', { 'style': 'display: flex; align-items: center; justify-content: space-between; margin-top: 0; margin-bottom: 15px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, [
 					E('h3', { 'style': 'margin: 0;' }, _('分流策略组管理 (实时切换节点)')),
@@ -4189,6 +4359,44 @@ return view.extend({
 				}
 			}, _('立即更新 Geo'));
 		};
+
+		// 链式代理 (Relay 多跳) 管理
+		s = m.section(form.TypedSection, 'relay_chain', _('链式代理 (Relay 多跳)'));
+		s.anonymous = false;
+		s.addremove = true;
+		s.sortable = false;
+		s.description = _('将多个节点 / 策略组按顺序串联成一条链路（如 入口 → 落地），生成可在策略组或其它规则中选用的 relay 代理。每个「跳」可填订阅中的节点名，或已有的策略组名。保存并重启核心后生效。');
+
+		o = s.option(form.Value, 'name', _('链路名称'), _('该链式代理在 Mihomo 中的显示名称，将作为一个可用代理出现在策略组列表中。'));
+		o.rmempty = false;
+
+		o = s.option(form.Flag, 'enabled', _('启用'), _('关闭后该链路不会注入运行配置。'));
+		o.rmempty = false;
+		o.default = '1';
+
+		o = s.option(form.DynamicList, 'hops', _('链路节点（按中转顺序）'), _('按出口链路顺序从上到下填写，例如第一跳为入口节点、最后一跳为落地节点。每跳填入订阅中的节点名，或已有的策略组名。保存后可在「运行状态」页面按跳实时切换。'));
+		o.rmempty = false;
+
+		// 设备链路绑定：按本机 IP / 网段把流量导向某条 relay 链路
+		s = m.section(form.TypedSection, 'relay_bind', _('设备链路绑定'));
+		s.anonymous = false;
+		s.addremove = true;
+		s.sortable = false;
+		s.description = _('把指定局域网设备（IP 或网段）的流量路由到某条「链式代理」：设备流量先走订阅机场节点，再依次经过链路中的落地点。需先在上方的「链式代理」中定义好链路，保存并重启核心后生效。');
+
+		o = s.option(form.Flag, 'enabled', _('启用'));
+		o.rmempty = false;
+		o.default = '1';
+
+		o = s.option(form.Value, 'src_ip', _('本机 IP / 网段'), _('局域网设备 IP（如 192.168.1.100）或 CIDR 网段（如 192.168.1.0/24）。匹配该来源的设备流量将走所选链路。'));
+		o.rmempty = false;
+
+		o = s.option(form.ListValue, 'chain', _('绑定链路'), _('选择该设备要使用的链式代理（机场 → 落地）。'));
+		o.rmempty = false;
+		uci.sections('mihomo', 'relay_chain', function(sec) {
+			var nm = sec.name;
+			if (nm) o.value(nm, nm);
+		});
 
 		return m.render().then(function(node) {
 			setTimeout(function() {
