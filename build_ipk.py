@@ -9,7 +9,7 @@ import tarfile
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-ssproxy"
-PKG_VERSION = "1.0.0-172"
+PKG_VERSION = "1.0.0-173"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -4149,6 +4149,7 @@ return view.extend({
 'require form';
 'require ui';
 'require fs';
+'require uci';
 
 return view.extend({
 	render: function() {
