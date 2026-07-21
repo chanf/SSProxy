@@ -9,7 +9,7 @@ embedded `helper.sh` backend.
 # one-time: create the venv and install pytest
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
-# run everything (104 tests)
+# run everything (136 tests)
 .venv/bin/python -m pytest tests/ -v
 ```
 
@@ -37,6 +37,7 @@ tests/
     test_get_schedule.py
     test_resolve_proxy_name.py
     test_get_arch.py
+    test_chain_proxy.py         # landing proxies + fixed two-hop data links
 ```
 
 ## How shell tests work

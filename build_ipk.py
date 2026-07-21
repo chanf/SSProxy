@@ -9,7 +9,7 @@ import tarfile
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-ssproxy"
-PKG_VERSION = "1.0.0-173"
+PKG_VERSION = "1.0.0-189"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -25,13 +25,53 @@ Section: luci
 Priority: optional
 Description: Lightweight Mihomo (Clash Meta) client for iStoreOS with Firewall4 (nftables) integration
 """,
+
+    # Back up the complete UCI file before upgrade. The backup lives outside
+    # the package manifest, so both chain records and other user settings can
+    # survive remove/install cycles as well as ordinary upgrades.
+    "CONTROL/preinst": """#!/bin/sh
+if [ -z "$IPKG_INSTROOT" ]; then
+    config_file="${MIHOMO_UCI_CONFIG:-/etc/config/mihomo}"
+    backup_file="${MIHOMO_UCI_BACKUP:-/etc/mihomo/.uci_config_backup}"
+    if [ -s "$config_file" ]; then
+        mkdir -p "$(dirname "$backup_file")"
+        cp -f "$config_file" "${backup_file}.tmp" && mv -f "${backup_file}.tmp" "$backup_file"
+        chmod 600 "$backup_file"
+    fi
+fi
+exit 0
+""",
     
     # Post-installation script to clear LuCI index asynchronously
     "CONTROL/postinst": """#!/bin/sh
 if [ -z "$IPKG_INSTROOT" ]; then
-    rm -f /tmp/luci-indexcache
-    rm -f /tmp/luci-modulecache
-    (sleep 3; /etc/init.d/rpcd restart) &
+    config_file="${MIHOMO_UCI_CONFIG:-/etc/config/mihomo}"
+    backup_file="${MIHOMO_UCI_BACKUP:-/etc/mihomo/.uci_config_backup}"
+    if [ -s "$backup_file" ]; then
+        mkdir -p "$(dirname "$config_file")"
+        cp -f "$backup_file" "${config_file}.tmp" && mv -f "${config_file}.tmp" "$config_file"
+        chmod 600 "$config_file"
+    fi
+    if [ "$SSPROXY_SKIP_RUNTIME_HOOKS" != "1" ]; then
+        rm -f /tmp/luci-indexcache
+        rm -f /tmp/luci-modulecache
+        (sleep 3; /etc/init.d/rpcd restart) &
+    fi
+fi
+exit 0
+""",
+
+    # Capture the latest UCI state before a real package removal. This is what
+    # makes a later fresh install restore landing-node and data-link sections.
+    "CONTROL/prerm": """#!/bin/sh
+if [ -z "$IPKG_INSTROOT" ]; then
+    config_file="${MIHOMO_UCI_CONFIG:-/etc/config/mihomo}"
+    backup_file="${MIHOMO_UCI_BACKUP:-/etc/mihomo/.uci_config_backup}"
+    if [ -s "$config_file" ]; then
+        mkdir -p "$(dirname "$backup_file")"
+        cp -f "$config_file" "${backup_file}.tmp" && mv -f "${backup_file}.tmp" "$backup_file"
+        chmod 600 "$backup_file"
+    fi
 fi
 exit 0
 """,
@@ -67,6 +107,7 @@ config mihomo 'config'
 	option tun_enabled '0'
 	option subscription_url ''
 	option test_url ''
+	option chain_front_node 'individual'
 	option auto_update '0'
 	option update_interval '24'
 	option last_update ''
@@ -721,27 +762,218 @@ emit_access_rules_yaml() {
 	done
 }
 
-# Emit SRC-IP-CIDR rules that bind a LAN device (by IP or CIDR) to a relay chain.
-# The chain is itself a relay proxy-group (airport -> landing ...), so the device's
-# traffic first traverses the subscribed airport node and then the landing hops.
-emit_relay_bind_rules_yaml() {
-	uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=relay_bind$/\\1/p' | while read -r sid; do
-		local enabled src_ip chain
-		enabled=$(uci -q get mihomo.$sid.enabled); [ "$enabled" = "1" ] || continue
-		src_ip=$(uci -q get mihomo.$sid.src_ip); [ -n "$src_ip" ] || continue
-		chain=$(uci -q get mihomo.$sid.chain); [ -n "$chain" ] || continue
-		# The target must be a defined & enabled relay chain (its relay group is
-		# injected by prepare_config, so validate against UCI rather than the file).
-		local found
-		found=$(uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=relay_chain$/\\1/p' | while read -r cs; do
-			[ "$(uci -q get mihomo.$cs.enabled)" = "1" ] || continue
-			[ "$(uci -q get mihomo.$cs.name)" = "$chain" ] && echo "$cs"
-		done)
-		[ -n "$found" ] || { logger -t mihomo "relay_bind '$src_ip' skipped: chain '$chain' not found/enabled"; continue; }
-		case "$src_ip" in
-			*/*) echo "  - 'SRC-IP-CIDR,$src_ip,$chain'" ;;
-			*)   echo "  - 'SRC-IP-CIDR,$src_ip/32,$chain'" ;;
+# --- Chain proxy: landing-node assets + device data links ---
+
+chain_log() {
+	logger -t mihomo-chain "$*"
+}
+
+yaml_quote() {
+	printf '%s' "$1" | tr '\r\n' '  ' | sed 's/[\\"]/\\&/g'
+}
+
+# Match generated list items to the indentation already used by a subscription.
+# Both 2-space and 4-space list indentation are valid YAML, but mixing them in
+# one block makes later items children of the generated item.
+align_list_body_indent() {
+	local cfg="$1" key="$2" body="$3"
+	[ -f "$cfg" ] && [ -s "$body" ] || return 0
+	local indent
+	indent=$(awk -v key="$key:" '
+		$0 == key { in_block=1; next }
+		in_block && /^[^[:space:]]/ { exit }
+		in_block && /^[[:space:]]*-/ { s=$0; sub(/-.*/, "", s); print length(s); exit }
+	' "$cfg")
+	case "$indent" in ''|*[!0-9]*) return 0 ;; esac
+	[ "$indent" -gt 2 ] || return 0
+	local extra=$((indent - 2))
+	awk -v count="$extra" 'BEGIN { pad=""; for (i=0; i<count; i++) pad=pad " " } { print pad $0 }' "$body" > "${body}.tmp" && mv "${body}.tmp" "$body"
+}
+
+safe_section_id() {
+	printf '%s' "$1" | tr -c 'A-Za-z0-9_' '_'
+}
+
+landing_proxy_name() {
+	echo "ssproxy-landing-$(safe_section_id "$1")"
+}
+
+data_link_group_name() {
+	echo "ssproxy-chain-$(safe_section_id "$1")"
+}
+
+chain_front_node() {
+	local node
+	node=$(uci -q get mihomo.config.chain_front_node)
+	[ -n "$node" ] || node="individual"
+	echo "$node"
+}
+
+effective_data_link_node() {
+	local sid="$1" cfg="$2" quiet="$3" node
+	node=$(chain_front_node)
+	if [ "$node" = "individual" ]; then
+		node=$(uci -q get mihomo.$sid.subscription_node)
+		[ -n "$node" ] || { [ "$quiet" = "1" ] || chain_log "data_link $sid skipped: subscription node required in individual mode"; return 1; }
+	fi
+	if [ -n "$cfg" ] && [ -f "$cfg" ]; then
+		collect_proxy_names "$cfg" | grep -qxF "$node" || { [ "$quiet" = "1" ] || chain_log "data_link $sid skipped: effective front node '$node' not found"; return 1; }
+	fi
+	echo "$node"
+}
+
+landing_node_exists() {
+	local wanted="$1"
+	uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=landing_node$/\\1/p' | grep -qxF "$wanted"
+}
+
+landing_node_valid() {
+	local sid="$1" quiet="$2"
+	local enabled type server port password cipher uuid
+	landing_node_exists "$sid" || { [ "$quiet" = "1" ] || chain_log "landing_node $sid skipped: section not found"; return 1; }
+	enabled=$(uci -q get mihomo.$sid.enabled); [ "$enabled" = "1" ] || return 1
+	type=$(uci -q get mihomo.$sid.type)
+	server=$(uci -q get mihomo.$sid.server)
+	port=$(uci -q get mihomo.$sid.port)
+	case "$port" in ''|*[!0-9]*) [ "$quiet" = "1" ] || chain_log "landing_node $sid skipped: invalid port"; return 1 ;; esac
+	[ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || { [ "$quiet" = "1" ] || chain_log "landing_node $sid skipped: port out of range"; return 1; }
+	[ -n "$server" ] || { [ "$quiet" = "1" ] || chain_log "landing_node $sid skipped: server required"; return 1; }
+	password=$(uci -q get mihomo.$sid.password)
+	cipher=$(uci -q get mihomo.$sid.cipher)
+	uuid=$(uci -q get mihomo.$sid.uuid)
+	case "$type" in
+		socks5|http) ;;
+		ss) [ -n "$cipher" ] && [ -n "$password" ] || { [ "$quiet" = "1" ] || chain_log "landing_node $sid skipped: SS cipher/password required"; return 1; } ;;
+		trojan) [ -n "$password" ] || { [ "$quiet" = "1" ] || chain_log "landing_node $sid skipped: Trojan password required"; return 1; } ;;
+		vmess|vless) [ -n "$uuid" ] || { [ "$quiet" = "1" ] || chain_log "landing_node $sid skipped: UUID required for $type"; return 1; } ;;
+		*) [ "$quiet" = "1" ] || chain_log "landing_node $sid skipped: unsupported type '$type'"; return 1 ;;
+	esac
+	return 0
+}
+
+# Output list entries for the top-level `proxies:` block.
+emit_landing_proxies_yaml() {
+	local only_sid="$1" override_name="$2" dialer_proxy="$3"
+	uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=landing_node$/\\1/p' | while read -r sid; do
+		[ -z "$only_sid" ] || [ "$sid" = "$only_sid" ] || continue
+		landing_node_valid "$sid" || continue
+		local name type server port username password cipher uuid alter_id tls sni flow network scv
+		name=$(landing_proxy_name "$sid")
+		[ -z "$override_name" ] || name="$override_name"
+		type=$(uci -q get mihomo.$sid.type)
+		server=$(uci -q get mihomo.$sid.server)
+		port=$(uci -q get mihomo.$sid.port)
+		username=$(uci -q get mihomo.$sid.username)
+		password=$(uci -q get mihomo.$sid.password)
+		cipher=$(uci -q get mihomo.$sid.cipher)
+		uuid=$(uci -q get mihomo.$sid.uuid)
+		alter_id=$(uci -q get mihomo.$sid.alter_id); [ -n "$alter_id" ] || alter_id=0
+		tls=$(uci -q get mihomo.$sid.tls)
+		sni=$(uci -q get mihomo.$sid.sni)
+		flow=$(uci -q get mihomo.$sid.flow)
+		network=$(uci -q get mihomo.$sid.network); [ -n "$network" ] || network=tcp
+		scv=$(uci -q get mihomo.$sid.skip_cert_verify)
+		echo "  - name: \\"$(yaml_quote "$name")\\""
+		echo "    type: $type"
+		echo "    server: \\"$(yaml_quote "$server")\\""
+		echo "    port: $port"
+		[ -n "$dialer_proxy" ] && echo "    dialer-proxy: \\"$(yaml_quote "$dialer_proxy")\\""
+		case "$type" in
+			socks5|http)
+				[ -n "$username" ] && echo "    username: \\"$(yaml_quote "$username")\\""
+				[ -n "$password" ] && echo "    password: \\"$(yaml_quote "$password")\\""
+				[ "$tls" = "1" ] && echo "    tls: true"
+				[ "$scv" = "1" ] && echo "    skip-cert-verify: true"
+				[ "$type" = "socks5" ] && echo "    udp: true"
+				;;
+			ss)
+				echo "    cipher: \\"$(yaml_quote "$cipher")\\""
+				echo "    password: \\"$(yaml_quote "$password")\\""
+				echo "    udp: true"
+				;;
+			trojan)
+				echo "    password: \\"$(yaml_quote "$password")\\""
+				[ -n "$sni" ] && echo "    sni: \\"$(yaml_quote "$sni")\\""
+				[ "$scv" = "1" ] && echo "    skip-cert-verify: true"
+				echo "    udp: true"
+				;;
+			vmess)
+				echo "    uuid: \\"$(yaml_quote "$uuid")\\""
+				echo "    alterId: $alter_id"
+				echo "    cipher: \\"$(yaml_quote "${cipher:-auto}")\\""
+				echo "    network: $network"
+				[ "$tls" = "1" ] && echo "    tls: true"
+				[ -n "$sni" ] && echo "    servername: \\"$(yaml_quote "$sni")\\""
+				[ "$scv" = "1" ] && echo "    skip-cert-verify: true"
+				echo "    udp: true"
+				;;
+			vless)
+				echo "    uuid: \\"$(yaml_quote "$uuid")\\""
+				echo "    network: $network"
+				[ -n "$flow" ] && echo "    flow: \\"$(yaml_quote "$flow")\\""
+				[ "$tls" = "1" ] && echo "    tls: true"
+				[ -n "$sni" ] && echo "    servername: \\"$(yaml_quote "$sni")\\""
+				[ "$scv" = "1" ] && echo "    skip-cert-verify: true"
+				echo "    udp: true"
+				;;
 		esac
+	done
+}
+
+data_link_valid() {
+	local sid="$1" cfg="$2" quiet="$3"
+	local enabled device sub landing
+	enabled=$(uci -q get mihomo.$sid.enabled); [ "$enabled" = "1" ] || return 1
+	device=$(uci -q get mihomo.$sid.device_ip)
+	landing=$(uci -q get mihomo.$sid.landing_node)
+	[ -n "$device" ] && [ -n "$landing" ] || { [ "$quiet" = "1" ] || chain_log "data_link $sid skipped: device/landing required"; return 1; }
+	case "$device" in *[!0-9A-Fa-f:./]*) [ "$quiet" = "1" ] || chain_log "data_link $sid skipped: invalid device IP/CIDR"; return 1 ;; esac
+	if [ "${device#*/}" != "$device" ]; then
+		local prefix="${device##*/}" max_prefix=32
+		case "$device" in *:*) max_prefix=128 ;; esac
+		case "$prefix" in ''|*[!0-9]*) [ "$quiet" = "1" ] || chain_log "data_link $sid skipped: invalid CIDR prefix"; return 1 ;; esac
+		[ "$prefix" -le "$max_prefix" ] 2>/dev/null || { [ "$quiet" = "1" ] || chain_log "data_link $sid skipped: CIDR prefix out of range"; return 1; }
+	fi
+	landing_node_valid "$landing" "$quiet" || { [ "$quiet" = "1" ] || chain_log "data_link $sid skipped: landing node '$landing' invalid"; return 1; }
+	sub=$(effective_data_link_node "$sid" "$cfg" "$quiet") || return 1
+	return 0
+}
+
+# Output one landing-proxy clone per data link. `dialer-proxy` makes Mihomo
+# establish the landing connection through the selected subscription node;
+# this replaces the relay group type removed in Mihomo v1.19.x.
+emit_data_link_proxies_yaml() {
+	local cfg="$1"
+	local seen_devices=""
+	uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=data_link$/\\1/p' | while read -r sid; do
+		data_link_valid "$sid" "$cfg" || continue
+		local device sub landing chain_name
+		device=$(uci -q get mihomo.$sid.device_ip)
+		case " $seen_devices " in *" $device "*) chain_log "data_link $sid skipped: duplicate device '$device'"; continue ;; esac
+		seen_devices="$seen_devices $device"
+		sub=$(effective_data_link_node "$sid" "$cfg" 1) || continue
+		landing=$(uci -q get mihomo.$sid.landing_node)
+		chain_name=$(data_link_group_name "$sid")
+		emit_landing_proxies_yaml "$landing" "$chain_name" "$sub"
+	done
+}
+
+# Output source-address rules targeting generated dialer-proxy entries.
+emit_data_link_rules_yaml() {
+	local cfg="$1"
+	local seen_devices=""
+	uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=data_link$/\\1/p' | while read -r sid; do
+		data_link_valid "$sid" "$cfg" || continue
+		local device gname rule_type suffix
+		device=$(uci -q get mihomo.$sid.device_ip)
+		case " $seen_devices " in *" $device "*) continue ;; esac
+		seen_devices="$seen_devices $device"
+		gname=$(data_link_group_name "$sid")
+		case "$device" in
+			*:*) rule_type="SRC-IP-CIDR6"; case "$device" in */*) suffix="" ;; *) suffix="/128" ;; esac ;;
+			*) rule_type="SRC-IP-CIDR"; case "$device" in */*) suffix="" ;; *) suffix="/32" ;; esac ;;
+		esac
+		echo "  - '$rule_type,$device$suffix,$gname'"
 	done
 }
 
@@ -979,6 +1211,13 @@ prepare_config() {
 	# Copy source config to temp running config
 	cp "$src_config" "$run_config"
 
+	# Mihomo warns that HTTP health checks are unreliable because providers may
+	# hijack them or mishandle repeated HEAD requests. Preserve the configured
+	# host/path while upgrading generate_204 probes to HTTPS. This covers both
+	# block-style health-check.url and inline proxy-group url fields without
+	# touching unrelated HTTP rule-provider downloads.
+	sed -i 's#http://\\([^ \",}]*generate_204\\)#https://\\1#g' "$run_config"
+
 	# Strip existing dns and tun blocks to avoid duplicate key errors
 	awk -v in_block=0 '
 	/^dns:/ || /^tun:/ { in_block=1; next }
@@ -1097,7 +1336,7 @@ EOF
 	# access rules, at the top of the rules block (highest priority, first-match).
 	local rules_file="${run_config}.rules"
 	emit_builtin_bypass_rules > "$rules_file"
-	emit_relay_bind_rules_yaml >> "$rules_file"
+	emit_data_link_rules_yaml "$src_config" >> "$rules_file"
 	emit_access_rules_yaml "$src_config" >> "$rules_file"
 	# Adblock REJECT rules go AFTER access rules so user whitelist (direct)
 	# entries always win over blanket ad blocking (prevents false positives).
@@ -1131,80 +1370,87 @@ EOF
 		normalize_rules "$run_config"
 	fi
 
-	# Relay (链式代理): read enabled relay_chain UCI sections and inject relay
-	# proxy-groups so multiple nodes/groups can be chained as one selectable
-	# proxy. Spliced into any existing proxy-groups block, else appended.
-	local relay_yaml="${run_config}.relay"
-	emit_relay_groups_yaml "$run_config" > "$relay_yaml"
-	if [ -s "$relay_yaml" ]; then
-		if grep -q '^proxy-groups:' "$run_config"; then
-			awk -v body="$relay_yaml" '
-				/^proxy-groups:[[:space:]]*$/ { print; while ((getline l < body) > 0) print l; next }
+	# Inject user-managed landing proxies before generating fixed two-hop links.
+	local landing_yaml="${run_config}.landing"
+	emit_landing_proxies_yaml > "$landing_yaml"
+	if [ -s "$landing_yaml" ]; then
+		align_list_body_indent "$run_config" "proxies" "$landing_yaml"
+		if grep -q '^proxies:[[:space:]]*\[\][[:space:]]*$' "$run_config"; then
+			awk -v body="$landing_yaml" '
+				/^proxies:[[:space:]]*\[\][[:space:]]*$/ { print "proxies:"; while ((getline l < body) > 0) print l; next }
+				{ print }
+			' "$run_config" > "${run_config}.tmp" && mv "${run_config}.tmp" "$run_config"
+		elif grep -q '^proxies:[[:space:]]*$' "$run_config"; then
+			awk -v body="$landing_yaml" '
+				/^proxies:[[:space:]]*$/ { print; while ((getline l < body) > 0) print l; next }
 				{ print }
 			' "$run_config" > "${run_config}.tmp" && mv "${run_config}.tmp" "$run_config"
 		else
-			{ echo "proxy-groups:"; cat "$relay_yaml"; } >> "$run_config"
+			{ echo "proxies:"; cat "$landing_yaml"; } >> "$run_config"
 		fi
-		logger -t mihomo "Injected relay proxy-groups from UCI relay_chain sections"
+		chain_log "landing proxies injected"
 	fi
-	rm -f "$relay_yaml"
+	rm -f "$landing_yaml"
+
+	local chain_yaml="${run_config}.data-links"
+	emit_data_link_proxies_yaml "$run_config" > "$chain_yaml"
+	if [ -s "$chain_yaml" ]; then
+		align_list_body_indent "$run_config" "proxies" "$chain_yaml"
+		if grep -q '^proxies:[[:space:]]*$' "$run_config"; then
+			awk -v body="$chain_yaml" '
+				/^proxies:[[:space:]]*$/ { print; while ((getline l < body) > 0) print l; next }
+				{ print }
+			' "$run_config" > "${run_config}.tmp" && mv "${run_config}.tmp" "$run_config"
+		else
+			{ echo "proxies:"; cat "$chain_yaml"; } >> "$run_config"
+		fi
+		chain_log "data-link dialer proxies injected"
+	fi
+	rm -f "$chain_yaml"
 
 	echo "SUCCESS: Prepared configuration at $run_config (mode=$config_mode)"
 	return 0
 }
 
-# Collect every usable proxy name (node names from `proxies:` plus group names
-# from `proxy-groups:`) out of the running config, one per line. Relay chains
-# may reference either a concrete node or an existing proxy-group, so both
-# namespaces are returned.
+# Collect proxy and proxy-group names from a block-style Mihomo config.
 collect_proxy_names() {
 	local cfg="$1"
 	[ -z "$cfg" ] || [ ! -f "$cfg" ] && return 0
 	tr -d '\\r' < "$cfg" | awk '
-		function strip(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); gsub(/^"|"$/,"",s); return s }
+		function strip(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); gsub(/^["'\''']|["'\''']$/,"",s); return s }
 		/^proxies:/     { inb=1; next }
 		/^proxy-groups:/ { inb=1; next }
 		/^[a-zA-Z]/ && $0 !~ /^[[:space:]]/ { inb=0 }
+		inb && /^[[:space:]]*-[[:space:]]*\{/ {
+			s=$0; sub(/^[[:space:]]*-[[:space:]]*\{[[:space:]]*/,"",s)
+			if (s ~ /^name:[[:space:]]*/) { sub(/^name:[[:space:]]*/,"",s); sub(/,.*/,"",s); print strip(s) }
+			next
+		}
 		inb && /^[[:space:]]*-[[:space:]]*name:/ { s=$0; sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/,"",s); print strip(s) }
 	'
 }
 
-# Emit relay proxy-group items (the list body under `proxy-groups:`) for every
-# enabled relay_chain UCI section whose hops all resolve to a known proxy/group
-# name. Items are printed WITHOUT the `proxy-groups:` header so the caller can
-# splice them into an existing block or append a fresh one. The candidate pool
-# for every hop is the full set of proxies/groups, giving the user freedom to
-# switch any hop to any node/group at runtime.
-emit_relay_groups_yaml() {
-	local cfg="$1"
-	[ -z "$cfg" ] && return 0
-	local chains
-	chains=$(uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=relay_chain$/\\1/p')
-	[ -z "$chains" ] && return 0
-	local pool
-	pool=$(collect_proxy_names "$cfg")
-	[ -z "$pool" ] && return 0
+chain_source_config() {
+	local mode
+	mode=$(uci -q get mihomo.config.config_mode); [ -n "$mode" ] || mode="subscription"
+	if [ "$mode" = "custom" ]; then
+		uci -q get mihomo.config.custom_config_path || echo "/etc/mihomo/custom.yaml"
+	else
+		uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml"
+	fi
+}
 
-	local sid en cname hops h valid
-	for sid in $chains; do
-		en=$(uci -q get mihomo.$sid.enabled); [ "$en" = "1" ] || continue
-		cname=$(uci -q get mihomo.$sid.name); [ -n "$cname" ] || continue
-		hops=$(uci -q get mihomo.$sid.hops); [ -n "$hops" ] || continue
-		valid=1
-		for h in $hops; do
-			if ! echo "$pool" | grep -qx "$h"; then
-				logger -t mihomo "relay chain '$cname' skipped: hop '$h' not found in proxies/groups"
-				valid=0; break
-			fi
-		done
-		[ "$valid" = "1" ] || continue
-		echo "  - name: \\"$cname\\""
-		echo "    type: relay"
-		echo "    proxies:"
-		echo "$pool" | while read -r p; do
-			[ -n "$p" ] && echo "      - \\"$p\\""
-		done
-	done
+set_chain_front_node() {
+	local node="$1" cfg
+	[ -n "$node" ] || node="individual"
+	if [ "$node" != "individual" ]; then
+		cfg=$(chain_source_config)
+		[ -f "$cfg" ] || { echo "ERROR: source config not found" >&2; return 1; }
+		collect_proxy_names "$cfg" | grep -qxF "$node" || { echo "ERROR: front node not found in current config" >&2; return 1; }
+	fi
+	uci -q set mihomo.config.chain_front_node="$node"
+	uci -q commit mihomo
+	printf '{"front_node":"%s"}\n' "$(yaml_quote "$node")"
 }
 
 get_proxy_groups() {
@@ -1228,30 +1474,6 @@ select_node() {
 		-H "Content-Type: application/json" \\
 		-d "{\\"name\\":\\"${node_esc}\\"}" \\
 		"http://127.0.0.1:${API_PORT}/proxies/${group_enc}" 2>&1)
-	local code=$?
-	if [ $code -ne 0 ]; then
-		echo "Network error: $resp" >&2
-		return $code
-	fi
-	if [ -n "$resp" ]; then
-		echo "$resp" >&2
-		return 1
-	fi
-	return 0
-}
-
-select_relay() {
-	# Set a relay (chain) proxy group's full chain. $2 is a JSON array of node
-	# names, one per hop, in chain order, e.g. '["entry","mid","exit"]'.
-	local group="$1" arr="$2"
-	if [ -z "$group" ] || [ -z "$arr" ]; then
-		echo "ERROR: Group and chain (JSON array) must be specified" >&2
-		return 1
-	fi
-	local group_enc
-	group_enc=$(urlencode "$group")
-	local resp
-	resp=$(mihomo_curl -sS -X PUT -H "Content-Type: application/json" -d "{\\"name\\":$arr}" "http://127.0.0.1:${API_PORT}/proxies/${group_enc}" 2>&1)
 	local code=$?
 	if [ $code -ne 0 ]; then
 		echo "Network error: $resp" >&2
@@ -1349,14 +1571,26 @@ get_proxies() {
 	fi
 }
 
-# ---------- 访问日志：实时连接 + 历史采集 + 规则管理 ----------
+# ---------- 访问日志：结构化网络访问记录 ----------
+
+access_log_file="${MIHOMO_ACCESS_LOG_FILE:-/tmp/mihomo_access.log}"
+access_seen_file="${MIHOMO_ACCESS_SEEN_FILE:-/tmp/mihomo_access.seen}"
+
+normalize_access_log() {
+	[ -s "$access_log_file" ] || return 0
+	local lines
+	lines=$(wc -l < "$access_log_file" 2>/dev/null)
+	# Versions before 1.0.0-180 omitted record newlines and produced one giant,
+	# invalid JSON stream. Discard it once instead of returning megabytes to LuCI.
+	[ "${lines:-0}" -eq 0 ] && : > "$access_log_file"
+}
 
 resolve_host() {
 	local ip="$1"
 	local leases="/tmp/dhcp.leases"
 	[ -z "$ip" ] && return 0
 	[ -f "$leases" ] || return 0
-	awk -v ip="$ip" '$3==ip { print $4; exit }' "$leases"
+	awk -v ip="$ip" '$3==ip && $4!="*" { print $4; exit }' "$leases"
 }
 
 flatten_connections() {
@@ -1367,7 +1601,7 @@ flatten_connections() {
 	ips=$(echo "$raw" | jsonfilter -e '$.connections[@].metadata.sourceIP' 2>/dev/null)
 	hosts=$(echo "$raw" | jsonfilter -e '$.connections[@].metadata.host' 2>/dev/null)
 	dst=$(echo "$raw" | jsonfilter -e '$.connections[@].metadata.destinationIP' 2>/dev/null)
-	policy=$(echo "$raw" | jsonfilter -e '$.connections[@].policy' 2>/dev/null)
+	policy=$(echo "$raw" | jsonfilter -e '$.connections[@].chains[0]' 2>/dev/null)
 	rule=$(echo "$raw" | jsonfilter -e '$.connections[@].rule' 2>/dev/null)
 	up=$(echo "$raw" | jsonfilter -e '$.connections[@].upload' 2>/dev/null)
 	down=$(echo "$raw" | jsonfilter -e '$.connections[@].download' 2>/dev/null)
@@ -1416,10 +1650,12 @@ get_connections() {
 
 collect_connections() {
 	local raw logf seenf
-	logf="/tmp/mihomo_access.log"
-	seenf="/tmp/mihomo_access.seen"
+	logf="$access_log_file"
+	seenf="$access_seen_file"
 	raw=$(mihomo_curl -s --connect-timeout 2 "http://127.0.0.1:${API_PORT}/connections" 2>/dev/null)
 	[ -z "$raw" ] && return 0
+	update_data_link_health_from_connections "$raw"
+	normalize_access_log
 	touch "$seenf"
 	flatten_connections "$raw" | while IFS='|' read -r id ip dev host d pol r u dn st; do
 		[ -z "$id" ] && continue
@@ -1427,9 +1663,12 @@ collect_connections() {
 		echo "$id" >> "$seenf"
 		local ts
 		ts=$(date +%s)
-		printf '{"ts":%s,"id":"%s","ip":"%s","device":"%s","domain":"%s","dst":"%s","policy":"%s","rule":"%s","up":%s,"down":%s,"start":"%s"}' "$ts" "$id" "$ip" "$dev" "$host" "$d" "$pol" "$r" "${u:-0}" "${dn:-0}" "$st" >> "$logf"
+		printf '{"ts":%s,"id":"%s","ip":"%s","device":"%s","domain":"%s","dst":"%s","policy":"%s","rule":"%s","up":%s,"down":%s,"start":"%s"}\n' "$ts" "$id" "$ip" "$dev" "$host" "$d" "$pol" "$r" "${u:-0}" "${dn:-0}" "$st" >> "$logf"
 	done
 	tail -n 2000 "$seenf" > "$seenf.tmp" && mv "$seenf.tmp" "$seenf"
+	if [ -f "$logf" ] && [ "$(wc -l < "$logf")" -gt 2000 ]; then
+		tail -n 2000 "$logf" > "$logf.tmp" && mv "$logf.tmp" "$logf"
+	fi
 }
 
 collect_loop() {
@@ -1458,6 +1697,7 @@ collect_traffic() {
 	bkmon=$(TZ=UTC-8 date +%Y-%m)
 	raw=$(mihomo_curl -s --connect-timeout 2 "http://127.0.0.1:${API_PORT}/connections" 2>/dev/null)
 	[ -z "$raw" ] && return 0
+	collect_data_link_traffic "$raw"
 	tmpd=$(mktemp -d)
 	printf '%s' "$raw" | jsonfilter -e '$.connections[@].id' 2>/dev/null > "$tmpd/id"
 	printf '%s' "$raw" | jsonfilter -e '$.connections[@].chains[0]' 2>/dev/null > "$tmpd/ch"
@@ -1750,8 +1990,9 @@ TikTok|https://www.tiktok.com"
 }
 
 get_history() {
-	local logf="/tmp/mihomo_access.log"
+	local logf="$access_log_file"
 	local limit="${1:-200}"
+	normalize_access_log
 	[ -f "$logf" ] || { echo "[]"; return 0; }
 	echo "["
 	first=1
@@ -1762,6 +2003,24 @@ get_history() {
 		printf '%s' "$line"
 	done
 	echo "]"
+}
+
+clear_access_log() {
+	# Mark every connection that is already active as seen before truncating the
+	# file. Otherwise a connection established just before the click but not yet
+	# sampled would immediately reappear and make the clear action look broken.
+	local raw id
+	raw=$(mihomo_curl -s --connect-timeout 2 "http://127.0.0.1:${API_PORT}/connections" 2>/dev/null)
+	if [ -n "$raw" ]; then
+		touch "$access_seen_file"
+		printf '%s' "$raw" | jsonfilter -e '$.connections[@].id' 2>/dev/null | while IFS= read -r id; do
+			[ -n "$id" ] || continue
+			grep -qxF "$id" "$access_seen_file" 2>/dev/null || echo "$id" >> "$access_seen_file"
+		done
+		tail -n 2000 "$access_seen_file" > "${access_seen_file}.tmp" && mv "${access_seen_file}.tmp" "$access_seen_file"
+	fi
+	: > "$access_log_file"
+	echo "OK"
 }
 
 get_access_rules() {
@@ -1993,6 +2252,225 @@ get_core_log() {
 		logread -e mihomo 2>/dev/null | tail -n "$lines"
 	fi
 }
+
+get_chain_status() {
+	local run_config="/tmp/mihomo_run.yaml"
+	local controller=0 landing_total landing_enabled landing_valid link_total link_enabled link_valid runtime_landing=0 runtime_links=0
+	mihomo_curl -s -m 2 "http://127.0.0.1:${API_PORT}/version" >/dev/null 2>&1 && controller=1
+	landing_total=$(uci -X show mihomo 2>/dev/null | grep -c '=landing_node$')
+	landing_enabled=$(uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=landing_node$/\\1/p' | while read -r sid; do [ "$(uci -q get mihomo.$sid.enabled)" = "1" ] && echo 1; done | wc -l | tr -d ' ')
+	landing_valid=$(uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=landing_node$/\\1/p' | while read -r sid; do landing_node_valid "$sid" 1 && echo 1; done | wc -l | tr -d ' ')
+	link_total=$(uci -X show mihomo 2>/dev/null | grep -c '=data_link$')
+	link_enabled=$(uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=data_link$/\\1/p' | while read -r sid; do [ "$(uci -q get mihomo.$sid.enabled)" = "1" ] && echo 1; done | wc -l | tr -d ' ')
+	link_valid=$(uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=data_link$/\\1/p' | while read -r sid; do data_link_valid "$sid" "$run_config" 1 && echo 1; done | wc -l | tr -d ' ')
+	if [ -f "$run_config" ]; then
+		runtime_landing=$(grep -c 'name: "ssproxy-landing-' "$run_config" 2>/dev/null)
+		runtime_links=$(grep -c 'name: "ssproxy-chain-' "$run_config" 2>/dev/null)
+	fi
+	echo "{\\"controller\\":$controller,\\"run_config\\":$([ -f "$run_config" ] && echo 1 || echo 0),\\"landing_total\\":${landing_total:-0},\\"landing_enabled\\":${landing_enabled:-0},\\"landing_valid\\":${landing_valid:-0},\\"link_total\\":${link_total:-0},\\"link_enabled\\":${link_enabled:-0},\\"link_valid\\":${link_valid:-0},\\"runtime_landing\\":${runtime_landing:-0},\\"runtime_links\\":${runtime_links:-0}}"
+}
+
+get_chain_log() {
+	local lines="${1:-100}"
+	case "$lines" in ''|*[!0-9]*) lines=100 ;; esac
+	[ "$lines" -gt 500 ] && lines=500
+	logread -e mihomo-chain 2>/dev/null | tail -n "$lines"
+}
+
+data_link_health_file="${MIHOMO_DATA_LINK_HEALTH_FILE:-/tmp/mihomo_data_link_health}"
+data_link_metrics_file="${MIHOMO_DATA_LINK_METRICS_FILE:-/tmp/mihomo_data_link_metrics}"
+data_link_conn_state_file="${MIHOMO_DATA_LINK_CONN_STATE_FILE:-/tmp/mihomo_data_link_conn_state}"
+data_link_last_poll_file="${MIHOMO_DATA_LINK_LAST_POLL_FILE:-/tmp/mihomo_data_link_last_poll}"
+data_link_flush_file="${MIHOMO_DATA_LINK_FLUSH_FILE:-/tmp/mihomo_data_link_flush}"
+data_link_persist_file="${MIHOMO_DATA_LINK_PERSIST_FILE:-/etc/mihomo/.data_link_traffic}"
+
+mark_data_link_healthy() {
+	local sid="$1"
+	[ -n "$sid" ] || return 1
+	uci -X show mihomo 2>/dev/null | grep -q "^mihomo\.$sid=data_link$" || return 1
+	touch "$data_link_health_file"
+	grep -qxF "$sid" "$data_link_health_file" 2>/dev/null || echo "$sid" >> "$data_link_health_file"
+}
+
+update_data_link_health_from_connections() {
+	local raw="$1"
+	[ -n "$raw" ] || return 0
+	uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=data_link$/\\1/p' | while read -r sid; do
+		local group
+		group=$(data_link_group_name "$sid")
+		printf '%s' "$raw" | grep -qF "$group" && mark_data_link_healthy "$sid"
+	done
+}
+
+resolve_data_link_sid() {
+	local source_ip="$1" policy="$2" chain="$3"
+	uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=data_link$/\\1/p' | while read -r sid; do
+		[ "$(uci -q get mihomo.$sid.enabled)" = "1" ] || continue
+		local device group
+		device=$(uci -q get mihomo.$sid.device_ip)
+		group=$(data_link_group_name "$sid")
+		if [ "$policy" = "$group" ] || [ "$chain" = "$group" ]; then
+			echo "$sid"
+			break
+		fi
+		case "$device" in
+			*/*) ;;
+			*) [ -n "$source_ip" ] && [ "$source_ip" = "$device" ] && { echo "$sid"; break; } ;;
+		esac
+	done
+}
+
+collect_data_link_traffic() {
+	local raw="$1" now last elapsed tmpd
+	[ -n "$raw" ] || return 0
+	now=$(date +%s)
+	last=$(cat "$data_link_last_poll_file" 2>/dev/null)
+	case "$last" in ''|*[!0-9]*) last=$((now - 5)) ;; esac
+	elapsed=$((now - last)); [ "$elapsed" -lt 1 ] && elapsed=1; [ "$elapsed" -gt 60 ] && elapsed=5
+	echo "$now" > "$data_link_last_poll_file"
+	tmpd=$(mktemp -d)
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].id' 2>/dev/null > "$tmpd/id"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].metadata.sourceIP' 2>/dev/null > "$tmpd/ip"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].policy' 2>/dev/null > "$tmpd/policy"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].chains[0]' 2>/dev/null > "$tmpd/chain"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].upload' 2>/dev/null > "$tmpd/up"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].download' 2>/dev/null > "$tmpd/down"
+	touch "$data_link_conn_state_file" "$data_link_metrics_file"
+	if [ ! -f "$data_link_persist_file" ]; then
+		mkdir -p "$(dirname "$data_link_persist_file")"
+		: > "$data_link_persist_file"
+	fi
+	: > "$tmpd/state.new"
+	: > "$tmpd/delta"
+	awk '{print NR, $0}' "$tmpd/id" | while read -r n cid; do
+		[ -n "$cid" ] || continue
+		local ip policy chain up down sid previous prev_up=0 prev_down=0 delta_up delta_down
+		ip=$(sed -n "${n}p" "$tmpd/ip")
+		policy=$(sed -n "${n}p" "$tmpd/policy")
+		chain=$(sed -n "${n}p" "$tmpd/chain")
+		up=$(sed -n "${n}p" "$tmpd/up"); case "$up" in ''|*[!0-9]*) up=0 ;; esac
+		down=$(sed -n "${n}p" "$tmpd/down"); case "$down" in ''|*[!0-9]*) down=0 ;; esac
+		sid=$(resolve_data_link_sid "$ip" "$policy" "$chain")
+		[ -n "$sid" ] || continue
+		previous=$(awk -F'|' -v id="$cid" '$1==id { print $3 "|" $4; exit }' "$data_link_conn_state_file")
+		if [ -n "$previous" ]; then prev_up=${previous%%|*}; prev_down=${previous#*|}; fi
+		delta_up=$((up - prev_up)); [ "$delta_up" -lt 0 ] && delta_up=$up
+		delta_down=$((down - prev_down)); [ "$delta_down" -lt 0 ] && delta_down=$down
+		echo "$cid|$sid|$up|$down" >> "$tmpd/state.new"
+		echo "$sid|$delta_up|$delta_down" >> "$tmpd/delta"
+	done
+	mv "$tmpd/state.new" "$data_link_conn_state_file"
+	awk -F'|' '{ up[$1]+=$2; down[$1]+=$3 } END { for (sid in up) print sid "|" up[sid] "|" down[sid] }' "$tmpd/delta" > "$tmpd/aggregate"
+	: > "$tmpd/metrics.new"
+	uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=data_link$/\\1/p' | while read -r sid; do
+		local delta previous total_up=0 total_down=0 delta_up=0 delta_down=0 up_rate down_rate
+		delta=$(awk -F'|' -v sid="$sid" '$1==sid { print $2 "|" $3; exit }' "$tmpd/aggregate")
+		if [ -n "$delta" ]; then delta_up=${delta%%|*}; delta_down=${delta#*|}; fi
+		previous=$(awk -F'|' -v sid="$sid" '$1==sid { print $4 "|" $5; exit }' "$data_link_metrics_file")
+		if [ -z "$previous" ]; then previous=$(awk -F'|' -v sid="$sid" '$1==sid { print $2 "|" $3; exit }' "$data_link_persist_file"); fi
+		if [ -n "$previous" ]; then total_up=${previous%%|*}; total_down=${previous#*|}; fi
+		total_up=$((total_up + delta_up)); total_down=$((total_down + delta_down))
+		up_rate=$((delta_up / elapsed)); down_rate=$((delta_down / elapsed))
+		echo "$sid|$up_rate|$down_rate|$total_up|$total_down|$now" >> "$tmpd/metrics.new"
+	done
+	mv "$tmpd/metrics.new" "$data_link_metrics_file"
+	local last_flush
+	last_flush=$(cat "$data_link_flush_file" 2>/dev/null); case "$last_flush" in ''|*[!0-9]*) last_flush=0 ;; esac
+	if [ $((now - last_flush)) -ge 60 ]; then
+		mkdir -p "$(dirname "$data_link_persist_file")"
+		awk -F'|' '{ print $1 "|" $4 "|" $5 }' "$data_link_metrics_file" > "${data_link_persist_file}.tmp" && mv "${data_link_persist_file}.tmp" "$data_link_persist_file"
+		echo "$now" > "$data_link_flush_file"
+	fi
+	rm -rf "$tmpd"
+}
+
+get_data_link_health() {
+	echo "["
+	local first=1
+	uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=data_link$/\\1/p' | while read -r sid; do
+		grep -qxF "$sid" "$data_link_health_file" 2>/dev/null || continue
+		[ $first -eq 0 ] && printf ','
+		first=0
+		printf '"%s"' "$sid"
+	done
+	echo "]"
+}
+
+get_data_link_metrics() {
+	echo "["
+	local first=1
+	uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=data_link$/\\1/p' | while read -r sid; do
+		local row up_rate=0 down_rate=0 total_up=0 total_down=0 updated=0 healthy=0
+		row=$(awk -F'|' -v sid="$sid" '$1==sid { print $2 "|" $3 "|" $4 "|" $5 "|" $6; exit }' "$data_link_metrics_file" 2>/dev/null)
+		if [ -n "$row" ]; then
+			up_rate=${row%%|*}; row=${row#*|}; down_rate=${row%%|*}; row=${row#*|}
+			total_up=${row%%|*}; row=${row#*|}; total_down=${row%%|*}; updated=${row#*|}
+		else
+			row=$(awk -F'|' -v sid="$sid" '$1==sid { print $2 "|" $3; exit }' "$data_link_persist_file" 2>/dev/null)
+			if [ -n "$row" ]; then total_up=${row%%|*}; total_down=${row#*|}; fi
+		fi
+		grep -qxF "$sid" "$data_link_health_file" 2>/dev/null && healthy=1
+		[ $first -eq 0 ] && printf ','
+		first=0
+		printf '{"sid":"%s","up_rate":%s,"down_rate":%s,"total_up":%s,"total_down":%s,"updated":%s,"healthy":%s}' "$sid" "${up_rate:-0}" "${down_rate:-0}" "${total_up:-0}" "${total_down:-0}" "${updated:-0}" "$healthy"
+	done
+	echo "]"
+}
+
+reset_data_link_health() {
+	: > "$data_link_health_file"
+	: > "$data_link_metrics_file"
+	: > "$data_link_conn_state_file"
+	: > "$data_link_persist_file"
+	: > "$data_link_last_poll_file"
+	: > "$data_link_flush_file"
+	echo "OK"
+}
+
+test_landing_node() {
+	local sid="$1"
+	[ -n "$sid" ] || { echo "ERROR: landing-node section id required" >&2; return 1; }
+	landing_node_exists "$sid" || { echo "ERROR: landing node not found" >&2; return 1; }
+	[ "$(uci -q get mihomo.$sid.enabled)" = "1" ] || { echo "ERROR: landing node is disabled" >&2; return 1; }
+	landing_node_valid "$sid" 1 || { echo "ERROR: landing node configuration is incomplete" >&2; return 1; }
+	local proxy run_config="/tmp/mihomo_run.yaml"
+	proxy=$(landing_proxy_name "$sid")
+	grep -q "name: \\"$proxy\\"" "$run_config" 2>/dev/null || { echo "ERROR: landing node is not applied; save and apply first" >&2; return 1; }
+	local url proxy_enc url_enc resp
+	url=$(uci -q get mihomo.config.test_url); [ -n "$url" ] || url="https://www.gstatic.com/generate_204"
+	proxy_enc=$(urlencode "$proxy")
+	url_enc=$(urlencode "$url")
+	resp=$(mihomo_curl -fsS -m 12 "http://127.0.0.1:${API_PORT}/proxies/${proxy_enc}/delay?url=${url_enc}&timeout=8000" 2>&1)
+	local code=$?
+	if [ $code -ne 0 ] || ! printf '%s' "$resp" | grep -q '"delay"'; then
+		chain_log "landing_node $sid test failed: ${resp:-controller returned no delay}"
+		echo "ERROR: ${resp:-landing node is unreachable}" >&2
+		return 1
+	fi
+	echo "$resp"
+}
+
+test_data_link() {
+	local sid="$1"
+	[ -n "$sid" ] || { echo "ERROR: data-link section id required" >&2; return 1; }
+	uci -X show mihomo 2>/dev/null | grep -q "^mihomo\.$sid=data_link$" || { echo "ERROR: data-link section not found" >&2; return 1; }
+	local group url group_enc url_enc
+	group=$(data_link_group_name "$sid")
+	url=$(uci -q get mihomo.config.test_url); [ -n "$url" ] || url="https://www.gstatic.com/generate_204"
+	group_enc=$(urlencode "$group")
+	url_enc=$(urlencode "$url")
+	local resp
+	resp=$(mihomo_curl -fsS -m 12 "http://127.0.0.1:${API_PORT}/proxies/${group_enc}/delay?url=${url_enc}&timeout=8000" 2>&1)
+	local code=$?
+	if [ $code -ne 0 ] || ! printf '%s' "$resp" | grep -q '"delay"'; then
+		chain_log "data_link $sid test failed: ${resp:-controller returned no delay}"
+		echo "ERROR: ${resp:-data link is unreachable}" >&2
+		return 1
+	fi
+	mark_data_link_healthy "$sid"
+	echo "$resp"
+}
+
 clear_access_rules() {
 	local _n=0
 	while [ $_n -lt 1000 ]; do uci -q delete mihomo.@mihomo_rule[0] || break; _n=$((_n+1)); done
@@ -2154,8 +2632,29 @@ case "$1" in
 	select_node)
 		select_node "$2" "$3"
 		;;
-	select_relay)
-		select_relay "$2" "$3"
+	get_chain_status)
+		get_chain_status
+		;;
+	set_chain_front_node)
+		set_chain_front_node "$2"
+		;;
+	get_chain_log)
+		get_chain_log "$2"
+		;;
+	get_data_link_health)
+		get_data_link_health
+		;;
+	get_data_link_metrics)
+		get_data_link_metrics
+		;;
+	reset_data_link_health)
+		reset_data_link_health
+		;;
+	test_landing_node)
+		test_landing_node "$2"
+		;;
+	test_data_link)
+		test_data_link "$2"
 		;;
 	get_connections)
 		get_connections
@@ -2177,6 +2676,9 @@ case "$1" in
 		;;
 	get_history)
 		get_history "$2"
+		;;
+	clear_access_log)
+		clear_access_log
 		;;
 	get_op_state)
 		get_op_state
@@ -2215,7 +2717,7 @@ case "$1" in
 		set_adblock_enabled "$2"
 		;;
 	*)
-		echo "Usage: $0 {get_arch|get_lan_ip|get_lan_ip6|emit_tproxy_rules|check_core|download_core|update_geox|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|select_relay|get_connections|collect_connections|collect_loop|get_history|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes|test_connectivity|traffic_loop|get_traffic|reset_traffic_domains|get_adblock_sources|add_adblock_source|del_adblock_source|toggle_adblock_source}"
+		echo "Usage: $0 {get_arch|get_lan_ip|get_lan_ip6|emit_tproxy_rules|check_core|download_core|update_geox|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_chain_status|set_chain_front_node|get_chain_log|get_data_link_health|get_data_link_metrics|reset_data_link_health|test_landing_node|test_data_link|get_connections|collect_connections|collect_loop|get_history|clear_access_log|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes|test_connectivity|traffic_loop|get_traffic|reset_traffic_domains|get_adblock_sources|add_adblock_source|del_adblock_source|toggle_adblock_source}"
 		exit 1
 		;;
 esac
@@ -2246,9 +2748,17 @@ esac
             "path": "mihomo/settings"
         }
     },
+    "admin/services/mihomo/chain": {
+        "title": "链式代理",
+        "order": 3,
+        "action": {
+            "type": "view",
+            "path": "mihomo/chain"
+        }
+    },
     "admin/services/mihomo/accesslog": {
         "title": "访问日志",
-        "order": 3,
+        "order": 4,
         "action": {
             "type": "view",
             "path": "mihomo/accesslog"
@@ -2256,7 +2766,7 @@ esac
     },
     "admin/services/mihomo/rules": {
         "title": "规则管理",
-        "order": 4,
+        "order": 5,
         "action": {
             "type": "view",
             "path": "mihomo/rules"
@@ -2264,7 +2774,7 @@ esac
     },
     "admin/services/mihomo/traffic": {
         "title": "流量统计",
-        "order": 5,
+        "order": 6,
         "action": {
             "type": "view",
             "path": "mihomo/traffic"
@@ -2272,7 +2782,7 @@ esac
     },
     "admin/services/mihomo/adblock": {
         "title": "广告过滤",
-        "order": 6,
+        "order": 7,
         "action": {
             "type": "view",
             "path": "mihomo/adblock"
@@ -2311,8 +2821,7 @@ esac
 'require view';
 'require ui';
 'require fs';
-'require rpc';
-'require uci';
+'require dom';
 
 function esc(s) {
 	return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
@@ -2338,36 +2847,24 @@ function fmt_bytes(n) {
 
 return view.extend({
 	load: function() {
-		return uci.load('mihomo').then(function() {
-			return Promise.all([
-				fs.exec('/usr/share/mihomo/helper.sh', ['get_connections']).catch(function() { return { stdout: '[]' }; }),
-				fs.exec('/usr/share/mihomo/helper.sh', ['get_history', '300']).catch(function() { return { stdout: '[]' }; }),
-				fs.exec('/usr/share/mihomo/helper.sh', ['get_proxy_groups']).catch(function() { return { stdout: '{"proxies":{}}' }; })
-			]);
-		});
+		return Promise.all([
+			fs.exec('/usr/share/mihomo/helper.sh', ['get_history', '300']).catch(function() { return { stdout: '[]' }; })
+		]);
 	},
 
 	render: function(results) {
 		var self = this;
 		if (self._timer) { clearInterval(self._timer); self._timer = null; }
 
-		var conn_raw = (results[0] && results[0].stdout) ? results[0].stdout.trim() : '[]';
-		var hist_raw = (results[1] && results[1].stdout) ? results[1].stdout.trim() : '[]';
-		var groups_raw = (results[2] && results[2].stdout) ? results[2].stdout.trim() : '{"proxies":{}}';
+		var hist_raw = (results[0] && results[0].stdout) ? results[0].stdout.trim() : '[]';
 
 		var connections = [];
 		var conn_error = null;
-		try {
-			var cj = JSON.parse(conn_raw);
-			if (cj && cj.error) conn_error = cj.msg;
-			else connections = cj;
-		} catch (e) { conn_error = _('无法解析实时连接数据。'); }
 
 		var history = [];
 		try { history = JSON.parse(hist_raw); } catch (e) { history = []; }
 
 		var proxy_groups = {};
-		try { proxy_groups = JSON.parse(groups_raw).proxies || {}; } catch (e) { proxy_groups = {}; }
 
 		var group_names = [];
 		for (var gk in proxy_groups) {
@@ -2569,7 +3066,7 @@ return view.extend({
 			box.innerHTML = '';
 			if (!history.length) {
 				box.appendChild(E('tr', {}, [
-					E('td', { 'colspan': 5, 'style': 'text-align:center;color:#999;padding:15px;' }, _('暂无历史记录（核心运行时每 15 秒采集一次）'))
+					E('td', { 'colspan': 5, 'style': 'text-align:center;color:#999;padding:24px;' }, _('暂无网络访问日志'))
 				]));
 				return;
 			}
@@ -2580,31 +3077,24 @@ return view.extend({
 				var ip = h.ip || '';
 				var time = fmt_time(h.ts);
 				var policy = h.policy || (h.rule ? h.rule : '-');
+				var traffic = fmt_bytes(h.up) + ' / ' + fmt_bytes(h.down);
 				
 				var tr = E('tr', {}, [
 					E('td', {}, time),
 					E('td', {}, dev || ip || '-'),
 					E('td', {}, domain),
 					E('td', {}, policy),
-					E('td', {}, [
-						btn(_('拦截'), 'cbi-button-reset', (function(ip, d) {
-							return function() { add_rule(ip, d, 'block'); };
-						})(ip, h.domain || h.dst)),
-						btn(_('直连'), 'cbi-button-neutral', (function(ip, d) {
-							return function() { add_rule(ip, d, 'direct'); };
-						})(ip, h.domain || h.dst))
-					])
+					E('td', {}, traffic)
 				]);
 				box.appendChild(tr);
 			}
 		}
 
 		var view_html = E('div', { 'class': 'cbi-map' }, [
-			E('h2', {}, _('水杉代理访问日志')),
-			E('p', {}, _('监控局域网设备实时连接与历史访问。您可以点击操作按钮快速针对特定域名创建规则。')),
+			E('h2', {}, _('网络访问日志')),
 
 			// IP列表板块（红杏 vs 设备）
-			E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
+			E('div', { 'class': 'cbi-section', 'style': 'display:none;' }, [
 				E('h3', { 'style': 'margin-top: 0; margin-bottom: 15px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, _('IP列表')),
 				E('div', { 'style': 'display: flex; gap: 20px; margin-bottom: 15px; align-items: stretch;' }, [
 					// 左边：红杏 (走代理)
@@ -2639,7 +3129,7 @@ return view.extend({
 			]),
 
 			// Real-time connections
-			E('div', { 'class': 'cbi-section' }, [
+			E('div', { 'class': 'cbi-section', 'style': 'display:none;' }, [
 				E('h3', {}, _('实时连接（每 5 秒刷新）')),
 				E('div', { 'style': 'margin-bottom: 12px; display: flex; align-items: center;' }, [
 					E('span', { 'style': 'margin-right: 8px; font-weight: bold; font-size: 13px; color: #444;' }, _('搜索过滤：')),
@@ -2670,7 +3160,26 @@ return view.extend({
 
 			// History
 			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, _('历史访问记录')),
+				E('div', { 'style': 'display:flex;align-items:center;margin-bottom:12px;' }, [
+					E('h3', { 'style': 'margin:0;' }, _('访问记录')),
+					E('button', {
+						'type': 'button',
+						'class': 'cbi-button cbi-button-reset',
+						'style': 'margin-left:auto;',
+						'click': function(ev) {
+							ev.preventDefault();
+							if (!confirm(_('确定要清空网络访问日志吗？'))) return;
+							return fs.exec('/usr/share/mihomo/helper.sh', ['clear_access_log']).then(function(res) {
+								if (res.code !== 0) throw new Error(res.stderr || res.stdout || _('清空失败'));
+								history = [];
+								render_history();
+								ui.addNotification(null, E('p', {}, _('网络访问日志已清空')), 'info');
+							}).catch(function(err) {
+								ui.addNotification(null, E('p', {}, _('清空失败：') + err.message), 'danger');
+							});
+						}
+					}, _('清空'))
+				]),
 				E('div', { 'style': 'max-height: 380px; overflow-y: auto; border: 1px solid rgba(0,0,0,0.08); border-radius: 6px;' }, [
 					E('table', { 'class': 'table', 'style': 'margin: 0;' }, [
 						E('thead', {}, [
@@ -2679,7 +3188,7 @@ return view.extend({
 								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('设备')),
 								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('域名 / 目标')),
 								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('策略')),
-								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('操作'))
+								E('th', { 'style': 'background: rgba(0,0,0,0.02); position: sticky; top: 0;' }, _('流量 (↑/↓)'))
 							])
 						]),
 						E('tbody', { 'id': 'hist-body' })
@@ -2689,28 +3198,14 @@ return view.extend({
 		]);
 
 		setTimeout(function() {
-			render_connections();
 			render_history();
-			updateTrackedDevices(connections, history);
 		}, 0);
 
 		self._timer = setInterval(function() {
-			fs.exec('/usr/share/mihomo/helper.sh', ['get_connections']).then(function(res) {
-				try {
-					var j = JSON.parse((res.stdout || '[]').trim());
-					if (j && !j.error) { 
-						connections = j; 
-						conn_error = null; 
-						render_connections(); 
-						updateTrackedDevices(connections, history);
-					}
-				} catch (e) {}
-			});
 			fs.exec('/usr/share/mihomo/helper.sh', ['get_history', '300']).then(function(res) {
 				try {
 					history = JSON.parse((res.stdout || '[]').trim());
 					render_history();
-					updateTrackedDevices(connections, history);
 				} catch (e) {}
 			});
 		}, 5000);
@@ -3379,7 +3874,6 @@ return view.extend({
 		var group_rows = [];
 		var group_names = Object.keys(proxy_groups);
 		var selector_groups_count = 0;
-		var relay_groups_count = 0;
 
 		for (var i = 0; i < group_names.length; i++) {
 			var gname = group_names[i];
@@ -3422,51 +3916,6 @@ return view.extend({
 					E('td', { 'style': 'font-weight: bold; vertical-align: middle; padding: 8px;' }, gname),
 					E('td', { 'style': 'vertical-align: middle; padding: 8px;' }, E('span', { 'class': 'label info', 'style': 'background-color: #17a2b8; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px;' }, g.type.toUpperCase())),
 				E('td', { 'style': 'vertical-align: middle; padding: 8px;' }, select_el)
-			]));
-		} else if (g && g.type === 'relay' && g.all && g.all.length) {
-			relay_groups_count++;
-
-			var nowArr = (g.now && typeof g.now === 'string') ? g.now.split(',') : [];
-			var hop_selects = [];
-			for (var h = 0; h < g.all.length; h++) {
-				var opts = [];
-				for (var k = 0; k < g.all[h].length; k++) {
-					var nm = g.all[h][k];
-					opts.push(E('option', {
-						'value': nm,
-						'selected': (nowArr[h] === nm) ? 'selected' : null
-					}, nm));
-				}
-				var sel = E('select', {
-					'class': 'cbi-input-select relay-hop',
-					'style': 'margin: 2px 4px 2px 0; min-width: 120px; padding: 4px; border-radius: 4px; border: 1px solid rgba(0,0,0,0.15); background: white;',
-					'data-group': gname,
-					'data-hop': h,
-					'change': function(ev) {
-						var grp = ev.target.getAttribute('data-group');
-						var sels = document.querySelectorAll('select.relay-hop[data-group="' + grp + '"]');
-						var arr = [];
-						for (var s = 0; s < sels.length; s++) arr.push(sels[s].value);
-						var payload = JSON.stringify(arr);
-						ui.addNotification(null, E('p', _('正在切换链路：') + grp), 'info');
-						return fs.exec('/usr/share/mihomo/helper.sh', ['select_relay', grp, payload]).then(function(res) {
-							if (res.code === 0) {
-								ui.addNotification(null, E('p', _('链路切换成功！')), 'info');
-							} else {
-								ui.addNotification(null, E('p', _('链路切换失败：') + (res.stderr || res.stdout || '')), 'danger');
-							}
-						}).catch(function(err) {
-							ui.addNotification(null, E('p', _('通信错误：') + err.message), 'danger');
-						});
-					}
-				}, opts);
-				hop_selects.push(sel);
-			}
-
-			group_rows.push(E('tr', {}, [
-				E('td', { 'style': 'font-weight: bold; vertical-align: middle; padding: 8px;' }, gname),
-				E('td', { 'style': 'vertical-align: middle; padding: 8px;' }, E('span', { 'class': 'label', 'style': 'background-color: #6c5ce7; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px;' }, 'RELAY')),
-				E('td', { 'style': 'vertical-align: middle; padding: 8px;' }, hop_selects)
 			]));
 		}
 		}
@@ -3563,7 +4012,7 @@ return view.extend({
 			}
 		}, _('自动设置代理'));
 		var proxy_groups_panel;
-		if (controller_up && (selector_groups_count + relay_groups_count) > 0) {
+		if (controller_up && selector_groups_count > 0) {
 			proxy_groups_panel = E('div', { 'class': 'cbi-section', 'style': 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);' }, [
 				E('div', { 'style': 'display: flex; align-items: center; justify-content: space-between; margin-top: 0; margin-bottom: 15px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, [
 					E('h3', { 'style': 'margin: 0;' }, _('分流策略组管理 (实时切换节点)')),
@@ -3989,6 +4438,12 @@ return view.extend({
 					E('div', { 'style': 'display: flex; gap: 8px;' }, [ download_logs_btn, clear_logs_btn ])
 				]),
 				logs_pre
+			]),
+
+			// 联系作者
+			E('div', { 'style': 'text-align: center; color: #888; font-size: 12px; margin-top: 20px; padding-top: 15px; border-top: 1px solid rgba(0,0,0,0.06);' }, [
+				'联系作者：',
+				E('a', { 'href': 'mailto:chanf@me.com', 'style': 'color: #59569d; text-decoration: none;' }, 'chanf@me.com')
 			])
 		]);
 
@@ -4140,6 +4595,453 @@ return view.extend({
 
 	unload: function() {
 		if (this._timer) { clearInterval(this._timer); this._timer = null; }
+	}
+});
+""",
+
+    "root/www/luci-static/resources/view/mihomo/chain.js": """'use strict';
+'require view';
+'require form';
+'require fs';
+'require ui';
+'require uci';
+
+function parse_json(res, fallback) {
+	try { return JSON.parse((res && res.stdout || '').trim()); }
+	catch (e) { return fallback; }
+}
+
+function protocol_label(type) {
+	var labels = { socks5: 'SOCKS5', http: 'HTTP', ss: 'Shadowsocks', trojan: 'Trojan', vmess: 'VMess', vless: 'VLESS' };
+	return labels[type] || type || '-';
+}
+
+function format_bytes(value, per_second) {
+	var units = ['B', 'KB', 'MB', 'GB', 'TB'];
+	var size = Math.max(0, Number(value) || 0);
+	var index = 0;
+	while (size >= 1024 && index < units.length - 1) { size /= 1024; index++; }
+	var digits = size >= 100 || index === 0 ? 0 : (size >= 10 ? 1 : 2);
+	return size.toFixed(digits) + ' ' + units[index] + (per_second ? '/s' : '');
+}
+
+return view.extend({
+	load: function() {
+		return Promise.all([
+			uci.load('mihomo'),
+			fs.exec('/usr/share/mihomo/helper.sh', ['get_proxies']).catch(function() { return { stdout: '[]' }; }),
+			fs.exec('/usr/share/mihomo/helper.sh', ['get_chain_status']).catch(function() { return { stdout: '{}' }; }),
+			fs.exec('/usr/share/mihomo/helper.sh', ['get_data_link_metrics']).catch(function() { return { stdout: '[]' }; })
+		]);
+	},
+
+	render: function(data) {
+		var self = this;
+		var proxies = parse_json(data[1], []);
+		var status = parse_json(data[2], {});
+		var metric_rows = parse_json(data[3], []);
+		var front_node = uci.get('mihomo', 'config', 'chain_front_node') || 'individual';
+		var link_health = {};
+		var link_metrics = {};
+		if (Array.isArray(metric_rows)) metric_rows.forEach(function(row) {
+			var sid = safe_section_id(row.sid);
+			link_metrics[sid] = row;
+			if (row.healthy) link_health[sid] = true;
+		});
+		if (!Array.isArray(proxies)) proxies = [];
+		proxies = proxies.filter(function(p) {
+			return p && p.name && p.name.indexOf('ssproxy-landing-') !== 0 && p.name.indexOf('ssproxy-chain-') !== 0;
+		});
+
+		var landing_labels = {};
+		uci.sections('mihomo', 'landing_node', function(sec) {
+			landing_labels[sec['.name']] = sec.name || sec['.name'];
+		});
+
+		var m = new form.Map('mihomo', _('链式代理'));
+		m.restart = 'mihomo';
+		var s, o;
+
+		s = m.section(form.GridSection, 'landing_node', _('落地节点'));
+		s.anonymous = true;
+		s.addremove = true;
+		s.sortable = true;
+		s.nodescriptions = true;
+		s.sectiontitle = function(section_id) {
+			return uci.get('mihomo', section_id, 'name') || section_id;
+		};
+
+		o = s.option(form.Flag, 'enabled', _('启用'));
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'name', _('名称'));
+		o.rmempty = false;
+		o.placeholder = _('香港落地');
+		o.validate = function(section_id, value) {
+			value = (value || '').trim();
+			if (!value) return _('请输入名称');
+			var duplicate = false;
+			uci.sections('mihomo', 'landing_node', function(sec) {
+				if (sec['.name'] !== section_id && (sec.name || '').trim() === value) duplicate = true;
+			});
+			return duplicate ? _('落地节点名称不能重复') : true;
+		};
+
+		o = s.option(form.ListValue, 'type', _('协议'));
+		o.value('socks5', 'SOCKS5');
+		o.value('http', 'HTTP');
+		o.value('ss', 'Shadowsocks');
+		o.value('trojan', 'Trojan');
+		o.value('vmess', 'VMess');
+		o.value('vless', 'VLESS');
+		o.default = 'socks5';
+		o.rmempty = false;
+		o.textvalue = function(section_id) { return protocol_label(uci.get('mihomo', section_id, 'type')); };
+
+		o = s.option(form.Value, 'server', _('服务器'));
+		o.rmempty = false;
+		o.placeholder = '203.0.113.10';
+
+		o = s.option(form.Value, 'port', _('端口'));
+		o.datatype = 'port';
+		o.rmempty = false;
+		o.placeholder = '1080';
+
+		o = s.option(form.Value, 'username', _('用户名'));
+		o.modalonly = true;
+		o.depends('type', 'socks5');
+		o.depends('type', 'http');
+
+		o = s.option(form.Value, 'password', _('密码'));
+		o.password = true;
+		o.modalonly = true;
+		o.depends('type', 'socks5');
+		o.depends('type', 'http');
+		o.depends('type', 'ss');
+		o.depends('type', 'trojan');
+
+		o = s.option(form.ListValue, 'cipher', _('加密方式'));
+		o.modalonly = true;
+		o.value('aes-128-gcm', 'aes-128-gcm');
+		o.value('aes-256-gcm', 'aes-256-gcm');
+		o.value('chacha20-ietf-poly1305', 'chacha20-ietf-poly1305');
+		o.value('2022-blake3-aes-128-gcm', '2022-blake3-aes-128-gcm');
+		o.value('2022-blake3-aes-256-gcm', '2022-blake3-aes-256-gcm');
+		o.depends('type', 'ss');
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'uuid', _('UUID'));
+		o.modalonly = true;
+		o.depends('type', 'vmess');
+		o.depends('type', 'vless');
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'alter_id', _('Alter ID'));
+		o.modalonly = true;
+		o.datatype = 'uinteger';
+		o.default = '0';
+		o.depends('type', 'vmess');
+
+		o = s.option(form.ListValue, 'vmess_cipher', _('VMess 加密'));
+		o.modalonly = true;
+		o.value('auto', 'auto');
+		o.value('none', 'none');
+		o.value('aes-128-gcm', 'aes-128-gcm');
+		o.value('chacha20-poly1305', 'chacha20-poly1305');
+		o.default = 'auto';
+		o.depends('type', 'vmess');
+		o.write = function(section_id, value) { return uci.set('mihomo', section_id, 'cipher', value); };
+		o.cfgvalue = function(section_id) { return uci.get('mihomo', section_id, 'cipher') || 'auto'; };
+
+		o = s.option(form.Flag, 'tls', _('TLS'));
+		o.modalonly = true;
+		o.default = '0';
+		o.depends('type', 'socks5');
+		o.depends('type', 'http');
+		o.depends('type', 'vmess');
+		o.depends('type', 'vless');
+
+		o = s.option(form.Value, 'sni', _('SNI / Server Name'));
+		o.modalonly = true;
+		o.depends('type', 'trojan');
+		o.depends('type', 'vmess');
+		o.depends('type', 'vless');
+
+		o = s.option(form.ListValue, 'flow', _('Flow'));
+		o.modalonly = true;
+		o.value('', _('无'));
+		o.value('xtls-rprx-vision', 'xtls-rprx-vision');
+		o.depends('type', 'vless');
+
+		o = s.option(form.Flag, 'skip_cert_verify', _('跳过证书验证'));
+		o.modalonly = true;
+		o.default = '0';
+		o.depends('type', 'socks5');
+		o.depends('type', 'http');
+		o.depends('type', 'trojan');
+		o.depends('type', 'vmess');
+		o.depends('type', 'vless');
+
+		o = s.option(form.Button, '_test_landing', _('测试'));
+		o.inputtitle = _('测试');
+		o.inputstyle = 'action';
+		o.onclick = function(section_id) {
+			return fs.exec('/usr/share/mihomo/helper.sh', ['test_landing_node', section_id]).then(function(res) {
+				var result = parse_json(res, {});
+				if (res.code === 0 && typeof result.delay === 'number') {
+					ui.addNotification(null, E('p', {}, _('落地节点可用，延时：') + result.delay + ' ms'), 'info');
+				} else {
+					ui.addNotification(null, E('p', {}, _('落地节点测试失败：') + (res.stderr || res.stdout || '')), 'danger');
+				}
+			}).catch(function(err) {
+				ui.addNotification(null, E('p', {}, _('落地节点测试失败：') + err.message), 'danger');
+			});
+		};
+
+		function safe_section_id(section_id) {
+			return String(section_id || '').replace(/[^A-Za-z0-9_]/g, '_');
+		}
+
+		function update_link_metrics() {
+			var dots = document.querySelectorAll('.ssproxy-data-link-dot');
+			for (var i = 0; i < dots.length; i++) {
+				var sid = dots[i].getAttribute('data-section');
+				var healthy = !!link_health[sid];
+				dots[i].style.backgroundColor = healthy ? '#16845b' : '#d92d20';
+				dots[i].title = healthy ? _('链路已通讯') : _('尚未检测到成功通讯');
+			}
+			var speeds = document.querySelectorAll('.ssproxy-data-link-speed');
+			for (var j = 0; j < speeds.length; j++) {
+				var speed_sid = speeds[j].getAttribute('data-section');
+				var speed_row = link_metrics[speed_sid] || {};
+				speeds[j].textContent = '↑ ' + format_bytes(speed_row.up_rate, true) + '  ↓ ' + format_bytes(speed_row.down_rate, true);
+			}
+			var totals = document.querySelectorAll('.ssproxy-data-link-total');
+			for (var k = 0; k < totals.length; k++) {
+				var total_sid = totals[k].getAttribute('data-section');
+				var total_row = link_metrics[total_sid] || {};
+				totals[k].textContent = '↑ ' + format_bytes(total_row.total_up, false) + '  ↓ ' + format_bytes(total_row.total_down, false);
+			}
+		}
+
+		function refresh_link_metrics() {
+			return fs.exec('/usr/share/mihomo/helper.sh', ['get_data_link_metrics']).then(function(res) {
+				var rows = parse_json(res, []);
+				link_health = {};
+				link_metrics = {};
+				if (Array.isArray(rows)) rows.forEach(function(row) {
+					var sid = safe_section_id(row.sid);
+					link_metrics[sid] = row;
+					if (row.healthy) link_health[sid] = true;
+				});
+				update_link_metrics();
+			});
+		}
+
+		var reset_button = E('button', {
+			'type': 'button',
+			'class': 'cbi-button cbi-button-reset',
+			'style': 'margin-left:8px;',
+			'click': function(ev) {
+				ev.preventDefault();
+				ev.stopPropagation();
+				return fs.exec('/usr/share/mihomo/helper.sh', ['reset_data_link_health']).then(function() {
+					link_health = {};
+					link_metrics = {};
+					update_link_metrics();
+					ui.addNotification(null, E('p', {}, _('数据链路状态和流量已重置')), 'info');
+				});
+			}
+		}, _('重置'));
+
+		var front_options = [ E('option', {
+			'value': 'individual',
+			'selected': front_node === 'individual' ? 'selected' : null
+		}, _('非统一前置')) ];
+		var front_found = front_node === 'individual';
+		for (var front_index = 0; front_index < proxies.length; front_index++) {
+			var front_name = proxies[front_index].name;
+			if (front_name === front_node) front_found = true;
+			front_options.push(E('option', {
+				'value': front_name,
+				'selected': front_name === front_node ? 'selected' : null
+			}, front_name));
+		}
+		if (!front_found) {
+			front_options.push(E('option', {
+				'value': front_node,
+				'selected': 'selected',
+				'disabled': 'disabled'
+			}, front_node + ' (' + _('已失效') + ')'));
+		}
+
+		var front_select = E('select', {
+			'class': 'cbi-input-select',
+			'style': 'min-width:180px;max-width:320px;',
+			'change': function(ev) {
+				var selected = ev.target.value;
+				if (selected === front_node) return;
+				front_select.disabled = true;
+				return fs.exec('/usr/share/mihomo/helper.sh', ['set_chain_front_node', selected]).then(function(res) {
+					if (!res || res.code !== 0) throw new Error((res && (res.stderr || res.stdout)) || _('保存失败'));
+					return fs.exec('/etc/init.d/mihomo', ['restart']);
+				}).then(function(res) {
+					if (!res || res.code !== 0) throw new Error((res && (res.stderr || res.stdout)) || _('重启失败'));
+					ui.addNotification(null, E('p', {}, _('前置节点已应用')), 'info');
+					setTimeout(function() { location.reload(); }, 600);
+				}).catch(function(err) {
+					front_select.value = front_node;
+					front_select.disabled = false;
+					ui.addNotification(null, E('p', {}, _('前置节点应用失败：') + err.message), 'danger');
+				});
+			}
+		}, front_options);
+
+		var data_link_title = E('div', { 'style': 'display:flex;align-items:center;width:100%;gap:12px;' }, [
+			E('span', {}, _('数据链路')),
+			E('div', { 'style': 'display:flex;align-items:center;margin-left:auto;gap:8px;' }, [
+				E('span', {}, _('前置节点')),
+				front_select,
+				reset_button
+			])
+		]);
+
+		s = m.section(form.GridSection, 'data_link', data_link_title);
+		s.anonymous = true;
+		s.addremove = true;
+		s.sortable = true;
+		s.nodescriptions = true;
+
+		o = s.option(form.DummyValue, '_health', _('状态'));
+		o.cfgvalue = function(section_id) {
+			var sid = safe_section_id(section_id);
+			return link_health[sid] ? _('链路已通讯') : _('尚未检测到成功通讯');
+		};
+		o.textvalue = function(section_id) {
+			var sid = safe_section_id(section_id);
+			var healthy = !!link_health[sid];
+			return E('span', {
+				'class': 'ssproxy-data-link-dot',
+				'data-section': sid,
+				'title': healthy ? _('链路已通讯') : _('尚未检测到成功通讯'),
+				'style': 'display:inline-block;width:11px;height:11px;border-radius:50%;background-color:' + (healthy ? '#16845b' : '#d92d20') + ';vertical-align:middle;'
+			});
+		};
+
+		o = s.option(form.DummyValue, '_speed', _('当前速率'));
+		o.cfgvalue = function(section_id) {
+			var sid = safe_section_id(section_id);
+			var row = link_metrics[sid] || {};
+			return '↑ ' + format_bytes(row.up_rate, true) + '  ↓ ' + format_bytes(row.down_rate, true);
+		};
+		o.textvalue = function(section_id) {
+			var sid = safe_section_id(section_id);
+			var row = link_metrics[sid] || {};
+			return E('span', {
+				'class': 'ssproxy-data-link-speed',
+				'data-section': sid,
+				'style': 'white-space:nowrap;'
+			}, '↑ ' + format_bytes(row.up_rate, true) + '  ↓ ' + format_bytes(row.down_rate, true));
+		};
+
+		o = s.option(form.DummyValue, '_total', _('累计流量'));
+		o.cfgvalue = function(section_id) {
+			var sid = safe_section_id(section_id);
+			var row = link_metrics[sid] || {};
+			return '↑ ' + format_bytes(row.total_up, false) + '  ↓ ' + format_bytes(row.total_down, false);
+		};
+		o.textvalue = function(section_id) {
+			var sid = safe_section_id(section_id);
+			var row = link_metrics[sid] || {};
+			return E('span', {
+				'class': 'ssproxy-data-link-total',
+				'data-section': sid,
+				'style': 'white-space:nowrap;'
+			}, '↑ ' + format_bytes(row.total_up, false) + '  ↓ ' + format_bytes(row.total_down, false));
+		};
+
+		o = s.option(form.Flag, 'enabled', _('启用'));
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'device_ip', _('设备 IP'));
+		o.rmempty = false;
+		o.placeholder = '192.168.66.158';
+		o.validate = function(section_id, value) {
+			value = (value || '').trim();
+			if (!/^[0-9A-Fa-f:.]+(?:\\/\\d{1,3})?$/.test(value)) return _('请输入有效的 IP 或 CIDR');
+			var duplicate = false;
+			uci.sections('mihomo', 'data_link', function(sec) {
+				if (sec['.name'] !== section_id && sec.enabled !== '0' && (sec.device_ip || '').trim() === value) duplicate = true;
+			});
+			return duplicate ? _('同一设备只能配置一条启用链路') : true;
+		};
+
+		o = s.option(form.Value, 'subscription_node', _('订阅节点'));
+		o.rmempty = false;
+		o.readonly = front_node !== 'individual';
+		for (var i = 0; i < proxies.length; i++) o.value(proxies[i].name, proxies[i].name);
+
+		o = s.option(form.ListValue, 'landing_node', _('落地节点'));
+		o.rmempty = false;
+		Object.keys(landing_labels).forEach(function(sid) { o.value(sid, landing_labels[sid]); });
+		o.textvalue = function(section_id) {
+			var sid = uci.get('mihomo', section_id, 'landing_node');
+			return landing_labels[sid] || sid || '-';
+		};
+
+		o = s.option(form.Button, '_test', _('测试'));
+		o.inputtitle = _('测试');
+		o.inputstyle = 'action';
+		o.onclick = function(section_id) {
+			return fs.exec('/usr/share/mihomo/helper.sh', ['test_data_link', section_id]).then(function(res) {
+				var result = parse_json(res, {});
+				if (res.code === 0 && typeof result.delay === 'number') {
+					link_health[safe_section_id(section_id)] = true;
+					update_link_metrics();
+					ui.addNotification(null, E('p', {}, _('链路延时：') + result.delay + ' ms'), 'info');
+				} else {
+					ui.addNotification(null, E('p', {}, _('链路测试失败：') + (res.stderr || res.stdout || '')), 'danger');
+				}
+			});
+		};
+
+		var state_color = status.controller ? '#16845b' : '#b54708';
+		var state_text = status.controller ? _('控制器在线') : _('控制器离线');
+		var status_panel = E('div', { 'class': 'cbi-section', 'style': 'padding: 14px 16px; margin-bottom: 18px; border-left: 4px solid ' + state_color + ';' }, [
+			E('div', { 'style': 'display:flex; flex-wrap:wrap; align-items:center; gap:18px;' }, [
+				E('strong', { 'style': 'color:' + state_color + ';' }, state_text),
+				E('span', {}, _('落地节点') + ': ' + (status.runtime_landing || 0) + ' / ' + (status.landing_enabled || 0)),
+				E('span', {}, _('有效链路') + ': ' + (status.runtime_links || 0) + ' / ' + (status.link_enabled || 0)),
+				E('button', { 'class': 'cbi-button cbi-button-neutral', 'click': function(ev) {
+					ev.preventDefault();
+					return fs.exec('/usr/share/mihomo/helper.sh', ['get_chain_log', '120']).then(function(res) {
+						ui.showModal(_('链式代理日志'), [
+							E('pre', { 'style': 'max-height:420px;overflow:auto;white-space:pre-wrap;' }, res.stdout || _('暂无日志')),
+							E('div', { 'class': 'right' }, [ E('button', { 'class': 'cbi-button', 'click': ui.hideModal }, _('关闭')) ])
+						]);
+					});
+				} }, _('日志'))
+			])
+		]);
+
+		return m.render().then(function(form_node) {
+			if (self._health_timer) clearInterval(self._health_timer);
+			self._health_timer = setInterval(refresh_link_metrics, 5000);
+			return E('div', { 'class': 'cbi-map' }, [
+				E('h2', {}, _('链式代理')),
+				status_panel,
+				form_node
+			]);
+		});
+	},
+
+	unload: function() {
+		if (this._health_timer) {
+			clearInterval(this._health_timer);
+			this._health_timer = null;
+		}
 	}
 });
 """,
@@ -4361,44 +5263,6 @@ return view.extend({
 			}, _('立即更新 Geo'));
 		};
 
-		// 链式代理 (Relay 多跳) 管理
-		s = m.section(form.TypedSection, 'relay_chain', _('链式代理 (Relay 多跳)'));
-		s.anonymous = false;
-		s.addremove = true;
-		s.sortable = false;
-		s.description = _('将多个节点 / 策略组按顺序串联成一条链路（如 入口 → 落地），生成可在策略组或其它规则中选用的 relay 代理。每个「跳」可填订阅中的节点名，或已有的策略组名。保存并重启核心后生效。');
-
-		o = s.option(form.Value, 'name', _('链路名称'), _('该链式代理在 Mihomo 中的显示名称，将作为一个可用代理出现在策略组列表中。'));
-		o.rmempty = false;
-
-		o = s.option(form.Flag, 'enabled', _('启用'), _('关闭后该链路不会注入运行配置。'));
-		o.rmempty = false;
-		o.default = '1';
-
-		o = s.option(form.DynamicList, 'hops', _('链路节点（按中转顺序）'), _('按出口链路顺序从上到下填写，例如第一跳为入口节点、最后一跳为落地节点。每跳填入订阅中的节点名，或已有的策略组名。保存后可在「运行状态」页面按跳实时切换。'));
-		o.rmempty = false;
-
-		// 设备链路绑定：按本机 IP / 网段把流量导向某条 relay 链路
-		s = m.section(form.TypedSection, 'relay_bind', _('设备链路绑定'));
-		s.anonymous = false;
-		s.addremove = true;
-		s.sortable = false;
-		s.description = _('把指定局域网设备（IP 或网段）的流量路由到某条「链式代理」：设备流量先走订阅机场节点，再依次经过链路中的落地点。需先在上方的「链式代理」中定义好链路，保存并重启核心后生效。');
-
-		o = s.option(form.Flag, 'enabled', _('启用'));
-		o.rmempty = false;
-		o.default = '1';
-
-		o = s.option(form.Value, 'src_ip', _('本机 IP / 网段'), _('局域网设备 IP（如 192.168.1.100）或 CIDR 网段（如 192.168.1.0/24）。匹配该来源的设备流量将走所选链路。'));
-		o.rmempty = false;
-
-		o = s.option(form.ListValue, 'chain', _('绑定链路'), _('选择该设备要使用的链式代理（机场 → 落地）。'));
-		o.rmempty = false;
-		uci.sections('mihomo', 'relay_chain', function(sec) {
-			var nm = sec.name;
-			if (nm) o.value(nm, nm);
-		});
-
 		return m.render().then(function(node) {
 			setTimeout(function() {
 				function updateWhitelistStatus() {
@@ -4445,6 +5309,174 @@ return view.extend({
 });
 """
 }
+
+# Replace the legacy multi-panel access-log view with the delivered minimal
+# network-log view. Keeping this assignment next to src_files makes the final
+# package content explicit while the historical implementation is removed in a
+# later source-layout cleanup.
+src_files["root/www/luci-static/resources/view/mihomo/accesslog.js"] = """'use strict';
+'require view';
+'require ui';
+'require fs';
+'require dom';
+
+function formatTime(timestamp) {
+	var value = Number(timestamp) || 0;
+	if (!value) return '-';
+	try { return new Date(value * 1000).toLocaleString(); }
+	catch (e) { return String(timestamp); }
+}
+
+function formatBytes(value) {
+	var size = Math.max(0, Number(value) || 0);
+	var units = ['B', 'KB', 'MB', 'GB', 'TB'];
+	var unit = 0;
+	while (size >= 1024 && unit < units.length - 1) {
+		size /= 1024;
+		unit++;
+	}
+	var digits = unit === 0 ? 0 : (size >= 100 ? 0 : (size >= 10 ? 1 : 2));
+	return size.toFixed(digits) + ' ' + units[unit];
+}
+
+function parseLogs(result) {
+	if (!result || result.code !== 0)
+		throw new Error((result && (result.stderr || result.stdout)) || _('读取日志失败'));
+	var payload = JSON.parse((result.stdout || '[]').trim() || '[]');
+	if (!Array.isArray(payload)) throw new Error(_('日志接口返回格式错误'));
+	return payload;
+}
+
+return view.extend({
+	load: function() {
+		return fs.exec('/usr/share/mihomo/helper.sh', ['get_history', '300']).then(function(result) {
+			try { return { logs: parseLogs(result), error: '' }; }
+			catch (e) { return { logs: [], error: e.message }; }
+		}).catch(function(error) {
+			return { logs: [], error: error.message || String(error) };
+		});
+	},
+
+	renderRows: function() {
+		var body = this._body;
+		if (!body) return;
+		dom.content(body, []);
+
+		if (this._error) {
+			body.appendChild(E('tr', {}, E('td', {
+				'colspan': 5,
+				'style': 'padding:24px;text-align:center;color:#d92d20;'
+			}, this._error)));
+			return;
+		}
+
+		if (!this._logs.length) {
+			body.appendChild(E('tr', {}, E('td', {
+				'colspan': 5,
+				'style': 'padding:24px;text-align:center;color:#777;'
+			}, _('暂无网络访问日志'))));
+			return;
+		}
+
+		for (var i = 0; i < this._logs.length; i++) {
+			var row = this._logs[i] || {};
+			var device = row.device || row.ip || '-';
+			var deviceCell = row.device && row.ip ? E('div', {}, [
+				E('div', {}, row.device),
+				E('div', { 'style': 'font-size:12px;color:#777;' }, row.ip)
+			]) : device;
+			var target = row.domain || row.dst || '-';
+			var outbound = row.policy || row.rule || '-';
+			body.appendChild(E('tr', {}, [
+				E('td', { 'style': 'white-space:nowrap;' }, formatTime(row.ts)),
+				E('td', {}, deviceCell),
+				E('td', { 'style': 'word-break:break-all;' }, target),
+				E('td', {}, outbound),
+				E('td', { 'style': 'white-space:nowrap;' },
+					'↑ ' + formatBytes(row.up) + '  ↓ ' + formatBytes(row.down))
+			]));
+		}
+	},
+
+	refreshLogs: function() {
+		var self = this;
+		return fs.exec('/usr/share/mihomo/helper.sh', ['get_history', '300']).then(function(result) {
+			self._logs = parseLogs(result);
+			self._error = '';
+			self.renderRows();
+		}).catch(function(error) {
+			self._error = error.message || String(error);
+			self.renderRows();
+		});
+	},
+
+	clearLogs: function(button) {
+		var self = this;
+		if (!confirm(_('确定要清空网络访问日志吗？'))) return;
+		button.disabled = true;
+		return fs.exec('/usr/share/mihomo/helper.sh', ['clear_access_log']).then(function(result) {
+			if (!result || result.code !== 0)
+				throw new Error((result && (result.stderr || result.stdout)) || _('清空失败'));
+			self._logs = [];
+			self._error = '';
+			self.renderRows();
+			ui.addNotification(null, E('p', {}, _('网络访问日志已清空')), 'info');
+		}).catch(function(error) {
+			ui.addNotification(null, E('p', {}, _('清空失败：') + (error.message || error)), 'danger');
+		}).then(function() {
+			button.disabled = false;
+		});
+	},
+
+	render: function(data) {
+		var self = this;
+		if (this._timer) clearInterval(this._timer);
+		this._logs = data.logs || [];
+		this._error = data.error || '';
+
+		var clearButton = E('button', {
+			'type': 'button',
+			'class': 'cbi-button cbi-button-reset',
+			'click': function(ev) {
+				ev.preventDefault();
+				return self.clearLogs(clearButton);
+			}
+		}, _('清空'));
+
+		this._body = E('tbody');
+		var viewNode = E('div', { 'class': 'cbi-map' }, [
+			E('h2', {}, _('网络访问日志')),
+			E('div', { 'class': 'cbi-section' }, [
+				E('div', { 'style': 'display:flex;align-items:center;margin-bottom:12px;' }, [
+					E('h3', { 'style': 'margin:0;' }, _('访问记录')),
+					E('div', { 'style': 'margin-left:auto;' }, clearButton)
+				]),
+				E('div', { 'style': 'overflow-x:auto;max-height:560px;overflow-y:auto;border:1px solid #ddd;' },
+					E('table', { 'class': 'table', 'style': 'margin:0;min-width:760px;' }, [
+						E('thead', {}, E('tr', {}, [
+							E('th', {}, _('时间')),
+							E('th', {}, _('设备 / IP')),
+							E('th', {}, _('访问目标')),
+							E('th', {}, _('出站策略')),
+							E('th', {}, _('流量 (↑/↓)'))
+						])),
+						this._body
+					]))
+			])
+		]);
+
+		this.renderRows();
+		this._timer = setInterval(function() { self.refreshLogs(); }, 5000);
+		return viewNode;
+	},
+
+	unload: function() {
+		if (this._timer) clearInterval(this._timer);
+		this._timer = null;
+		this._body = null;
+	}
+});
+"""
 
 def _bump_version_string(current_ver):
     """Return the next version string after ``current_ver``.

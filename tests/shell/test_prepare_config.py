@@ -84,6 +84,32 @@ def test_tun_enabled_block(run, uci_env, tmp_path):
     assert "auto-route: true" in out
 
 
+def test_upgrades_generate_204_health_checks_to_https(run, uci_env, tmp_path):
+    src = tmp_path / "src.yaml"
+    src.write_text(
+        SRC
+        + "proxy-groups:\n"
+        + "  - {name: Auto, type: url-test, proxies: [testnode], "
+        + "url: http://connect.rom.miui.com/generate_204, interval: 300}\n"
+        + "proxy-providers:\n"
+        + "  provider-a:\n"
+        + "    type: http\n"
+        + "    url: http://provider.example.com/nodes.yaml\n"
+        + "    health-check:\n"
+        + "      enable: true\n"
+        + "      url: http://www.gstatic.com/generate_204\n"
+    )
+
+    result = _run(run, uci_env, src, tun_enabled="0")
+    output = open(RUN_CONFIG, encoding="utf-8").read()
+
+    assert result.returncode == 0, result.stderr
+    assert "http://connect.rom.miui.com/generate_204" not in output
+    assert "https://connect.rom.miui.com/generate_204" in output
+    assert "https://www.gstatic.com/generate_204" in output
+    assert "http://provider.example.com/nodes.yaml" in output
+
+
 def test_injects_uci_access_rules(run, uci_env, tmp_path):
     src = tmp_path / "src.yaml"
     # The rule's proxy target must exist as a `name:` in the config for the

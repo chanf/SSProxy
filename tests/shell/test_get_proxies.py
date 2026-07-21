@@ -6,6 +6,7 @@ the router due to a quote-escaping bug. Covered here: every error path
 forms (block and inline flow-map) and CRLF tolerance.
 """
 import json
+import os
 
 BLOCK = (
     "proxies:\n"
@@ -25,6 +26,12 @@ FLOW = (
 
 
 def _run(run, uci_env, config_path):
+    # get_proxies intentionally prefers the live merged config. Tests in this
+    # suite create that global runtime file, so isolate parser cases explicitly.
+    try:
+        os.unlink("/tmp/mihomo_run.yaml")
+    except FileNotFoundError:
+        pass
     env = uci_env(gets={"mihomo.config.config_path": str(config_path)})
     return run("get_proxies", env=env)
 
