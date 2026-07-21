@@ -61,4 +61,4 @@
 ## 测试
 
 - 单元：`tests/shell/test_tproxy_rules.py` 断言 `emit_tproxy_rules` 四象限 + v4/v6/空/混合 + 缺 LAN IP 回退的精确输出；`get_lan_ip`/`get_lan_ip6` 的回退链（配合 `tests/fixtures/stubs/ip` 与 `uci_env`）。`tests/shell/test_prepare_config.py` 新增 `ipv6: true` 断言。
-- 端到端：见 `docs/whitelist-test-cases.md` 的 TC-06（白名单+DNS 劫持共存）。
+- 端到端：见 `Docs/whitelist-test-cases.md` 的 TC-06（白名单+DNS 劫持共存）。

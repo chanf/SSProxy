@@ -1,5 +1,7 @@
 # Mihomo 访问日志 产品设计文档
 
+> 2026-07-21 实现已简化为单一「网络访问日志」表：只展示时间、设备/IP、访问目标、出站策略和流量，最多保留 2000 条，支持后端清空。下文中「实时连接 / IP 列表 / 快捷规则」为旧版设计记录，不再是当前页面功能。
+
 > 状态：**已实现并重构（v1.0.0-90 拆分为独立页面）**
 > 模块：`luci-app-ssproxy` → 「访问日志」页面（`admin/services/mihomo/accesslog`）与「规则管理」页面（`admin/services/mihomo/rules`）
 > 适用：OpenWrt + LuCI，依赖 Mihomo（Clash Meta）核心经 TProxy / TUN 透明接管流量

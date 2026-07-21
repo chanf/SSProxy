@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概览
 
-`luci-app-ssproxy` —— 面向 iStoreOS / OpenWrt (Firewall4 + nftables) 的 LuCI 应用，是 Mihomo (Clash Meta) 代理核心的前端，集成 TProxy 透明代理、Dnsmasq DNS 劫持、订阅自动更新、节点延时测试与访问日志/规则管理。整个仓库**只有一个源文件** `build_ipk.py`：它既是构建器，也以字符串形式内嵌了全部要打包的文件（shell 脚本、UCI 配置、LuCI JS 视图、JSON）。
+`luci-app-ssproxy` —— 面向 iStoreOS / OpenWrt (Firewall4 + nftables) 的 LuCI 应用，是 Mihomo (Clash Meta) 代理核心的前端，集成 TProxy 透明代理、Dnsmasq DNS 劫持、按设备白名单、订阅自动更新、节点延时测试、链式代理（Relay 多跳）、访问日志、规则管理、流量统计与广告过滤。整个仓库**只有一个源文件** `build_ipk.py`：它既是构建器，也以字符串形式内嵌了全部要打包的文件（shell 脚本、UCI 配置、LuCI JS 视图、JSON）。
 
 ## 构建
 
@@ -13,8 +13,7 @@ python build_ipk.py
 ```
 
 - 仅依赖 Python 3 标准库（`os, tarfile, io, shutil, re, subprocess, datetime`），无需虚拟环境或第三方包；每次构建除产出 `.ipk` 外，还自动生成 `dist/releaseNote.md`（从 git 提交自动提取变更，基线记录在仓库根 `.release_baseline`）
-- 产出 `dist/luci-app-ssproxy_<version>_all.ipk`；中间产物 `build/control.tar.gz`、`build/data.tar.gz`
-- 没有测试套件、没有 lint 配置
+- 产出 `dist/luci-app-ssproxy_<version>_all.ipk`；中间产物 `build/control.tar.gz`、`build/data.tar.gz`；无 lint 配置
 
 ⚠️ **每次构建会自改 `build_ipk.py`**：`main()` 第一步调用 `increment_version()`，把 `PKG_VERSION`（如 `1.0.0-81` → `1.0.0-82`）原地重写并刷新 `IPK_FILENAME`。构建后一定有"源文件被改"的 diff，属预期；编辑该文件请以磁盘最新内容为准。
 
@@ -28,6 +27,24 @@ python build_ipk.py
 ```bash
 python3 build_ipk.py && ./deploy.sh
 ```
+
+## 测试
+
+pytest 套件覆盖 Python 构建器与 `helper.sh` 黑盒（约 136 例），位于 `tests/`：
+
+```bash
+# 一次性：建 venv 装 pytest
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+
+.venv/bin/python -m pytest tests/ -q                                          # 全量
+.venv/bin/python -m pytest tests/shell/test_chain_proxy.py -v                # 单文件
+.venv/bin/python -m pytest tests/shell/test_get_proxies.py::test_xxx -v      # 单用例
+```
+
+- `tests/` 顶层测构建器（版本自增、tar 打包的可复现性、端到端、文件模式）；`tests/shell/` 以 `subprocess` 黑盒驱动 `helper.sh`，脚本字符串直接取自 `build_ipk.src_files`，故 `\t`→Tab、`\\"`→`\"` 等转义与生产逐字一致。
+- `tests/fixtures/stubs/` 提供假 `uci/logger/sed/uname/opkg/curl`，注入 `PATH`；UCI 状态经数据文件喂入（`uci_env` fixture）。未对外暴露的内部函数（`urlencode`、`resolve_proxy_name`、`emit_access_rules_yaml` 等）通过裁掉 `case` 分发的库副本测试（`run_fn` fixture）。
+- macOS 上 `sed` stub 把 GNU `sed -i` 译成 BSD 写法以本地跑通；路由器 busybox 上用真 `sed -i`。
+- 改 `helper.sh` 或构建器后**先跑相关测试**再部署，远比在路由器上盲调高效。详见 `tests/README.md`。
 
 ## 核心架构：单源真相 `src_files`
 
@@ -44,26 +61,32 @@ IPK = gzip tar，含 `debian-binary`(`2.0\n`) + `control.tar.gz`(由 `src/CONTRO
 
 ## 运行时架构（多文件协作的关键）
 
-### `/etc/init.d/mihomo` —— procd 编排者，启动 **3 个实例**
+### `/etc/init.d/mihomo` —— procd 编排者，启动 **4 个实例**
 `START=95`，`start_service` 依次拉起：
 1. **核心**：先 `helper.sh restore_subscription_url` 恢复订阅链接 → `helper.sh prepare_config` 生成 `/tmp/mihomo_run.yaml` → 以 `-f /tmp/mihomo_run.yaml` 启动核心（**不直接用订阅原文件**）→ 非 TUN 时 `enable_tproxy`（nftables 表 `inet mihomo`、fwmark 1、路由表 100）→ 开 dns_hijack 时 `enable_dns_hijack`（UCI 改 `dhcp.@dnsmasq[0]` 的 server/noresolv）。
 2. **连接采集器**：后台循环 `collect_connections`，每 15s 把实时连接去重持久化到 `/tmp/mihomo_access.log`（供访问日志历史视图）。
 3. **自动更新循环**：`auto_update_loop` 每 10min 轮询一次 `auto_update_now`——**自包含、不依赖系统 cron**。
+4. **流量统计循环**：`traffic_loop`（每 5s 调 `collect_traffic`）累计代理字节，按域名分桶 + 永久累计总量 + 按天/按月汇总（北京时间），数据供 `traffic.js` 视图。
 
-### `/usr/share/mihomo/helper.sh` —— 单体后端，~20 个子命令
+### `/usr/share/mihomo/helper.sh` —— 单体后端，约 48 个子命令
 由末尾 `case "$1"` 分发，按子系统分组：
 
 - **核心/架构**：`get_arch`（含 `cpu_amd64_v3` 检测 AVX2/BMI2 等，区分 `amd64` 与 `amd64-compatible`）、`check_core`、`download_core [url]`（硬编码 `v1.19.28`，GitHub MetaCubeX/mihomo，用 curl）。
 - **订阅**：`update_subscription [url]`、`clear_subscription`、`save_subscription_url`/`restore_subscription_url`（持久化到包外文件 `/etc/mihomo/.subscription_url`，**即使 opkg remove+install 重装也能恢复订阅链接**）、`get_proxies`（健壮 awk 解析器，兼容 inline `- name:` 与 flow-map `{name:...}` 两种 YAML；对未下载/空/HTML 拦截页/无节点/解析失败返回带中文提示的结构化 JSON）。
 - **自动更新**：`auto_update_now`、`auto_update_loop`、`get_schedule`（按 `update_interval` 小时数节流，报告上次/下次更新时间 JSON）。
-- **配置合并**：`prepare_config`——拷贝订阅 YAML 到 `/tmp/mihomo_run.yaml`，awk 删原有 `dns:`/`tun:` 块、sed 删顶层端口，前置受控端口、追加受控 `dns:`/`tun:` 块，**再用 `emit_access_rules_yaml` 把 UCI 访问规则注入 `rules:` 段**。正因为有它，UCI 的端口/DNS/TUN 设置才真正生效。
+- **配置合并**：`prepare_config`——拷贝订阅 YAML 到 `/tmp/mihomo_run.yaml`，awk 删原有 `dns:`/`tun:` 块、sed 删顶层端口，前置受控端口、追加受控 `dns:`/`tun:` 块，**再用一组 `emit_*` 把 UCI 配置注入运行配置**：`emit_access_rules_yaml`（访问规则）+ `emit_landing_proxies_yaml`/`emit_data_link_proxies_yaml`/`emit_data_link_rules_yaml`（链式代理）+ `emit_adblock_rule_providers_yaml`/`emit_adblock_rules_yaml`（广告过滤）+ `emit_builtin_bypass_rules`（私网/组播旁路）+ `apply_custom_overlay`（「仅自定义/混合」模式覆盖）。正因为有它，UCI 的端口/DNS/TUN/规则/链路/广告设置才真正生效。
 - **实时控制（依赖核心已启动，走 9090 外部控制器 API）**：`get_proxy_groups`、`select_node <group> <node>`、`get_connections`、`collect_connections`、`test_node_delay <name>`、`test_all_nodes`。延时测试用可配置的 `test_url`，并对节点名做 `resolve_proxy_name` 容错匹配（容忍订阅文件与运行配置间的引号/CRLF 差异）。
-- **访问规则（UCI `mihomo_rule` 段）**：`get_access_rules`、`add_access_rule`、`del_access_rule`。注意 Mihomo 规则是**全局**的，记录的 `src_ip` 仅用于管理追溯、不按来源 IP 生效。
+- **访问规则（UCI `mihomo_rule` 段）**：`get/add/del/clear_access_rules`、`import_rules`（批量导入）。注意 Mihomo 规则是**全局**的，记录的 `src_ip` 仅用于管理追溯、不按来源 IP 生效。
+- **链式代理（UCI `mihomo_landing` / `mihomo_data_link` 段，Relay 两跳）**：`get_chain_status`、`set_chain_front_node`、`get_chain_log`、`test_landing_node`、`test_data_link`、`get_data_link_health`/`get_data_link_metrics`、`reset_data_link_health`。模型为「设备 IP → 订阅节点 → 落地节点」两跳链路，`prepare_config` 注入对应 `proxies:`/`rules:`。详见 `docs/chain-proxy-product-design.md`。
+- **流量统计**：`traffic_loop` / `get_traffic` / `reset_traffic_domains`（按域名分桶 + 永久累计 + 按天/月汇总）。
+- **广告过滤（Mihomo rule-provider 双重拦截）**：`get_adblock_sources`、`add/del/toggle_adblock_source`、`set_adblock_enabled`；`emit_adblock_*_yaml` 在 `prepare_config` 注入。
+- **Geo 数据库**：`update_geox`（GeoIP/GeoSite 镜像下载与更新）。
+- **透明代理 / 白名单**：`emit_tproxy_rules`（生成 nftables 规则；`acl_mode=whitelist` 时仅放行 `acl_ips` 设备，其余内核态旁路）、`get_lan_ip`（探测 LAN/网关地址供 ACL 默认值）。
 
 > `test_all_nodes` 用有限并发一次跑完所有节点延时——这是为替代旧版"前端每节点一个 fs.exec（30 路并发）把 rpcd/file-exec 打满超时"的设计；新增类似批量需求时沿用此后端批量模式。
 
-### LuCI 前端（4 个视图，纯 JS API，无 npm/无编译）
-`dashboard.js`（运行状态 + 策略组实时切换 + 节点卡片/延时测试/清空 + 自动更新排程 + 核心管理 + 日志）、`settings.js`（UCI 表单：订阅/自动更新/更新间隔/清空/延时测试 URL/TUN/DNS 劫持/高级端口路径）、`accesslog.js`（实时连接 5s 刷新 + 历史访问，支持快捷追加规则，自带 `setInterval` 与 `unload` 清理）、`rules.js`（自定义访问规则管理：添加/删除规则，应用并重启核心）。菜单在 `menu.d/*.json` 注册 4 项；`rpcd/acl.d/*.json` 授予 helper.sh/logread/init.d 的 exec 权限。
+### LuCI 前端（7 个视图，纯 JS API，无 npm/无编译）
+`dashboard.js`（运行状态 + 策略组实时切换 + 节点卡片/延时测试/清空 + 自动更新排程 + 核心管理 + 日志）、`settings.js`（UCI 表单：订阅/自动更新/更新间隔/清空/延时测试 URL/TUN/DNS 劫持/按设备白名单 `acl_mode`+`acl_ips`/高级端口路径）、`accesslog.js`（实时连接 5s 刷新 + 历史访问，支持快捷追加规则，自带 `setInterval` 与 `unload` 清理）、`rules.js`（自定义访问规则管理：增删/批量导入/应用并重启核心）、`chain.js`（链式代理：落地节点管理 + 设备链路绑定 + 前置节点选择）、`traffic.js`（流量统计：按域名分桶/累计/按天按月汇总）、`adblock.js`（广告过滤源管理与开关）。菜单在 `menu.d/*.json` 注册 7 项；`rpcd/acl.d/*.json` 授予 helper.sh/logread/init.d 的 exec 权限。
 
 ## 约定与注意
 
@@ -71,3 +94,4 @@ IPK = gzip tar，含 `debian-binary`(`2.0\n`) + `control.tar.gz`(由 `src/CONTRO
 - **shell 输出 JSON 的引号转义**：helper.sh 里 `echo` 的 JSON 用转义双引号（源码写成 `\\"`，写出为 `\"`）；awk 程序里改用八进制 `\042`/`\047`（源码 `\\042`/`\\047`）以避开 awk 字符串引号冲突。新增类似代码务必沿用这两种模式，否则会复现"整脚本 syntax error 无法加载"的坑（历史上 get_proxies 的 echo 曾因引号未转义导致整个 helper.sh 在路由器上无法加载）。
 - **两个 JSON 缩进风格不一致**：`menu.d/*.json` 用 4 空格、`acl.d/*.json` 用 Tab，各自保留即可。
 - `increment_version()` 靠正则定位 `PKG_VERSION = "..."` 行原地改写脚本——重命名该变量会破坏自增。
+- **权威设计文档**：整体产品设计见 `docs/产品设计文档.md`，子系统设计散落在 `docs/*.md`（链式代理、白名单+DNS 共存、访问日志、流量统计、广告过滤等）；新增子系统前先看对应设计文档对齐模型与命名。

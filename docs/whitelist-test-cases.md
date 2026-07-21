@@ -145,4 +145,4 @@
 5. **硬编码 DNS 客户端**：把白名单设备 A 的 DNS 手动设为 `8.8.8.8`，仍应被按源地址 DNAT 到 Mihomo（`nslookup` 返回 fake-ip）。
 6. **停止服务清理**：`/etc/init.d/mihomo stop` 后，`inet mihomo` 与 `inet mihomo_dns` 两张表均被销毁。
 
-> **IPv6**：白名单中若含 v6 地址（如 `fd00::158`），则 `inet mihomo_dns` 应额外含 `ip6 saddr { ... } ... dnat ip6 to [<router-v6>]:1053`，且 `inet mihomo` 含 `ip6 saddr != { ... } return` 旁路。需先用 `ss -lunp | grep 7893` 确认 Mihomo 在 IPv6 上监听 tproxy，否则 v6 流量无法被代理（v6 DNS 仍可按源分流）。详见 `docs/whitelist-dns-coexistence-design.md`。
+> **IPv6**：白名单中若含 v6 地址（如 `fd00::158`），则 `inet mihomo_dns` 应额外含 `ip6 saddr { ... } ... dnat ip6 to [<router-v6>]:1053`，且 `inet mihomo` 含 `ip6 saddr != { ... } return` 旁路。需先用 `ss -lunp | grep 7893` 确认 Mihomo 在 IPv6 上监听 tproxy，否则 v6 流量无法被代理（v6 DNS 仍可按源分流）。详见 `Docs/whitelist-dns-coexistence-design.md`。

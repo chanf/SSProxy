@@ -10,6 +10,21 @@
 
 ## 未发布（Unreleased / 工作区未提交）
 
+- 🆕 **链式代理重新设计**：新增独立 Tab，将旧 `relay_chain` / `relay_bind` 替换为「落地节点资产 + 设备数据链路」模型；支持 SOCKS5 / HTTP / SS / Trojan / VMess / VLESS。
+- 🆕 数据链路固定表达「设备 IP/CIDR → 订阅节点 → 落地节点」，自动注入带 `dialer-proxy` 的链路 `proxies` 和 `SRC-IP-CIDR` / `SRC-IP-CIDR6` 规则。
+- 🆕 新增 `get_chain_status`、`get_chain_log`、`test_data_link` 诊断接口及 `tests/shell/test_chain_proxy.py`。
+- 🆕 落地节点列表增加连通性/延时测试按钮，通过 Mihomo 控制器测试已应用节点并返回延时。
+- 🆕 数据链路列表增加红/绿通讯状态；测试成功或检测到真实链路流量后置绿，标题栏支持一键重置。
+- 🆕 数据链路按行显示上下行实时速率与累计流量，单位自动切换；累计值每 60 秒持久化，重置按钮同步清零。
+- 🐛 修复数据链路状态、当前速率和累计流量在 `GridSection` 中被当作 HTML 源码显示的问题，改为 DOM 节点渲染。
+- 🔧 访问日志简化为单一网络访问表，增加后端清空功能；修复记录未换行导致的非法 JSON 和日志无上限增长。
+- 🔧 彻底移除访问日志页面中旧的 IP 分类、实时连接和快捷规则代码，交付的 `accesslog.js` 只依赖日志读取与清空接口。
+- 🐛 修复卸载/重装后落地节点和数据链路丢失：`preinst` / `prerm` 将完整 UCI 配置备份到包清单外，`postinst` 原子恢复。
+- 🐛 清空访问日志时同步标记当前活跃连接，避免清空前已建立但尚未采集的连接立即重新出现。
+- 🐛 修复 Mihomo v1.19.x 已移除 `relay` 类型导致启用数据链路后核心无法启动，改用官方支持的 `dialer-proxy` 两跳链路。
+- 🐛 修复 BusyBox `printf` 不会像 macOS shell 一样吞掉 `\\\"` 而导致数据链路指标接口返回非法 JSON。
+- 🆕 数据链路标题栏新增全局「前置节点」选择：默认「非统一前置」沿用逐行订阅节点，选择具体节点后统一覆盖所有链路且不改写各行原值。
+- 🔧 清理旧 Relay 设置表单、仪表盘逐跳切换逻辑和旧版设计文档。
 - 🆕 **「受控 IP 列表」与「劫持系统 DNS」共存**（IPv4 + IPv6）：不再在 `dns_hijack=1` 时把白名单静默强转为 `all`。新增 nft 表 `inet mihomo_dns`（nat prerouting）按源 IP 把白名单设备的 53 端口 `dnat` 到 Mihomo DNS，其余设备保留 dnsmasq 真实上游直连。
 - 🆕 `helper.sh` 新增纯函数 `emit_tproxy_rules`（输出 nft 规则文本，`nft -f -` 应用）、`get_lan_ip` / `get_lan_ip6`（路由器 LAN 地址探测）；`init.d` 补 IPv6 策略路由与停机清理。
 - 🧪 新增 `tests/shell/test_tproxy_rules.py`（14 例）+ `ip` 测试桩；`test_prepare_config.py` 断言 `ipv6: true`。
