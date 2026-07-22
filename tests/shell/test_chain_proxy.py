@@ -188,6 +188,38 @@ def test_prepare_config_injects_complete_chain(run, uci_env, tmp_path):
     assert "SRC-IP-CIDR,192.168.66.158/32,ssproxy-chain-dl1" in output
 
 
+def test_prepare_config_only_injects_referenced_landing_nodes(run, uci_env, tmp_path):
+    source = tmp_path / "source.yaml"
+    source.write_text(BASE_CONFIG)
+    gets = {
+        "mihomo.config.config_path": str(source),
+        "mihomo.config.config_mode": "subscription",
+        "mihomo.config.dns_port": "1053",
+        "mihomo.config.tproxy_port": "7893",
+        "mihomo.config.mix_port": "7890",
+        "mihomo.config.tun_enabled": "0",
+        "mihomo.config.geo_auto_update": "0",
+    }
+    gets.update(_landing_gets("ln1"))
+    gets.update(_landing_gets("ln2"))
+    gets.update(_link_gets(landing="ln1"))
+    env = uci_env(
+        gets=gets,
+        show=[
+            "mihomo.ln1=landing_node",
+            "mihomo.ln2=landing_node",
+            "mihomo.dl1=data_link",
+        ],
+    )
+
+    result = run("prepare_config", env=env)
+    output = Path("/tmp/mihomo_run.yaml").read_text()
+
+    assert result.returncode == 0, result.stderr
+    assert 'name: "ssproxy-landing-ln1"' in output
+    assert 'name: "ssproxy-landing-ln2"' not in output
+
+
 def test_landing_node_delay_test_returns_controller_delay(run, uci_env):
     run_config = Path("/tmp/mihomo_run.yaml")
     run_config.write_text('proxies:\n  - name: "ssproxy-landing-ln1"\n    type: socks5\n')
@@ -232,15 +264,45 @@ def test_data_link_success_marks_health_and_reset_clears_it(run, uci_env, tmp_pa
         assert Path(env[key]).read_text() == ""
 
 
-def test_live_connection_marks_data_link_health(run_fn, uci_env, tmp_path):
+def test_live_connection_marks_data_link_health(run_fn, uci_env, bin_dir, tmp_path):
     env = uci_env(gets=_link_gets(), show=["mihomo.dl1=data_link"])
     paths = _metrics_env(env, tmp_path)
     raw = '{"connections":[{"chains":["ssproxy-chain-dl1"]}]}'
+    jsonfilter = Path(bin_dir) / "jsonfilter"
+    jsonfilter.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *'.policy'*) printf '%s\\n' \"$JSONFILTER_POLICY\" ;;\n"
+        "  *'.chains[0]'*) printf '%s\\n' \"$JSONFILTER_CHAIN\" ;;\n"
+        "esac\n"
+    )
+    jsonfilter.chmod(0o755)
+    env["JSONFILTER_CHAIN"] = "ssproxy-chain-dl1"
 
     result = run_fn(f"update_data_link_health_from_connections '{raw}'", env=env)
 
     assert result.returncode == 0, result.stderr
     assert paths["MIHOMO_DATA_LINK_HEALTH_FILE"].read_text().strip() == "dl1"
+
+
+def test_live_connection_health_does_not_substring_match(run_fn, uci_env, bin_dir, tmp_path):
+    env = uci_env(gets=_link_gets(), show=["mihomo.dl1=data_link"])
+    paths = _metrics_env(env, tmp_path)
+    jsonfilter = Path(bin_dir) / "jsonfilter"
+    jsonfilter.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *'.policy'*) printf '%s\\n' \"$JSONFILTER_POLICY\" ;;\n"
+        "  *'.chains[0]'*) printf '%s\\n' \"$JSONFILTER_CHAIN\" ;;\n"
+        "esac\n"
+    )
+    jsonfilter.chmod(0o755)
+    env["JSONFILTER_CHAIN"] = "ssproxy-chain-dl10"
+
+    result = run_fn("update_data_link_health_from_connections '{}'", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not paths["MIHOMO_DATA_LINK_HEALTH_FILE"].exists()
 
 
 def test_data_link_metrics_endpoint_returns_rates_totals_and_health(run, uci_env, tmp_path):
@@ -268,7 +330,7 @@ def test_data_link_json_printf_is_busybox_portable(src_files):
 
     assert "printf '\\\"%s\\\"'" not in helper
     assert "printf '{\\\"sid\\\":" not in helper
-    assert "printf '{\"sid\":\"%s\"" in helper
+    assert "printf '{\"sid\":%s" in helper
 
 
 def test_set_chain_front_node_validates_and_commits(run, uci_env, tmp_path):
@@ -293,8 +355,67 @@ def test_chain_frontend_contains_unified_front_control(src_files):
 
     assert "_('非统一前置')" in chain
     assert "['set_chain_front_node', selected]" in chain
+    assert "切换前置节点将重启 Mihomo" in chain
     assert "o.readonly = front_node !== 'individual'" in chain
     assert "p.name.indexOf('ssproxy-chain-') !== 0" in chain
+    assert "['add_data_link_to_acl', section_id]" in chain
+    assert "row.reason" in chain
+
+
+def test_chain_status_explains_whitelist_bypass_and_acl_action(run, uci_env, tmp_path):
+    Path("/tmp/mihomo_run.yaml").write_text(
+        BASE_CONFIG
+        + '  - name: "ssproxy-chain-dl1"\n'
+        + "    type: socks5\n"
+    )
+    gets = {
+        "mihomo.config.acl_mode": "whitelist",
+        "mihomo.config.tun_enabled": "0",
+        "mihomo.config.acl_ips": "",
+    }
+    gets.update(_landing_gets())
+    gets.update(_link_gets())
+    env = uci_env(
+        gets=gets,
+        show=["mihomo.ln1=landing_node", "mihomo.dl1=data_link"],
+    )
+
+    status = run("get_chain_status", env=env)
+    payload = json.loads(status.stdout)
+
+    assert status.returncode == 0, status.stderr
+    assert payload["links"][0]["code"] == "bypassed"
+    assert payload["links"][0]["runtime"] == 1
+    assert payload["links"][0]["intercepted"] == 0
+
+    added = run("add_data_link_to_acl", "dl1", env=env)
+    assert added.returncode == 0, added.stderr
+    assert json.loads(added.stdout)["changed"] == 1
+    assert "add_list mihomo.config.acl_ips=192.168.66.158" in uci_env.ops()
+
+
+def test_chain_status_normalizes_host_prefix_in_acl(run, uci_env):
+    Path("/tmp/mihomo_run.yaml").write_text(
+        BASE_CONFIG
+        + '  - name: "ssproxy-chain-dl1"\n'
+        + "    type: socks5\n"
+    )
+    gets = {
+        "mihomo.config.acl_mode": "whitelist",
+        "mihomo.config.tun_enabled": "0",
+        "mihomo.config.acl_ips": "192.168.66.158/32",
+    }
+    gets.update(_landing_gets())
+    gets.update(_link_gets())
+    env = uci_env(
+        gets=gets,
+        show=["mihomo.ln1=landing_node", "mihomo.dl1=data_link"],
+    )
+
+    payload = json.loads(run("get_chain_status", env=env).stdout)
+
+    assert payload["links"][0]["code"] == "ready"
+    assert payload["links"][0]["intercepted"] == 1
 
 
 def test_resolve_data_link_sid_uses_device_ip_or_group(run_fn, uci_env):

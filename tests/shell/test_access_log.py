@@ -100,3 +100,9 @@ def test_frontend_uses_dom_nodes_for_data_link_metrics(src_files):
     assert "add_access_rule" not in access_log
     assert "IP列表" not in access_log
     assert "实时连接" not in access_log
+    assert "'id': 'accesslog-device-filter'" in access_log
+    assert "'id': 'accesslog-outbound-filter'" in access_log
+    assert "deviceFilterKey: function(row)" in access_log
+    assert "outboundFilterValue: function(row)" in access_log
+    assert "outboundFilterKey: function(row)" in access_log
+    assert "没有符合筛选条件的访问日志" in access_log

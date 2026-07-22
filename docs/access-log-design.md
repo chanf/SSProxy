@@ -1,8 +1,8 @@
 # Mihomo 访问日志 产品设计文档
 
-> 2026-07-21 实现已简化为单一「网络访问日志」表：只展示时间、设备/IP、访问目标、出站策略和流量，最多保留 2000 条，支持后端清空。下文中「实时连接 / IP 列表 / 快捷规则」为旧版设计记录，不再是当前页面功能。
+> 2026-07-22 实现为单一「网络访问日志」表：只展示时间、设备/IP、访问目标、出站策略和流量，最多保留 2000 条，支持设备/IP与出站策略组合过滤、后端清空。仪表盘「系统代理日志」另支持 Debug/Info/Warning/Error/Fatal/其他级别过滤。下文中「实时连接 / IP 列表 / 快捷规则」为旧版设计记录，不再是当前页面功能。
 
-> 状态：**已实现并重构（v1.0.0-90 拆分为独立页面）**
+> 状态：**已实现并重构（v1.0.0-197）**
 > 模块：`luci-app-ssproxy` → 「访问日志」页面（`admin/services/mihomo/accesslog`）与「规则管理」页面（`admin/services/mihomo/rules`）
 > 适用：OpenWrt + LuCI，依赖 Mihomo（Clash Meta）核心经 TProxy / TUN 透明接管流量
 
@@ -14,7 +14,7 @@
 |---|---|
 | 模块定位 | 访问日志与规则管理分离，形成平级独立的两个子页面 |
 | 入口路径 | ① **访问日志** (`/accesslog`)；② **规则管理** (`/rules`) |
-| 核心能力 | ① 局域网设备实时连接可见性（带全局模糊过滤搜索）；② 历史访问记录落盘；③ 独立配置与应用代理/直连/拦截规则（UCI 持久化） |
+| 核心能力 | ① 历史访问记录落盘；② 设备/IP与出站策略组合过滤；③ 独立配置与应用代理/直连/拦截规则（UCI 持久化） |
 | 实现载体 | `helper.sh` 子命令 + 常驻采集进程 + `accesslog.js`/`rules.js` 视图 + 菜单节点 + `prepare_config` 规则注入 |
 | 数据源 | Mihomo 外部控制器 `127.0.0.1:9090` 的 `GET /connections`；`/tmp/dhcp.leases` 设备名解析；UCI `mihomo` 规则段 |
 | 变更生效 | 规则写入 UCI 后**需手动在规则页面点击重启核心**（`/etc/init.d/mihomo restart`）生效，重启有 1~2s 短暂断流 |
@@ -151,7 +151,7 @@ config mihomo_rule
   - `up`/`down` 缺省补 `0`。
 
 ### 7.2 `collect_connections`
-- 行为：同 `get_connections` 取实时连接，逐条去重（用 `/tmp/mihomo_access.seen` 记录已采集的连接 `id`），新连接以 `{"ts":<unix秒>,"id","ip","device","domain","dst","policy","rule","up","down","start"}` 追加到 `/tmp/mihomo_access.log`。
+- 行为：从统一遥测循环复用的 `/connections` 快照逐条去重（用 `/tmp/mihomo_access.seen` 记录已采集的连接 `id`），新连接以 `{"ts":<unix秒>,"id","ip","device","domain","dst","policy","rule","up","down","start"}` 追加到 `/tmp/mihomo_access.log`。
 - 去重集超过 2000 行时滚动裁剪，避免无限增长。
 - 核心不可达时直接返回（无操作）。
 - 由 `init.d/mihomo` 启动时的常驻 procd 实例每 15s 调用一次。

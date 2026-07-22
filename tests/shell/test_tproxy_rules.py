@@ -68,25 +68,30 @@ def test_whitelist_dns_on_full_coexistence(run_fn):
 
 
 def test_whitelist_dns_on_v4_only(run_fn):
-    # Only IPv4 acl + router IP: v4 DNAT emitted, no v6 rules.
+    # Only IPv4 acl + router IP: v4 DNAT emitted, plus an explicit IPv6
+    # family bypass so IPv6 traffic cannot accidentally fall through to the
+    # catch-all TProxy rule.
     out = _emit(run_fn, 7893, "whitelist", "10.0.0.5", "", 1, 1053, "10.0.0.1", "")
     assert "ip saddr { 10.0.0.5 } udp dport 53 dnat ip to 10.0.0.1:1053" in out
-    assert "ip6 saddr" not in out
+    assert "ip6 saddr ::/0 return" in out
 
 
 def test_whitelist_dns_on_v6_only(run_fn):
-    # Only IPv6 acl + router IP: v6 DNAT emitted, no v4 source rules.
+    # Only IPv6 acl + router IP: v6 DNAT emitted, plus an explicit IPv4
+    # family bypass so IPv4 traffic cannot accidentally fall through to the
+    # catch-all TProxy rule.
     out = _emit(run_fn, 7893, "whitelist", "", "fd00::5", 1, 1053, "", "fe80::1")
     assert "ip6 saddr { fd00::5 } udp dport 53 dnat ip6 to [fe80::1]:1053" in out
     assert "ip6 saddr != { fd00::5 } return" in out
-    assert "ip saddr" not in out
+    assert "ip saddr 0.0.0.0/0 return" in out
 
 
 def test_empty_acl_emits_no_source_rules(run_fn):
-    # whitelist + dns_hijack but empty acl: behaves like all mode (no saddr,
-    # no DNS table). init.d falls back to the global dnsmasq hijack here.
+    # whitelist + dns_hijack but empty acl: bypass both address families and
+    # omit the DNS table. init.d falls back to the global dnsmasq hijack here.
     out = _emit(run_fn, 7893, "whitelist", "", "", 1, 1053, "192.168.66.1", "fe80::1")
-    assert "saddr" not in out
+    assert "ip saddr 0.0.0.0/0 return" in out
+    assert "ip6 saddr ::/0 return" in out
     assert "mihomo_dns" not in out
 
 

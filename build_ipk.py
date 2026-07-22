@@ -1,4 +1,5 @@
 import datetime
+import contextlib
 import gzip
 import io
 import os
@@ -9,7 +10,7 @@ import tarfile
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-ssproxy"
-PKG_VERSION = "1.0.0-189"
+PKG_VERSION = "1.0.0-199"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -18,7 +19,7 @@ src_files = {
     # Package metadata
     "CONTROL/control": """Package: luci-app-ssproxy
 Version: 1.0.0-1
-Depends: luci-base, ip-full, kmod-nft-tproxy, kmod-nft-nat, curl
+Depends: luci-base, ip-full, kmod-nft-tproxy, kmod-nft-nat, curl, ca-bundle
 Architecture: all
 Maintainer: Antigravity
 Section: luci
@@ -123,6 +124,8 @@ config mihomo 'config'
 
 START=95
 USE_PROCD=1
+EXTRA_COMMANDS="apply_network"
+EXTRA_HELP="        apply_network  Wait for Mihomo and apply TProxy/DNS interception"
 
 enable_tproxy() {
 	local tproxy_port="$1" acl_mode="$2" acl_v4="$3" acl_v6="$4"
@@ -140,6 +143,11 @@ enable_tproxy() {
 	nft delete table inet mihomo 2>/dev/null
 	nft delete table inet mihomo_dns 2>/dev/null
 	/usr/share/mihomo/helper.sh emit_tproxy_rules "$tproxy_port" "$acl_mode" "$acl_v4" "$acl_v6" "$dns_hijack" "$dns_port" "$rip_v4" "$rip_v6" | nft -f -
+	local nft_status=$?
+	if [ "$nft_status" -ne 0 ]; then
+		logger -t mihomo "ERROR: Failed to apply nftables TProxy rules"
+		return 1
+	fi
 
 	logger -t mihomo "TProxy redirect rules enabled on port $tproxy_port (acl_mode: $acl_mode, dns_hijack: $dns_hijack)"
 }
@@ -158,26 +166,110 @@ disable_tproxy() {
 
 enable_dns_hijack() {
 	local dns_port="$1"
+	local state_file="/etc/mihomo/.dnsmasq_state"
+	mkdir -p /etc/mihomo
+	if [ ! -f "$state_file" ]; then
+		local original_noresolv
+		original_noresolv=$(uci -q get dhcp.@dnsmasq[0].noresolv)
+		if [ -n "$original_noresolv" ]; then
+			printf 'noresolv=%s\n' "$original_noresolv" > "$state_file"
+		else
+			printf 'noresolv=__unset__\n' > "$state_file"
+		fi
+		printf 'port=%s\n' "$dns_port" >> "$state_file"
+		chmod 600 "$state_file"
+	fi
 	
 	# Configure Dnsmasq to forward external requests to Mihomo DNS
-	uci add_list dhcp.@dnsmasq[0].server="127.0.0.1#$dns_port"
-	uci set dhcp.@dnsmasq[0].noresolv="1"
-	uci commit dhcp
-	/etc/init.d/dnsmasq restart
+	if ! uci -q show dhcp.@dnsmasq[0].server 2>/dev/null | grep -q "127.0.0.1#${dns_port}"; then
+		uci add_list dhcp.@dnsmasq[0].server="127.0.0.1#$dns_port" || return 1
+	fi
+	uci set dhcp.@dnsmasq[0].noresolv="1" || return 1
+	uci commit dhcp || return 1
+	/etc/init.d/dnsmasq restart || return 1
 	
 	logger -t mihomo "DNS hijack enabled: Dnsmasq forwarding to Mihomo DNS on port $dns_port"
 }
 
 disable_dns_hijack() {
-	local dns_port="$1"
+	local dns_port="$1" state_file="/etc/mihomo/.dnsmasq_state"
+	if [ -f "$state_file" ]; then
+		local state_port original_noresolv
+		state_port=$(sed -n 's/^port=//p' "$state_file" | head -n 1)
+		[ -n "$state_port" ] && dns_port="$state_port"
+		original_noresolv=$(sed -n 's/^noresolv=//p' "$state_file" | head -n 1)
+	else
+		original_noresolv="__unset__"
+	fi
 	
 	# Revert Dnsmasq changes
 	uci del_list dhcp.@dnsmasq[0].server="127.0.0.1#$dns_port" 2>/dev/null
-	uci del dhcp.@dnsmasq[0].noresolv 2>/dev/null
+	if [ "$original_noresolv" = "__unset__" ]; then
+		uci del dhcp.@dnsmasq[0].noresolv 2>/dev/null
+	elif [ -n "$original_noresolv" ]; then
+		uci set dhcp.@dnsmasq[0].noresolv="$original_noresolv"
+	fi
 	uci commit dhcp
 	/etc/init.d/dnsmasq restart
+	rm -f "$state_file"
 	
 	logger -t mihomo "DNS hijack disabled"
+}
+
+apply_network() {
+	config_load mihomo
+	local dns_port dns_hijack tproxy_port tun_enabled acl_mode
+	local acl_v4="" acl_v6="" rip_v4="" rip_v6="" src_dns=0
+	config_get dns_port config dns_port "1053"
+	config_get_bool dns_hijack config dns_hijack 1
+	config_get tproxy_port config tproxy_port "7893"
+	config_get_bool tun_enabled config tun_enabled 0
+	config_get acl_mode config acl_mode "all"
+
+	# procd starts registered instances only after start_service returns. This
+	# command runs as a separate one-shot instance, so the core can become ready
+	# while we wait without deadlocking the service start.
+	if ! /usr/share/mihomo/helper.sh wait_controller 30; then
+		logger -t mihomo "ERROR: Mihomo controller did not become ready; network interception not applied"
+		disable_tproxy
+		return 1
+	fi
+
+	if [ "$tun_enabled" -ne 1 ]; then
+		append_acl_ip() {
+			[ -n "$1" ] || return 0
+			if ! /usr/share/mihomo/helper.sh validate_acl_ip "$1"; then
+				logger -t mihomo "WARN: ignoring invalid ACL IP/CIDR '$1'"
+				return 0
+			fi
+			case "$1" in
+				*:*) acl_v6="${acl_v6:+$acl_v6,}$1" ;;
+				*) acl_v4="${acl_v4:+$acl_v4,}$1" ;;
+			esac
+		}
+		config_list_foreach config acl_ips append_acl_ip
+
+		if [ "$acl_mode" = "whitelist" ] && [ "$dns_hijack" -eq 1 ] && { [ -n "$acl_v4" ] || [ -n "$acl_v6" ]; }; then
+			rip_v4=$(/usr/share/mihomo/helper.sh get_lan_ip 2>/dev/null)
+			rip_v6=$(/usr/share/mihomo/helper.sh get_lan_ip6 2>/dev/null)
+			{ [ -n "$rip_v4" ] || [ -n "$rip_v6" ]; } && src_dns=1
+			[ "$src_dns" = "0" ] && logger -t mihomo "WARN: LAN IP not detected; falling back to global DNS hijack"
+		fi
+
+		if ! enable_tproxy "$tproxy_port" "$acl_mode" "$acl_v4" "$acl_v6" "$dns_hijack" "$dns_port" "$rip_v4" "$rip_v6"; then
+			disable_tproxy
+			return 1
+		fi
+	fi
+
+	if [ "$dns_hijack" -eq 1 ] && [ "$src_dns" != "1" ]; then
+		if ! enable_dns_hijack "$dns_port"; then
+			logger -t mihomo "ERROR: Failed to configure dnsmasq DNS hijack"
+			disable_tproxy
+			return 1
+		fi
+	fi
+	logger -t mihomo "Mihomo network interception applied after controller became ready"
 }
 
 start_service() {
@@ -237,68 +329,36 @@ EOF
 		return 1
 	fi
 	
+	# Validate before handing the config to procd. This catches fatal YAML/provider
+	# errors without installing any traffic interception.
+	: > /tmp/mihomo_core.log
+	if ! "$core_path" -t -d "$work_dir" -f /tmp/mihomo_run.yaml >> /tmp/mihomo_core.log 2>&1; then
+		logger -t mihomo "ERROR: Mihomo configuration validation failed"
+		return 1
+	fi
+
 	# Start Daemon — capture the core's real stdout/stderr (incl. FATAL errors)
 	# to a dedicated file so the dashboard can surface startup failures.
-	# Truncated per clean start; procd respawns append, so a crash loop stays visible.
-	: > /tmp/mihomo_core.log
+	# procd respawns append, so a crash loop stays visible.
 	procd_open_instance
 	# Wrap in sh -c so we can redirect output to the log file (procd execs directly,
 	# no shell, so '>' must live inside the sh -c script). $0=mihomo, $1=core, $2=workdir.
 	procd_set_param command sh -c 'ulimit -Hn 65535; ulimit -n 65535; "$1" -d "$2" -f /tmp/mihomo_run.yaml >> /tmp/mihomo_core.log 2>&1' mihomo "$core_path" "$work_dir"
 	procd_set_param respawn
 	procd_close_instance
-	
-	# Apply network redirections
-	if [ "$tun_enabled" -ne 1 ]; then
-		local acl_mode acl_v4="" acl_v6=""
-		config_get acl_mode config acl_mode "all"
 
-		# Collect acl_ips and split by family: a ':' marks IPv6, anything else
-		# (a single addr or an IPv4 CIDR like 192.168.1.0/24) is IPv4.
-		append_acl_ip() {
-			[ -n "$1" ] || return 0
-			case "$1" in
-				*:*) acl_v6="${acl_v6:+$acl_v6,}$1" ;;
-				*) acl_v4="${acl_v4:+$acl_v4,}$1" ;;
-			esac
-		}
-		config_list_foreach config acl_ips append_acl_ip
-
-		# whitelist+dns_hijack: redirect only whitelisted clients' DNS to Mihomo
-		# (source-scoped nft DNAT) instead of the global dnsmasq hijack. Detect the
-		# router's LAN addresses as the DNAT target; fall back to the global hijack
-		# if we can't find them or the acl is empty.
-		local rip_v4="" rip_v6="" src_dns=0
-		if [ "$acl_mode" = "whitelist" ] && [ "$dns_hijack" -eq 1 ] && { [ -n "$acl_v4" ] || [ -n "$acl_v6" ]; }; then
-			rip_v4=$(/usr/share/mihomo/helper.sh get_lan_ip 2>/dev/null)
-			rip_v6=$(/usr/share/mihomo/helper.sh get_lan_ip6 2>/dev/null)
-			{ [ -n "$rip_v4" ] || [ -n "$rip_v6" ]; } && src_dns=1
-			[ "$src_dns" = "0" ] && logger -t mihomo "WARN: LAN IP not detected; falling back to global DNS hijack"
-		fi
-
-		enable_tproxy "$tproxy_port" "$acl_mode" "$acl_v4" "$acl_v6" "$dns_hijack" "$dns_port" "$rip_v4" "$rip_v6"
-	fi
-
-	# Global dnsmasq hijack: 'all' mode, TUN mode, or whitelist mode without a
-	# working source-scoped DNAT. Skipped when the source-scoped nft DNAT is
-	# active so non-whitelisted clients keep the router's real DNS upstream.
-	if [ "$dns_hijack" -eq 1 ] && [ "$src_dns" != "1" ]; then
-		enable_dns_hijack "$dns_port"
-	fi
-
-	# Background collector: persist connections to /tmp/mihomo_access.log for the
-	# access-log history view. No-ops when the core controller is unreachable.
-	procd_open_instance
-	procd_set_param command /usr/share/mihomo/helper.sh collect_loop
+	# One-shot procd instance: wait for the actual core process, then install
+	# interception. It deliberately has no respawn policy.
+	procd_open_instance network_setup
+	procd_set_param command /etc/init.d/mihomo apply_network
 	procd_set_param stdout 1
 	procd_set_param stderr 1
-	procd_set_param respawn
 	procd_close_instance
 
-	# Traffic stats loop: every 5s accumulate proxy (chains[0]!=DIRECT) byte
-	# deltas into a never-cleared grand total + clearable per-domain buckets.
+	# Unified telemetry collector: fetch /connections once every 5 seconds, then
+	# reuse the snapshot for traffic, chain metrics and 15-second access history.
 	procd_open_instance
-	procd_set_param command /usr/share/mihomo/helper.sh traffic_loop
+	procd_set_param command /usr/share/mihomo/helper.sh collect_loop
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_set_param respawn
@@ -314,7 +374,7 @@ EOF
 	procd_set_param respawn
 	procd_close_instance
 
-	logger -t mihomo "Mihomo service started successfully"
+	logger -t mihomo "Mihomo service instances registered successfully"
 }
 
 stop_service() {
@@ -362,15 +422,18 @@ get_api_config() {
 get_api_config
 
 mihomo_curl() {
-	local auth_header=""
-	if [ -n "$API_SECRET" ]; then
-		auth_header="Authorization: Bearer $API_SECRET"
-	fi
-	if [ -n "$auth_header" ]; then
-		curl -H "$auth_header" "$@"
-	else
+	if [ -z "$API_SECRET" ]; then
 		curl "$@"
+		return $?
 	fi
+	local auth_file rc
+	auth_file=$(mktemp) || return 1
+	chmod 600 "$auth_file"
+	printf 'Authorization: Bearer %s\n' "$API_SECRET" > "$auth_file"
+	curl -H "@$auth_file" "$@"
+	rc=$?
+	rm -f "$auth_file"
+	return "$rc"
 }
 
 cpu_amd64_v3() {
@@ -430,6 +493,21 @@ check_core() {
 	fi
 }
 
+check_controller() {
+	mihomo_curl -s -m 1 "http://127.0.0.1:${API_PORT}/version" >/dev/null 2>&1
+}
+
+wait_controller() {
+	local timeout="$1" i=0
+	case "$timeout" in ''|*[!0-9]*) timeout=30 ;; esac
+	while [ "$i" -lt "$timeout" ]; do
+		check_controller && return 0
+		i=$((i + 1))
+		sleep 1
+	done
+	return 1
+}
+
 download_core() {
 	local arch=$(get_arch)
 	if [ "$arch" = "unknown" ]; then
@@ -441,47 +519,105 @@ download_core() {
 	local mirror="https://github.com/MetaCubeX/mihomo/releases/download/${version}"
 	local filename="mihomo-linux-${arch}-${version}.gz"
 	local url="${mirror}/${filename}"
+	local expected_sha256="$2" custom_url=0
 
 	if [ -n "$1" ]; then
 		url="$1"
-		filename=$(basename "$url")
+		custom_url=1
+		local url_path="${url%%[?]*}"
+		filename=$(basename "$url_path")
 	fi
+	[ -n "$filename" ] && [ "$filename" != "." ] && [ "$filename" != "/" ] || {
+		echo "ERROR: Invalid core download filename" >&2
+		return 1
+	}
+	case "$url" in
+		https://*) ;;
+		*)
+			echo "ERROR: Core downloads require HTTPS" >&2
+			return 1
+		;;
+	esac
+	if [ "$custom_url" = "0" ]; then
+		case "$filename" in
+			mihomo-linux-amd64-compatible-v1.19.28.gz) expected_sha256="70d01cfb8cb7bf7a92fd1af16cb4b9553d90bb4eecde3b5c4849103e27c80ddb" ;;
+			mihomo-linux-amd64-v1.19.28.gz) expected_sha256="d5967e079d9f793515a5a8193aabda455f7e012427eccd567dbc4f2f15498204" ;;
+			mihomo-linux-arm64-v1.19.28.gz) expected_sha256="2474450cd1c41dfa53036a54a4e85579f493d3af524d86c3d4b8e2b240b56cd2" ;;
+			mihomo-linux-armv7-v1.19.28.gz) expected_sha256="661a64466f79ab9c39cd3a1c1ece5371a4d93f87cb2d6610ff8c0dacaaa9f180" ;;
+			mihomo-linux-mips-softfloat-v1.19.28.gz) expected_sha256="cfe16b8422198831b6e8d002a93786b0c39fe58a1e240ee4c38d1692d71865b0" ;;
+			mihomo-linux-mipsle-softfloat-v1.19.28.gz) expected_sha256="cb181a3464310055a0c39c3fe8453c7ad9ad657cb24fbf1cadc2218899d0ec13" ;;
+			*) expected_sha256="" ;;
+		esac
+	fi
+	expected_sha256=$(printf '%s' "$expected_sha256" | tr 'A-F' 'a-f')
+	printf '%s' "$expected_sha256" | grep -Eq '^[0-9a-f]{64}$' || {
+		echo "ERROR: A SHA256 digest is required for this core asset" >&2
+		return 1
+	}
+	command -v sha256sum >/dev/null 2>&1 || {
+		echo "ERROR: sha256sum is required to verify the core" >&2
+		return 1
+	}
 
 	local core_path=$(uci -q get mihomo.config.core_path || echo "/usr/bin/mihomo")
 	local core_dir=$(dirname "$core_path")
+	local download_dir
 	
 	mkdir -p "$core_dir"
-	mkdir -p /tmp/mihomo_download
+	download_dir=$(mktemp -d /tmp/mihomo_download.XXXXXX) || {
+		echo "ERROR: Cannot create download directory" >&2
+		return 1
+	}
 
 	echo "Downloading Mihomo core from $url..."
-	curl -fsSL -k -o "/tmp/mihomo_download/$filename" "$url"
+	curl -fsSL --proto '=https' --tlsv1.2 -o "$download_dir/$filename" "$url"
 	if [ $? -ne 0 ]; then
 		echo "ERROR: Download failed" >&2
-		rm -rf /tmp/mihomo_download
+		rm -rf "$download_dir"
+		return 1
+	fi
+	local actual_sha256
+	actual_sha256=$(sha256sum "$download_dir/$filename" | awk '{print $1}')
+	if [ "$actual_sha256" != "$expected_sha256" ]; then
+		echo "ERROR: Core SHA256 verification failed" >&2
+		rm -rf "$download_dir"
 		return 1
 	fi
 
 	echo "Extracting binary..."
-	if [ "${filename##*.}" = "gz" ] && [ "${filename#*.gz}" != "$filename" ]; then
-		gunzip -f "/tmp/mihomo_download/$filename"
-		local extracted_name=$(basename "$filename" .gz)
-		mv "/tmp/mihomo_download/$extracted_name" "$core_path"
-	elif [ "${filename##*.}" = "tar.gz" ] || [ "${filename#*.tar.gz}" != "$filename" ]; then
-		tar -zxf "/tmp/mihomo_download/$filename" -C /tmp/mihomo_download
-		local bin_file=$(find /tmp/mihomo_download -type f -executable | head -n 1)
+	local candidate="$download_dir/mihomo_candidate"
+	case "$filename" in
+	*.tar.gz|*.tgz)
+		tar -zxf "$download_dir/$filename" -C "$download_dir"
+		local bin_file=$(find "$download_dir" -type f -name 'mihomo*' | head -n 1)
 		if [ -n "$bin_file" ]; then
-			mv "$bin_file" "$core_path"
+			mv "$bin_file" "$candidate"
 		else
 			echo "ERROR: Could not find executable in tarball" >&2
-			rm -rf /tmp/mihomo_download
+			rm -rf "$download_dir"
 			return 1
-	fi
-	else
-		mv "/tmp/mihomo_download/$filename" "$core_path"
-	fi
+		fi
+		;;
+	*.gz)
+		gunzip -c "$download_dir/$filename" > "$candidate" || {
+			echo "ERROR: Could not extract core gzip" >&2
+			rm -rf "$download_dir"
+			return 1
+		}
+		;;
+	*)
+		mv "$download_dir/$filename" "$candidate"
+		;;
+	esac
 
-	chmod +x "$core_path"
-	rm -rf /tmp/mihomo_download
+	[ -s "$candidate" ] || {
+		echo "ERROR: Extracted core is empty" >&2
+		rm -rf "$download_dir"
+		return 1
+	}
+	chmod +x "$candidate"
+	mv -f "$candidate" "$core_path"
+	rm -rf "$download_dir"
 	echo "SUCCESS: Mihomo core installed to $core_path"
 	return 0
 }
@@ -506,7 +642,9 @@ update_geox() {
 		local fname="${pair%%:*}" url="${pair#*:}"
 		[ -z "$url" ] && continue
 		echo "Downloading $fname from $url..."
-		if curl -fsSL -k -o "$tmpd/$fname" "$url"; then
+		if ! valid_http_url "$url"; then
+			failed="$failed $fname(invalid-url)"
+		elif curl -fsSL -o "$tmpd/$fname" "$url"; then
 			mv "$tmpd/$fname" "$work_dir/$fname"
 			ok=$((ok + 1))
 		else
@@ -530,130 +668,287 @@ update_geox() {
 	return 0
 }
 
-update_subscription() {
-	local url="$1"
-	# Custom-only mode has no subscription; refuse to overwrite the user's config.
-	if [ "$(uci -q get mihomo.config.config_mode || echo subscription)" = "custom" ]; then
-		echo "ERROR: 当前为「仅自定义配置」模式，无法下载订阅。请切换到订阅/混合模式后再更新订阅。" >&2
-		return 1
-	fi
-	if [ -z "$url" ]; then
-		url=$(uci -q get mihomo.config.subscription_url)
-	fi
-	if [ -z "$url" ]; then
-		echo "ERROR: No subscription URL specified" >&2
-		return 1
-	fi
-	local work_dir=$(uci -q get mihomo.config.work_dir || echo "/etc/mihomo")
-	local config_path=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
-
-	mkdir -p "$work_dir"
-	logger -t mihomo "Updating subscription from $url"
-	echo "Fetching subscription..."
-	# Bypass our own fake-ip DNS hijack: when dns_hijack is on, dnsmasq forwards to
-	# mihomo which returns 198.18.x.x for everything, so a plain curl would connect
-	# to a fake IP and fail. Resolve the host via a direct query to public resolvers
-	# (router-originated UDP bypasses tproxy/dnsmasq) and force the real IP.
-	local host realip resolve_arg=""
-	host="${url#*://}"; host="${host%%/*}"; host="${host##*@}"; host="${host%%:*}"
-	if [ -n "$host" ]; then
-		for ns in 223.5.5.5 119.29.29.29 1.1.1.1; do
-			realip=$(nslookup "$host" "$ns" 2>/dev/null | awk '/^Address:[[:space:]]/ {last=$NF} END {print last}')
-			# accept only a pure IPv4; reject server-style "1.2.3.4:53", CNAMEs, empty
-			case "$realip" in
-				*[!0-9.]*|"") realip="" ;;
-				*.*.*.*) break ;;
-				*) realip="" ;;
-			esac
-			[ -n "$realip" ] && break
-		done
-		[ -n "$realip" ] && resolve_arg="--resolve ${host}:443:${realip}"
-	fi
-	curl -fsSL -k -A "ClashMeta" $resolve_arg -o "/tmp/mihomo_sub.yaml" "$url"
-	if [ $? -ne 0 ] || ! grep -q "^proxies:" /tmp/mihomo_sub.yaml 2>/dev/null; then
-		echo "ERROR: Failed to download subscription (resolved=$realip)" >&2
-		logger -t mihomo "Subscription update FAILED: download error (resolved=$realip)"
-		rm -f /tmp/mihomo_sub.yaml
-		# Deadlock guard: if the live config has no proxies (stub/empty) but a backup
-		# exists, restore it so we're never left without any proxy.
-		if ! grep -q "^proxies:" "$config_path" 2>/dev/null && [ -s "${config_path}.bak" ]; then
-			cp "${config_path}.bak" "$config_path"
-			logger -t mihomo "Restored previous subscription from ${config_path}.bak"
-			echo "WARNING: download failed; restored previous subscription from backup" >&2
-			/etc/init.d/mihomo restart >/dev/null 2>&1
-		fi
-		return 1
-	fi
-
-	mv "/tmp/mihomo_sub.yaml" "$config_path"
-	uci -q set mihomo.config.last_update="$(date +%s)"
-	uci -q commit mihomo
-	save_subscription_url "$url"
-	# Restart the core so it loads the freshly downloaded config. Without this the
-	# running core keeps serving the previous (empty/stale) proxy set while the
-	# dashboard reads the new file, causing every node delay test to fail with
-	# "Resource not found".
-	if pidof mihomo >/dev/null 2>&1; then
-		/etc/init.d/mihomo restart
-	fi
-	echo "SUCCESS: Subscription updated at $config_path"
-	logger -t mihomo "Subscription updated: $(wc -c < "$config_path") bytes at $config_path"
-	return 0
-}
-
-# Remove all locally downloaded subscription nodes. The subscription_url is
-# preserved so the user can re-fetch later. If the core is running it is
-# restarted so the deletion takes effect immediately.
-clear_subscription() {
-	# Custom-only mode has no subscription to clear.
-	if [ "$(uci -q get mihomo.config.config_mode || echo subscription)" = "custom" ]; then
-		echo '{"success":false,"msg":"当前为「仅自定义配置」模式，没有可清空的订阅节点"}'
-		return 0
-	fi
-	local config_path=$(uci -q get mihomo.config.config_path || echo "/etc/mihomo/config.yaml")
-	# Back up the current subscription before deleting, so it can be restored if a
-	# later re-download fails (e.g. the subscription host is only reachable via the
-	# proxy, which is now gone). update_subscription auto-restores this on failure.
-	if [ -s "$config_path" ]; then
-		cp "$config_path" "${config_path}.bak"
-		logger -t mihomo "Backed up subscription to ${config_path}.bak before clearing"
-	fi
-	rm -f "$config_path"
-	uci -q set mihomo.config.last_update=''
-	uci -q commit mihomo
-	logger -t mihomo "All subscription nodes cleared"
-	if pidof mihomo >/dev/null 2>&1; then
-		/etc/init.d/mihomo restart
-	fi
-	echo '{"success":true,"msg":"已清空所有订阅节点"}'
-}
-
-# Persist the subscription URL to a package-external store so it survives a full
-# reinstall (opkg remove + install), which would otherwise delete the conffile
-# /etc/config/mihomo. The file is not part of the package manifest, so opkg
-# never removes it.
 SUBSCRIPTION_URL_FILE="/etc/mihomo/.subscription_url"
+
+subscription_sections() {
+	uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=subscription$/\\1/p'
+}
+
+subscription_cache_dir() {
+	local work_dir
+	work_dir=$(uci -q get mihomo.config.work_dir || echo /etc/mihomo)
+	printf '%s/subscriptions\n' "$work_dir"
+}
+
+enabled_subscription_count() {
+	local count
+	count=$(subscription_sections | while read -r sid; do [ "$(uci -q get mihomo.$sid.enabled)" != "0" ] && echo 1; done | wc -l | tr -d ' ')
+	if [ "${count:-0}" -eq 0 ] && [ -n "$(uci -q get mihomo.config.subscription_url)" ]; then count=1; fi
+	printf '%s\n' "${count:-0}"
+}
+
+migrate_legacy_subscription() {
+	[ -n "$(subscription_sections | head -n 1)" ] && return 0
+	local url sid config_path cache_dir
+	url=$(uci -q get mihomo.config.subscription_url)
+	[ -z "$url" ] && [ -f "$SUBSCRIPTION_URL_FILE" ] && url=$(cat "$SUBSCRIPTION_URL_FILE" 2>/dev/null)
+	[ -n "$url" ] || return 0
+	valid_http_url "$url" || return 1
+	sid=$(uci add mihomo subscription) || return 1
+	uci -q set mihomo.$sid.name="订阅 1"
+	uci -q set mihomo.$sid.url="$url"
+	uci -q set mihomo.$sid.enabled="1"
+	uci -q commit mihomo
+	config_path=$(uci -q get mihomo.config.config_path || echo /etc/mihomo/config.yaml)
+	cache_dir=$(subscription_cache_dir)
+	mkdir -p "$cache_dir"
+	[ -s "$config_path" ] && grep -q '^proxies:' "$config_path" 2>/dev/null && cp -f "$config_path" "$cache_dir/$sid.yaml"
+	logger -t mihomo "Migrated legacy subscription_url to section $sid"
+}
 
 save_subscription_url() {
 	local url="$1"
 	[ -z "$url" ] && url=$(uci -q get mihomo.config.subscription_url)
-	[ -z "$url" ] && return 0
+	[ -n "$url" ] || return 0
 	mkdir -p "$(uci -q get mihomo.config.work_dir || echo /etc/mihomo)"
 	printf '%s' "$url" > "$SUBSCRIPTION_URL_FILE"
 	uci -q set mihomo.config.subscription_url="$url"
 	uci -q commit mihomo
+	migrate_legacy_subscription
 }
 
 restore_subscription_url() {
-	local url=$(uci -q get mihomo.config.subscription_url)
+	local url
+	url=$(uci -q get mihomo.config.subscription_url)
 	if [ -z "$url" ] && [ -f "$SUBSCRIPTION_URL_FILE" ]; then
 		url=$(cat "$SUBSCRIPTION_URL_FILE" 2>/dev/null)
-		if [ -n "$url" ]; then
-			uci -q set mihomo.config.subscription_url="$url"
-			uci -q commit mihomo
-			logger -t mihomo "Restored subscription_url from persistent store"
-		fi
+		[ -n "$url" ] && uci -q set mihomo.config.subscription_url="$url"
+		[ -n "$url" ] && uci -q commit mihomo
 	fi
+	migrate_legacy_subscription
+}
+
+download_subscription_file() {
+	local url="$1" output="$2" scheme authority host realip resolve_arg="" resolve_port=443
+	valid_http_url "$url" || return 1
+	scheme="${url%%://*}"
+	authority="${url#*://}"; authority="${authority%%/*}"; authority="${authority##*@}"
+	case "$scheme" in http) resolve_port=80 ;; https) resolve_port=443 ;; esac
+	case "$authority" in
+		\\[*\\]:[0-9]*) host="${authority#\\[}"; host="${host%%\\]}"; resolve_port="${authority##*]:}" ;;
+		*:[0-9]*) host="${authority%:*}"; resolve_port="${authority##*:}" ;;
+		*) host="$authority" ;;
+	esac
+	case "$resolve_port" in ''|*[!0-9]*) resolve_port=443 ;; esac
+	if [ -n "$host" ]; then
+		for ns in 223.5.5.5 119.29.29.29 1.1.1.1; do
+			realip=$(nslookup "$host" "$ns" 2>/dev/null | awk '/^Address:[[:space:]]/ {last=$NF} END {print last}')
+			case "$realip" in *[!0-9.]*|"") realip="" ;; *.*.*.*) break ;; *) realip="" ;; esac
+			[ -n "$realip" ] && break
+		done
+		[ -n "$realip" ] && resolve_arg="--resolve ${host}:${resolve_port}:${realip}"
+	fi
+	curl -fsSL -A "ClashMeta" $resolve_arg -o "$output" "$url" || return 1
+	grep -q '^proxies:' "$output" 2>/dev/null || return 1
+	grep -q -E '<html>|<!DOCTYPE html>' "$output" 2>/dev/null && return 1
+	return 0
+}
+
+collect_proxy_node_names() {
+	local cfg="$1"
+	awk '
+		function clean(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); gsub(/^["'\''']|["'\''']$/, "", s); return s }
+		/^proxies:[[:space:]]*(\\[\\])?[[:space:]]*$/ { inb=1; next }
+		inb && /^[^[:space:]]/ { exit }
+		inb && /^[[:space:]]*-[[:space:]]*name:[[:space:]]*/ {
+			s=$0; sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", s); print clean(s); next
+		}
+		inb && /^[[:space:]]*-[[:space:]]*\\{[[:space:]]*name:[[:space:]]*/ {
+			s=$0; sub(/^[[:space:]]*-[[:space:]]*\\{[[:space:]]*name:[[:space:]]*/, "", s); sub(/,.*/, "", s); print clean(s)
+		}
+	' "$cfg"
+}
+
+extract_unique_proxy_entries() {
+	local cfg="$1" names="$2" output="$3"
+	awk -v names="$names" '
+		function clean(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); gsub(/^["'\''']|["'\''']$/, "", s); return s }
+		function entry_name(line, s) {
+			s=line
+			sub(/^[[:space:]]*-[[:space:]]*/, "", s)
+			sub(/^\\{[[:space:]]*/, "", s)
+			if (s !~ /^name:[[:space:]]*/) return ""
+			sub(/^name:[[:space:]]*/, "", s); sub(/,.*/, "", s)
+			return clean(s)
+		}
+		function flush() {
+			if (buf != "" && name != "" && !(name in seen)) { printf "%s", buf; print name >> names; seen[name]=1 }
+			buf=""; name=""
+		}
+		BEGIN { while ((getline n < names) > 0) seen[n]=1; close(names) }
+		/^proxies:[[:space:]]*(\\[\\])?[[:space:]]*$/ { inb=1; next }
+		inb && /^[^[:space:]]/ { flush(); exit }
+		inb && /^[[:space:]]*-[[:space:]]*/ {
+			match($0, /^[[:space:]]*/); current_indent=RLENGTH
+			if (entry_indent == 0) entry_indent=current_indent
+			if (current_indent == entry_indent) { flush(); buf=$0 ORS; name=entry_name($0); next }
+		}
+		inb && buf != "" { buf=buf $0 ORS }
+		END { flush() }
+	' "$cfg" > "$output"
+}
+
+append_yaml_list_body() {
+	local cfg="$1" key="$2" body="$3"
+	[ -s "$body" ] || return 0
+	align_list_body_indent "$cfg" "$key" "$body"
+	if grep -q "^${key}:[[:space:]]*\\[\\][[:space:]]*$" "$cfg"; then
+		awk -v key="$key" -v body="$body" '
+			$0 ~ "^" key ":[[:space:]]*\\[\\][[:space:]]*$" { print key ":"; while ((getline l < body) > 0) print l; next }
+			{ print }
+		' "$cfg" > "${cfg}.tmp" && mv "${cfg}.tmp" "$cfg"
+	elif grep -q "^${key}:[[:space:]]*$" "$cfg"; then
+		awk -v key="$key" -v body="$body" '
+			$0 ~ "^" key ":[[:space:]]*$" { print; while ((getline l < body) > 0) print l; next }
+			{ print }
+		' "$cfg" > "${cfg}.tmp" && mv "${cfg}.tmp" "$cfg"
+	else
+		{ echo "$key:"; cat "$body"; } >> "$cfg"
+	fi
+}
+
+inject_aggregate_into_selectors() {
+	local cfg="$1" group="$2"
+	awk -v group="$group" '
+		function add_to_inline_proxies(line, quoted) {
+			quoted = "\\"" group "\\""
+			if (line ~ /proxies:[[:space:]]*\\[[[:space:]]*\\]/) {
+				sub(/proxies:[[:space:]]*\\[[[:space:]]*\\]/, "proxies: [" quoted "]", line)
+			} else {
+				sub(/proxies:[[:space:]]*\\[[[:space:]]*/, "&" quoted ", ", line)
+			}
+			return line
+		}
+		/^proxy-groups:[[:space:]]*$/ { in_groups=1; print; next }
+		in_groups && /^[^[:space:]]/ { in_groups=0 }
+		in_groups && /^[[:space:]]*-[[:space:]]*\\{/ && /type:[[:space:]]*select([[:space:],}]|$)/ && /proxies:[[:space:]]*\\[/ {
+			print add_to_inline_proxies($0); next
+		}
+		in_groups && /^[[:space:]]*-[[:space:]]*name:/ { is_select=0; added=0 }
+		in_groups && /^[[:space:]]+type:[[:space:]]*select[[:space:]]*(#.*)?$/ { is_select=1 }
+		in_groups && is_select && !added && /^[[:space:]]+proxies:[[:space:]]*\\[/ {
+			print add_to_inline_proxies($0); added=1; next
+		}
+		in_groups && is_select && !added && /^[[:space:]]+proxies:[[:space:]]*$/ {
+			print; match($0, /^[[:space:]]*/); indent=substr($0, 1, RLENGTH) "  "; print indent "- \\"" group "\\""; added=1; next
+		}
+		{ print }
+	' "$cfg" > "${cfg}.tmp" && mv "${cfg}.tmp" "$cfg"
+}
+
+merge_subscription_configs() {
+	local output="$1"; shift
+	[ "$#" -gt 0 ] || return 1
+	local input_count="$#" tmpd first cfg body names group="SSProxy - 全部订阅"
+	tmpd=$(mktemp -d) || return 1
+	first="$1"; shift
+	cp "$first" "$output" || { rm -rf "$tmpd"; return 1; }
+	if [ "$input_count" -eq 1 ]; then rm -rf "$tmpd"; return 0; fi
+	names="$tmpd/names"
+	collect_proxy_node_names "$output" > "$names"
+	for cfg in "$@"; do
+		body="$tmpd/extra"
+		extract_unique_proxy_entries "$cfg" "$names" "$body"
+		append_yaml_list_body "$output" "proxies" "$body"
+	done
+	inject_aggregate_into_selectors "$output" "$group"
+	body="$tmpd/group"
+	{
+		echo "  - name: \\"$(yaml_quote "$group")\\""
+		echo "    type: select"
+		echo "    proxies:"
+		while IFS= read -r name; do [ -n "$name" ] && echo "      - \\"$(yaml_quote "$name")\\""; done < "$names"
+	} > "$body"
+	append_yaml_list_body "$output" "proxy-groups" "$body"
+	rm -rf "$tmpd"
+	grep -q '^proxies:' "$output"
+}
+
+update_subscriptions() {
+	[ "$(uci -q get mihomo.config.config_mode || echo subscription)" != "custom" ] || {
+		echo "ERROR: 当前为仅自定义配置模式" >&2; return 1;
+	}
+	migrate_legacy_subscription
+	local cache_dir config_path tmpd sid enabled url name fresh=0 stale=0 failed=0 available=0
+	cache_dir=$(subscription_cache_dir)
+	config_path=$(uci -q get mihomo.config.config_path || echo /etc/mihomo/config.yaml)
+	mkdir -p "$cache_dir" "$(dirname "$config_path")"
+	tmpd=$(mktemp -d) || return 1
+	set --
+	local known_sections=" $(subscription_sections | tr '\n' ' ') " cached_file cached_sid
+	for cached_file in "$cache_dir"/*.yaml; do
+		[ -e "$cached_file" ] || continue
+		cached_sid=$(basename "$cached_file" .yaml)
+		case "$known_sections" in
+			*" $cached_sid "*) ;;
+			*) rm -f "$cached_file" ;;
+		esac
+	done
+	for sid in $(subscription_sections); do
+		enabled=$(uci -q get mihomo.$sid.enabled); [ "$enabled" = "0" ] && continue
+		url=$(uci -q get mihomo.$sid.url); name=$(uci -q get mihomo.$sid.name); [ -n "$name" ] || name="$sid"
+		if [ -n "$url" ] && download_subscription_file "$url" "$tmpd/$sid.yaml"; then
+			mv "$tmpd/$sid.yaml" "$cache_dir/$sid.yaml"; fresh=$((fresh + 1))
+			logger -t mihomo "Subscription '$name' updated"
+		elif [ -s "$cache_dir/$sid.yaml" ]; then
+			stale=$((stale + 1)); logger -t mihomo "Subscription '$name' update failed; using cache"
+		else
+			failed=$((failed + 1)); logger -t mihomo "Subscription '$name' unavailable"
+			continue
+		fi
+		set -- "$@" "$cache_dir/$sid.yaml"; available=$((available + 1))
+	done
+	if [ "$available" -eq 0 ]; then
+		rm -rf "$tmpd"; echo "ERROR: No enabled subscription cache is available" >&2; return 1
+	fi
+	merge_subscription_configs "$tmpd/merged.yaml" "$@" || {
+		rm -rf "$tmpd"; echo "ERROR: Failed to merge subscriptions" >&2; return 1;
+	}
+	[ -s "$config_path" ] && cp -f "$config_path" "${config_path}.bak"
+	mv "$tmpd/merged.yaml" "$config_path"
+	rm -rf "$tmpd"
+	[ "$fresh" -gt 0 ] && uci -q set mihomo.config.last_update="$(date +%s)"
+	uci -q commit mihomo
+	local nodes
+	nodes=$(collect_proxy_node_names "$config_path" | wc -l | tr -d ' ')
+	if pidof mihomo >/dev/null 2>&1; then /etc/init.d/mihomo restart; fi
+	printf '{"updated":%s,"cached":%s,"failed":%s,"available":%s,"nodes":%s}\n' "$fresh" "$stale" "$failed" "$available" "${nodes:-0}"
+}
+
+update_subscription() {
+	local url="$1" sid
+	if [ -n "$url" ]; then
+		valid_http_url "$url" || { echo "ERROR: Invalid subscription URL" >&2; return 1; }
+		uci -q set mihomo.config.subscription_url="$url"
+		migrate_legacy_subscription
+		sid=$(subscription_sections | head -n 1)
+		[ -n "$sid" ] && uci -q set mihomo.$sid.url="$url"
+		uci -q commit mihomo
+	fi
+	update_subscriptions
+}
+
+clear_subscription() {
+	local config_path cache_dir
+	config_path=$(uci -q get mihomo.config.config_path || echo /etc/mihomo/config.yaml)
+	cache_dir=$(subscription_cache_dir)
+	[ -s "$config_path" ] && cp -f "$config_path" "${config_path}.bak"
+	rm -f "$config_path" "$cache_dir"/*.yaml
+	uci -q set mihomo.config.last_update=''
+	uci -q commit mihomo
+	logger -t mihomo "All subscription caches cleared"
+	if pidof mihomo >/dev/null 2>&1; then /etc/init.d/mihomo restart; fi
+	echo '{"success":true,"msg":"已清空所有订阅节点缓存"}'
 }
 
 # Background loop driven by the procd service instance. Polls every 10 minutes;
@@ -666,13 +961,15 @@ auto_update_loop() {
 	done
 }
 
-# Called hourly by cron. Downloads a fresh subscription only when auto_update is
-# enabled, a URL is configured, and the configured interval has elapsed.
+# Downloads a fresh subscription only when auto_update is enabled, a URL is
+# configured, and the configured interval has elapsed.
 auto_update_now() {
 	local enabled=$(uci -q get mihomo.config.auto_update)
-	[ "$enabled" = "1" ] || exit 0
-	local url=$(uci -q get mihomo.config.subscription_url)
-	[ -z "$url" ] && { logger -t mihomo "auto_update: no subscription_url configured"; exit 0; }
+	[ "$enabled" = "1" ] || return 0
+	migrate_legacy_subscription
+	local subscription_count
+	subscription_count=$(enabled_subscription_count)
+	[ "${subscription_count:-0}" -gt 0 ] || { logger -t mihomo "auto_update: no enabled subscription configured"; return 0; }
 	local interval=$(uci -q get mihomo.config.update_interval || echo 24)
 	case "$interval" in ''|*[!0-9]*) interval=24 ;; esac
 	[ "$interval" -lt 1 ] && interval=1
@@ -682,14 +979,11 @@ auto_update_now() {
 		local elapsed=$((now - last))
 		if [ "$elapsed" -lt $((interval * 3600)) ]; then
 			logger -t mihomo "auto_update: skipped, next run in $((interval * 3600 - elapsed))s"
-			exit 0
+			return 0
 		fi
 	fi
-	logger -t mihomo "auto_update: starting scheduled update"
-	update_subscription "$url"
-	if [ $? -eq 0 ] && pidof mihomo >/dev/null 2>&1; then
-		/etc/init.d/mihomo restart
-	fi
+	logger -t mihomo "auto_update: starting scheduled batch update"
+	update_subscriptions
 }
 
 # Report auto-update schedule state for the UI.
@@ -699,14 +993,17 @@ get_schedule() {
 	case "$interval" in ''|*[!0-9]*) interval=24 ;; esac
 	[ "$interval" -lt 1 ] && interval=1
 	local last=$(uci -q get mihomo.config.last_update)
-	local url=$(uci -q get mihomo.config.subscription_url)
-	local next=""
-	if [ "$enabled" = "1" ] && [ -n "$url" ]; then
+	migrate_legacy_subscription
+	local subscription_count next=""
+	subscription_count=$(enabled_subscription_count)
+	if [ "$enabled" = "1" ] && [ "${subscription_count:-0}" -gt 0 ]; then
 		if [ -n "$last" ] && [ "$last" -gt 0 ] 2>/dev/null; then
 			next=$((last + interval * 3600))
 		fi
 	fi
-	echo "{\\"auto_update\\":\\"$enabled\\",\\"interval\\":\\"$interval\\",\\"last_update\\":\\"$last\\",\\"next_update\\":\\"$next\\",\\"has_url\\":\\"$([ -n "$url" ] && echo 1 || echo 0)\\"}"
+	printf '{"auto_update":%s,"interval":%s,"last_update":%s,"next_update":%s,"has_url":%s,"subscription_count":%s}\\n' \
+		"$(json_quote "$enabled")" "$(json_quote "$interval")" "$(json_quote "$last")" \
+		"$(json_quote "$next")" "$(json_quote "$([ "${subscription_count:-0}" -gt 0 ] && echo 1 || echo 0)")" "${subscription_count:-0}"
 }
 
 # Emit controlled access rules (from UCI mihomo_rule) as YAML rule lines.
@@ -736,6 +1033,7 @@ emit_access_rules_yaml() {
 		[ "$enabled" = "1" ] || continue
 		domain=$(uci -q get mihomo.$sid.domain)
 		[ -n "$domain" ] || continue
+		valid_rule_domain "$domain" || { logger -t mihomo "access_rule skipped: invalid domain"; continue; }
 		rule_type=$(uci -q get mihomo.$sid.rule_type)
 		case "$rule_type" in
 			domain) rtype="DOMAIN" ;;
@@ -769,7 +1067,49 @@ chain_log() {
 }
 
 yaml_quote() {
-	printf '%s' "$1" | tr '\r\n' '  ' | sed 's/[\\"]/\\&/g'
+	printf '%s' "$1" | tr '\r\n' '  ' | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g'
+}
+
+valid_rule_domain() {
+	local value="$1"
+	[ -n "$value" ] && [ "${#value}" -le 253 ] 2>/dev/null || return 1
+	printf '%s' "$value" | awk 'BEGIN { q=sprintf("%c",34); a=sprintf("%c",39); bad=0 } /[[:space:],]/ { bad=1 } { if (index($0,q) || index($0,a)) bad=1 } END { exit bad }'
+}
+
+valid_http_url() {
+	local value="$1"
+	case "$value" in
+		http://*|https://*) ;;
+		*) return 1 ;;
+	esac
+	printf '%s' "$value" | awk 'BEGIN { bad=0 } /[[:space:]\\047\\042\\r\\n]/ { bad=1 } END { exit bad }'
+}
+
+validate_acl_ip() {
+	local value="$1" base prefix
+	[ -n "$value" ] || return 1
+	case "$value" in *[!0-9A-Fa-f:./]*) return 1 ;; esac
+	base="$value"; prefix=""
+	if [ "${value#*/}" != "$value" ]; then
+		base="${value%%/*}"; prefix="${value##*/}"
+		case "$prefix" in ''|*[!0-9]*) return 1 ;; esac
+	fi
+	case "$base" in
+		*:*)
+			[ -z "$prefix" ] || [ "$prefix" -le 128 ] 2>/dev/null || return 1
+			printf '%s' "$base" | grep -q ':' || return 1
+			;;
+		*)
+			[ -z "$prefix" ] || [ "$prefix" -le 32 ] 2>/dev/null || return 1
+			printf '%s' "$base" | awk -F. 'NF == 4 { ok=1; for (i=1; i<=4; i++) if ($i !~ /^[0-9]+$/ || $i > 255) ok=0 } END { exit !ok }'
+			;;
+	esac
+}
+
+json_quote() {
+	local value
+	value=$(printf '%s' "$1" | tr '\r\n' '  ' | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
+	printf '"%s"' "$value"
 }
 
 # Match generated list items to the indentation already used by a subscription.
@@ -848,6 +1188,14 @@ landing_node_valid() {
 		vmess|vless) [ -n "$uuid" ] || { [ "$quiet" = "1" ] || chain_log "landing_node $sid skipped: UUID required for $type"; return 1; } ;;
 		*) [ "$quiet" = "1" ] || chain_log "landing_node $sid skipped: unsupported type '$type'"; return 1 ;;
 	esac
+	if [ "$type" = "vmess" ] || [ "$type" = "vless" ]; then
+		local network
+		network=$(uci -q get mihomo.$sid.network); [ -n "$network" ] || network=tcp
+		case "$network" in
+			tcp|ws|grpc|h2|http) ;;
+			*) [ "$quiet" = "1" ] || chain_log "landing_node $sid skipped: unsupported network '$network'"; return 1 ;;
+		esac
+	fi
 	return 0
 }
 
@@ -920,6 +1268,20 @@ emit_landing_proxies_yaml() {
 	done
 }
 
+emit_referenced_landing_proxies_yaml() {
+	local cfg="$1" seen=""
+	uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=data_link$/\\1/p' | while read -r sid; do
+		data_link_valid "$sid" "$cfg" 1 || continue
+		local landing
+		landing=$(uci -q get mihomo.$sid.landing_node)
+		case " $seen " in
+			*" $landing "*) continue ;;
+		esac
+		seen="$seen $landing"
+		emit_landing_proxies_yaml "$landing"
+	done
+}
+
 data_link_valid() {
 	local sid="$1" cfg="$2" quiet="$3"
 	local enabled device sub landing
@@ -988,13 +1350,17 @@ emit_adblock_rule_providers_yaml() {
 		e=$(uci -q get mihomo.$sid.enabled); [ "$e" = "1" ] || continue
 		name=$(uci -q get mihomo.$sid.name); url=$(uci -q get mihomo.$sid.url)
 		[ -n "$name" ] && [ -n "$url" ] || continue
+		case "$name" in *[!A-Za-z0-9_-]*) logger -t mihomo "adblock source skipped: invalid name"; continue ;; esac
 		behavior=$(uci -q get mihomo.$sid.behavior || echo domain)
 		fmt=$(uci -q get mihomo.$sid.format || echo yaml)
+		case "$behavior" in domain|classical|ipcidr) ;; *) logger -t mihomo "adblock source skipped: invalid behavior"; continue ;; esac
+		case "$fmt" in yaml|text) ;; *) logger -t mihomo "adblock source skipped: invalid format"; continue ;; esac
+		valid_http_url "$url" || { logger -t mihomo "adblock source skipped: invalid URL"; continue; }
 		echo "  $name:"
 		echo "    type: http"
 		echo "    behavior: $behavior"
 		echo "    format: $fmt"
-		echo "    url: \\"$url\\""
+		echo "    url: \\"$(yaml_quote "$url")\\""
 		echo "    path: ./ruleset/$name.yaml"
 		echo "    interval: 86400"
 	done
@@ -1119,7 +1485,7 @@ merge_rules_before_catchall() {
 	tail -n +2 "$blk" > "$itemsf"
 	if grep -q '^rules:' "$base"; then
 		awk -v items="$itemsf" '
-			/^rules:[[:space:]]*$/ { inr=1; print; next }
+			/^rules:[[:space:]]*(\[\])?[[:space:]]*$/ { inr=1; print; next }
 			inr && /^[A-Za-z0-9_@.\-]+:/ { if (!done) { system("cat " items); done=1 } inr=0; print; next }
 			inr && !done && /^[[:space:]]*-.*(MATCH|FINAL),/ { system("cat " items); done=1 }
 			{ print }
@@ -1154,7 +1520,7 @@ normalize_rules() {
 	if grep -q '^rules:' "$f"; then
 		local normf="${f}.norm"
 		awk '
-			/^rules:[[:space:]]*$/ { in_rules = 1; print; next }
+			/^rules:[[:space:]]*(\[\])?[[:space:]]*$/ { in_rules = 1; if ($0 ~ /\[\]/) sub(/\[\][[:space:]]*$/, ""); print; next }
 			in_rules && /^[A-Za-z]/ { in_rules = 0 }
 			in_rules && /^[[:space:]]*-/ { sub(/^[[:space:]]*/, "  "); print; next }
 			{ print }
@@ -1186,6 +1552,12 @@ prepare_config() {
 	local tproxy_port=$(uci -q get mihomo.config.tproxy_port || echo "7893")
 	local mix_port=$(uci -q get mihomo.config.mix_port || echo "7890")
 	local tun_enabled=$(uci -q get mihomo.config.tun_enabled || echo "0")
+	local port_name port_value
+	for port_name in dns_port tproxy_port mix_port; do
+		port_value=$(eval "printf '%s' \"\$$port_name\"")
+		case "$port_value" in ''|*[!0-9]*) echo "ERROR: Invalid $port_name" >&2; return 1 ;; esac
+		[ "$port_value" -ge 1 ] 2>/dev/null && [ "$port_value" -le 65535 ] 2>/dev/null || { echo "ERROR: $port_name out of range" >&2; return 1; }
+	done
 
 	# Controller secret: auto-generate a random one on first run and persist it,
 	# so the external-controller is never left unauthenticated (commercial-grade
@@ -1235,7 +1607,7 @@ mixed-port: $mix_port
 tproxy-port: $tproxy_port
 allow-lan: true
 external-controller: 0.0.0.0:9090
-secret: "$secret"
+secret: "$(yaml_quote "$secret")"
 profile:
   store-selected: true
   store-fake-ip: true
@@ -1336,7 +1708,7 @@ EOF
 	# access rules, at the top of the rules block (highest priority, first-match).
 	local rules_file="${run_config}.rules"
 	emit_builtin_bypass_rules > "$rules_file"
-	emit_data_link_rules_yaml "$src_config" >> "$rules_file"
+	emit_data_link_rules_yaml "$run_config" >> "$rules_file"
 	emit_access_rules_yaml "$src_config" >> "$rules_file"
 	# Adblock REJECT rules go AFTER access rules so user whitelist (direct)
 	# entries always win over blanket ad blocking (prevents false positives).
@@ -1347,7 +1719,7 @@ EOF
 			awk -v f="$rules_file" '
 				BEGIN { while ((getline line < f) > 0) buf = buf line "\\n" }
 				{ print }
-				/^rules:/ && !done { printf "%s", buf; done=1 }
+				/^rules:[[:space:]]*(\\[\\])?[[:space:]]*$/ && !done { if ($0 ~ /\\[\\]/) sub(/\\[\\][[:space:]]*$/, ""); printf "%s", buf; done=1 }
 			' "$run_config" > "$tmpf" && mv "$tmpf" "$run_config"
 		else
 			printf 'rules:\n' >> "$run_config"
@@ -1372,7 +1744,7 @@ EOF
 
 	# Inject user-managed landing proxies before generating fixed two-hop links.
 	local landing_yaml="${run_config}.landing"
-	emit_landing_proxies_yaml > "$landing_yaml"
+	emit_referenced_landing_proxies_yaml "$run_config" > "$landing_yaml"
 	if [ -s "$landing_yaml" ]; then
 		align_list_body_indent "$run_config" "proxies" "$landing_yaml"
 		if grep -q '^proxies:[[:space:]]*\[\][[:space:]]*$' "$run_config"; then
@@ -1450,7 +1822,7 @@ set_chain_front_node() {
 	fi
 	uci -q set mihomo.config.chain_front_node="$node"
 	uci -q commit mihomo
-	printf '{"front_node":"%s"}\n' "$(yaml_quote "$node")"
+	printf '{"front_node":%s}\n' "$(json_quote "$node")"
 }
 
 get_proxy_groups() {
@@ -1522,6 +1894,18 @@ get_proxies() {
 	
 	local nodes=$(tr -d '\r' < "$config_path" | awk \'
 	function trim(s){ gsub(/^[ 	]+|[ 	]+$/, "", s); return s }
+	function jsonv(s,   out, i, c, slash, quote, cr, lf){
+		slash=sprintf("%c",92); quote=sprintf("%c",34)
+		cr=sprintf("%c",13); lf=sprintf("%c",10); out=""
+		for (i=1; i<=length(s); i++) {
+			c=substr(s,i,1)
+			if (c == slash) out=out slash slash
+			else if (c == quote) out=out slash quote
+			else if (c == cr || c == lf) out=out " "
+			else out=out c
+		}
+		return out
+	}
 	function stripq(s){ if ((substr(s,1,1)=="\\042" && substr(s,length(s),1)=="\\042") || (substr(s,1,1)=="\\047" && substr(s,length(s),1)=="\\047")) s=substr(s,2,length(s)-2); return trim(s) }
 	function getf(str, key,   rest, p, q, v){
 		if (match(str, key ":[ 	]*")) {
@@ -1537,12 +1921,12 @@ get_proxies() {
 	in_p && /^[a-zA-Z]/ && $0 !~ /^[ 	]/ { in_p=0 }
 	in_p {
 		if ($0 ~ /^[ 	]*-/) {
-			if (name != "") { if(!first) printf ","; first=0; printf("  {\\042name\\042:\\042%s\\042,\\042type\\042:\\042%s\\042,\\042server\\042:\\042%s\\042}", name, type, server) }
+			if (name != "") { if(!first) printf ","; first=0; printf("  {\\042name\\042:\\042%s\\042,\\042type\\042:\\042%s\\042,\\042server\\042:\\042%s\\042}", jsonv(name), jsonv(type), jsonv(server)) }
 			name=""; type=""; server=""
 			s = $0; sub(/^[ 	]*-[ 	]*/, "", s)
 			if (s ~ /\\{/) {
 				name=getf(s,"name"); type=getf(s,"type"); server=getf(s,"server")
-				if (name != "") { if(!first) printf ","; first=0; printf("  {\\042name\\042:\\042%s\\042,\\042type\\042:\\042%s\\042,\\042server\\042:\\042%s\\042}", name, type, server) }
+				if (name != "") { if(!first) printf ","; first=0; printf("  {\\042name\\042:\\042%s\\042,\\042type\\042:\\042%s\\042,\\042server\\042:\\042%s\\042}", jsonv(name), jsonv(type), jsonv(server)) }
 				name=""; type=""; server=""
 				next
 			}
@@ -1553,7 +1937,7 @@ get_proxies() {
 		else if ($0 ~ /^[ 	]*type:/) { sub(/^[ 	]*type:[ 	]*/, "", $0); type=stripq($0) }
 		else if ($0 ~ /^[ 	]*server:/) { sub(/^[ 	]*server:[ 	]*/, "", $0); server=stripq($0) }
 	}
-	END { if (name != "") { if(!first) printf ","; printf("  {\\042name\\042:\\042%s\\042,\\042type\\042:\\042%s\\042,\\042server\\042:\\042%s\\042}", name, type, server) }; print "]" }
+	END { if (name != "") { if(!first) printf ","; printf("  {\\042name\\042:\\042%s\\042,\\042type\\042:\\042%s\\042,\\042server\\042:\\042%s\\042}", jsonv(name), jsonv(type), jsonv(server)) }; print "]" }
 	\')
 	
 	local count=$(printf '%s' "$nodes" | grep -c '"name"')
@@ -1596,32 +1980,40 @@ resolve_host() {
 flatten_connections() {
 	local raw="$1"
 	[ -z "$raw" ] && return 0
-	local ids ips hosts dst policy rule up down start
-	ids=$(echo "$raw" | jsonfilter -e '$.connections[@].id' 2>/dev/null)
-	ips=$(echo "$raw" | jsonfilter -e '$.connections[@].metadata.sourceIP' 2>/dev/null)
-	hosts=$(echo "$raw" | jsonfilter -e '$.connections[@].metadata.host' 2>/dev/null)
-	dst=$(echo "$raw" | jsonfilter -e '$.connections[@].metadata.destinationIP' 2>/dev/null)
-	policy=$(echo "$raw" | jsonfilter -e '$.connections[@].chains[0]' 2>/dev/null)
-	rule=$(echo "$raw" | jsonfilter -e '$.connections[@].rule' 2>/dev/null)
-	up=$(echo "$raw" | jsonfilter -e '$.connections[@].upload' 2>/dev/null)
-	down=$(echo "$raw" | jsonfilter -e '$.connections[@].download' 2>/dev/null)
-	start=$(echo "$raw" | jsonfilter -e '$.connections[@].start' 2>/dev/null)
-	echo "$ids" | awk '{print NR, $0}' | while read -r n id; do
-		[ -z "$id" ] && continue
-		local ip host d pol r u dn st
-		ip=$(echo "$ips" | sed -n "${n}p")
-		host=$(echo "$hosts" | sed -n "${n}p")
-		d=$(echo "$dst" | sed -n "${n}p")
-		pol=$(echo "$policy" | sed -n "${n}p")
-		r=$(echo "$rule" | sed -n "${n}p")
-		u=$(echo "$up" | sed -n "${n}p")
-		dn=$(echo "$down" | sed -n "${n}p")
-		st=$(echo "$start" | sed -n "${n}p")
-		local dev
-		dev=$(resolve_host "$ip")
-		[ -z "$host" ] && host="$d"
-		echo "${id}|${ip}|${dev}|${host}|${d}|${pol}|${r}|${u}|${dn}|${st}"
-	done
+	local tmpd leasef
+	tmpd=$(mktemp -d) || return 1
+	leasef="$tmpd/leases"
+	[ -f /tmp/dhcp.leases ] && cp /tmp/dhcp.leases "$leasef" || : > "$leasef"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].id' 2>/dev/null > "$tmpd/id"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].metadata.sourceIP' 2>/dev/null > "$tmpd/ip"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].metadata.host' 2>/dev/null > "$tmpd/host"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].metadata.destinationIP' 2>/dev/null > "$tmpd/dst"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].chains[0]' 2>/dev/null > "$tmpd/policy"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].rule' 2>/dev/null > "$tmpd/rule"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].upload' 2>/dev/null > "$tmpd/up"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].download' 2>/dev/null > "$tmpd/down"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].start' 2>/dev/null > "$tmpd/start"
+	awk -v leasef="$leasef" -v idf="$tmpd/id" -v ipf="$tmpd/ip" -v hostf="$tmpd/host" \
+		-v dstf="$tmpd/dst" -v policyf="$tmpd/policy" -v rulef="$tmpd/rule" \
+		-v upf="$tmpd/up" -v downf="$tmpd/down" -v startf="$tmpd/start" '
+		FILENAME == leasef { if ($3 != "" && $4 != "*") device[$3]=$4; next }
+		FILENAME == idf { id[FNR]=$0; if (FNR > maxn) maxn=FNR; next }
+		FILENAME == ipf { ip[FNR]=$0; next }
+		FILENAME == hostf { host[FNR]=$0; next }
+		FILENAME == dstf { dst[FNR]=$0; next }
+		FILENAME == policyf { policy[FNR]=$0; next }
+		FILENAME == rulef { rule[FNR]=$0; next }
+		FILENAME == upf { up[FNR]=$0; next }
+		FILENAME == downf { down[FNR]=$0; next }
+		FILENAME == startf { start[FNR]=$0; next }
+		END {
+			for (i=1; i<=maxn; i++) {
+				if (id[i] == "") continue
+				hostname=host[i]; if (hostname == "") hostname=dst[i]
+				print id[i] "|" ip[i] "|" device[ip[i]] "|" hostname "|" dst[i] "|" policy[i] "|" rule[i] "|" up[i] "|" down[i] "|" start[i]
+			}
+		}' "$leasef" "$tmpd/id" "$tmpd/ip" "$tmpd/host" "$tmpd/dst" "$tmpd/policy" "$tmpd/rule" "$tmpd/up" "$tmpd/down" "$tmpd/start"
+	rm -rf "$tmpd"
 }
 
 get_connections() {
@@ -1634,7 +2026,7 @@ get_connections() {
 	local err_msg
 	err_msg=$(echo "$raw" | jsonfilter -e '$.message' 2>/dev/null)
 	if [ -n "$err_msg" ]; then
-		echo "{\\"error\\":\\"api_error\\", \\"msg\\":\\"Mihomo 控制器错误：${err_msg}\\"}"
+		printf '{"error":"api_error","msg":%s}\\n' "$(json_quote "Mihomo 控制器错误：${err_msg}")"
 		return 0
 	fi
 	echo "["
@@ -1643,7 +2035,8 @@ get_connections() {
 		[ -z "$id" ] && continue
 		if [ $first -eq 0 ]; then printf ','; fi
 		first=0
-		printf '{"id":"%s","ip":"%s","device":"%s","domain":"%s","dst":"%s","policy":"%s","rule":"%s","up":%s,"down":%s,"start":"%s"}' "$id" "$ip" "$dev" "$host" "$d" "$pol" "$r" "${u:-0}" "${dn:-0}" "$st"
+		printf '{"id":%s,"ip":%s,"device":%s,"domain":%s,"dst":%s,"policy":%s,"rule":%s,"up":%s,"down":%s,"start":%s}' \
+			"$(json_quote "$id")" "$(json_quote "$ip")" "$(json_quote "$dev")" "$(json_quote "$host")" "$(json_quote "$d")" "$(json_quote "$pol")" "$(json_quote "$r")" "${u:-0}" "${dn:-0}" "$(json_quote "$st")"
 	done
 	echo "]"
 }
@@ -1652,19 +2045,24 @@ collect_connections() {
 	local raw logf seenf
 	logf="$access_log_file"
 	seenf="$access_seen_file"
-	raw=$(mihomo_curl -s --connect-timeout 2 "http://127.0.0.1:${API_PORT}/connections" 2>/dev/null)
+	raw="$1"
+	[ -n "$raw" ] || raw=$(mihomo_curl -s --connect-timeout 2 "http://127.0.0.1:${API_PORT}/connections" 2>/dev/null)
 	[ -z "$raw" ] && return 0
-	update_data_link_health_from_connections "$raw"
 	normalize_access_log
 	touch "$seenf"
-	flatten_connections "$raw" | while IFS='|' read -r id ip dev host d pol r u dn st; do
+	local tmpd
+	tmpd=$(mktemp -d) || return 1
+	flatten_connections "$raw" > "$tmpd/all"
+	awk -F'|' 'NR==FNR { seen[$1]=1; next } !($1 in seen)' "$seenf" "$tmpd/all" > "$tmpd/new"
+	while IFS='|' read -r id ip dev host d pol r u dn st; do
 		[ -z "$id" ] && continue
-		grep -qxF "$id" "$seenf" && continue
 		echo "$id" >> "$seenf"
 		local ts
 		ts=$(date +%s)
-		printf '{"ts":%s,"id":"%s","ip":"%s","device":"%s","domain":"%s","dst":"%s","policy":"%s","rule":"%s","up":%s,"down":%s,"start":"%s"}\n' "$ts" "$id" "$ip" "$dev" "$host" "$d" "$pol" "$r" "${u:-0}" "${dn:-0}" "$st" >> "$logf"
-	done
+		printf '{"ts":%s,"id":%s,"ip":%s,"device":%s,"domain":%s,"dst":%s,"policy":%s,"rule":%s,"up":%s,"down":%s,"start":%s}\n' \
+			"$ts" "$(json_quote "$id")" "$(json_quote "$ip")" "$(json_quote "$dev")" "$(json_quote "$host")" "$(json_quote "$d")" "$(json_quote "$pol")" "$(json_quote "$r")" "${u:-0}" "${dn:-0}" "$(json_quote "$st")" >> "$logf"
+	done < "$tmpd/new"
+	rm -rf "$tmpd"
 	tail -n 2000 "$seenf" > "$seenf.tmp" && mv "$seenf.tmp" "$seenf"
 	if [ -f "$logf" ] && [ "$(wc -l < "$logf")" -gt 2000 ]; then
 		tail -n 2000 "$logf" > "$logf.tmp" && mv "$logf.tmp" "$logf"
@@ -1673,9 +2071,15 @@ collect_connections() {
 
 collect_loop() {
 	sleep 5
+	local tick=0 raw
 	while true; do
-		collect_connections
-		sleep 15
+		raw=$(mihomo_curl -s --connect-timeout 2 "http://127.0.0.1:${API_PORT}/connections" 2>/dev/null)
+		if [ -n "$raw" ]; then
+			collect_traffic "$raw"
+			if [ "$tick" -eq 0 ]; then collect_connections "$raw"; fi
+			tick=$(( (tick + 1) % 3 ))
+		fi
+		sleep 5
 	done
 }
 
@@ -1695,7 +2099,8 @@ collect_traffic() {
 	# buckets. POSIX TZ offset sign is inverted: "UTC-8" == 8h east of UTC.
 	bkday=$(TZ=UTC-8 date +%Y-%m-%d)
 	bkmon=$(TZ=UTC-8 date +%Y-%m)
-	raw=$(mihomo_curl -s --connect-timeout 2 "http://127.0.0.1:${API_PORT}/connections" 2>/dev/null)
+	raw="$1"
+	[ -n "$raw" ] || raw=$(mihomo_curl -s --connect-timeout 2 "http://127.0.0.1:${API_PORT}/connections" 2>/dev/null)
 	[ -z "$raw" ] && return 0
 	collect_data_link_traffic "$raw"
 	tmpd=$(mktemp -d)
@@ -1765,11 +2170,8 @@ collect_traffic() {
 }
 
 traffic_loop() {
-	sleep 5
-	while true; do
-		collect_traffic
-		sleep 5
-	done
+	# Compatibility alias for older procd definitions during package upgrades.
+	collect_loop
 }
 
 # Emit traffic stats as JSON: {total, since, domains:[{domain,bytes}] (top 30 by
@@ -1788,7 +2190,7 @@ get_traffic() {
 			[ -z "$_d" ] && continue
 			[ "$_first" -eq 0 ] && printf ','
 			_first=0
-			printf '{"domain":"%s","bytes":%d}' "$_d" "${_b:-0}"
+			printf '{"domain":%s,"bytes":%d}' "$(json_quote "$_d")" "${_b:-0}"
 		done
 	fi
 	printf '],"daily":['
@@ -1798,7 +2200,7 @@ get_traffic() {
 			[ -z "$_k" ] && continue
 			[ "$_first" -eq 0 ] && printf ','
 			_first=0
-			printf '{"date":"%s","bytes":%d}' "$_k" "${_b:-0}"
+			printf '{"date":%s,"bytes":%d}' "$(json_quote "$_k")" "${_b:-0}"
 		done
 	fi
 	printf '],"monthly":['
@@ -1808,7 +2210,7 @@ get_traffic() {
 			[ -z "$_k" ] && continue
 			[ "$_first" -eq 0 ] && printf ','
 			_first=0
-			printf '{"month":"%s","bytes":%d}' "$_k" "${_b:-0}"
+			printf '{"month":%s,"bytes":%d}' "$(json_quote "$_k")" "${_b:-0}"
 		done
 	fi
 	printf ']}'
@@ -1928,7 +2330,31 @@ test_all_nodes() {
 	nodes_json=$(get_proxies 2>/dev/null)
 	[ -z "$nodes_json" ] && { echo "[]"; return 0; }
 	tmpd=$(mktemp -d)
-	printf '%s' "$nodes_json" | grep -o '"name":"[^"]*"' | sed 's/"name":"//; s/"$//' > "$tmpd/names"
+	printf '%s' "$nodes_json" | awk '
+		BEGIN {
+			q=sprintf("%c",34); slash=sprintf("%c",92)
+			needle=q "name" q ":" q
+			data=""
+		}
+		{ data=data $0 }
+		END {
+			pos=1
+			while ((off=index(substr(data,pos), needle)) > 0) {
+				start=pos+off-1+length(needle); value=""
+				for (i=start; i<=length(data); i++) {
+					c=substr(data,i,1)
+					if (c == q) { print value; pos=i+1; break }
+					if (c == slash && i < length(data)) {
+						i++; c=substr(data,i,1)
+						if (c == "n") value=value sprintf("%c",10)
+						else if (c == "r") value=value sprintf("%c",13)
+						else if (c == "t") value=value sprintf("%c",9)
+						else value=value c
+					} else value=value c
+				}
+			}
+		}
+	' > "$tmpd/names"
 	i=0
 	while IFS= read -r name; do
 		[ -z "$name" ] && continue
@@ -1942,7 +2368,7 @@ test_all_nodes() {
 			if [ -n "$delay" ] && [ "$delay" -ge 0 ] 2>/dev/null; then
 				printf '{"delay":%s}' "$delay" > "$tmpd/$i"
 			else
-				printf '{"delay":-1,"msg":"%s"}' "${msg:-timeout}" > "$tmpd/$i"
+				printf '{"delay":-1,"msg":%s}' "$(json_quote "${msg:-timeout}")" > "$tmpd/$i"
 			fi
 		) &
 	done < "$tmpd/names"
@@ -1981,9 +2407,9 @@ TikTok|https://www.tiktok.com"
 		delay=$(printf '%s' "$out" | awk '{print $2}')
 		if [ -n "$code" ] && [ "$code" != "000" ] && [ -n "$delay" ]; then
 			ms=$(awk -v t="$delay" 'BEGIN{ printf "%d", (t+0)*1000 }')
-			printf '{"name":"%s","delay":%s,"code":"%s","ok":true}' "$name" "$ms" "$code"
+			printf '{"name":%s,"delay":%s,"code":%s,"ok":true}' "$(json_quote "$name")" "$ms" "$(json_quote "$code")"
 		else
-			printf '{"name":"%s","delay":0,"code":"","ok":false,"msg":"timeout"}' "$name"
+			printf '{"name":%s,"delay":0,"code":"","ok":false,"msg":"timeout"}' "$(json_quote "$name")"
 		fi
 	done
 	echo "]"
@@ -2041,16 +2467,20 @@ get_access_rules() {
 		[ -z "$domain" ] && continue
 		if [ $first -eq 0 ]; then printf ','; fi
 		first=0
-		printf '{"sid":"%s","ip":"%s","domain":"%s","action":"%s","group":"%s","enabled":"%s","comment":"%s","rule_type":"%s"}' "$sid" "$ip" "$domain" "$action" "$group" "$enabled" "$comment" "$rule_type"
+		printf '{"sid":%s,"ip":%s,"domain":%s,"action":%s,"group":%s,"enabled":%s,"comment":%s,"rule_type":%s}' \
+			"$(json_quote "$sid")" "$(json_quote "$ip")" "$(json_quote "$domain")" "$(json_quote "$action")" "$(json_quote "$group")" "$(json_quote "$enabled")" "$(json_quote "$comment")" "$(json_quote "$rule_type")"
 	done
 	echo "]"
 }
 
 add_access_rule() {
-	local ip="$1" domain="$2" action="$3" group="$4" rule_type="$5"
+	local ip="$1" domain="$2" action="$3" group="$4" rule_type="$5" comment="$6"
 	[ -z "$domain" ] && { echo "ERROR: domain required" >&2; return 1; }
+	valid_rule_domain "$domain" || { echo "ERROR: invalid domain" >&2; return 1; }
 	[ -z "$action" ] && action="block"
 	[ -z "$rule_type" ] && rule_type="suffix"
+	case "$action" in block|direct|proxy) ;; *) echo "ERROR: invalid action" >&2; return 1 ;; esac
+	case "$rule_type" in suffix|domain|keyword) ;; *) echo "ERROR: invalid rule_type" >&2; return 1 ;; esac
 	local sid
 	sid=$(uci add mihomo mihomo_rule)
 	uci -q set mihomo.$sid.src_ip="$ip"
@@ -2058,6 +2488,7 @@ add_access_rule() {
 	uci -q set mihomo.$sid.action="$action"
 	[ -n "$group" ] && uci -q set mihomo.$sid.group="$group"
 	uci -q set mihomo.$sid.rule_type="$rule_type"
+	[ -n "$comment" ] && uci -q set mihomo.$sid.comment="$comment"
 	uci -q set mihomo.$sid.enabled="1"
 	uci commit mihomo
 	logger -t mihomo "access_rule added: ip=$ip domain=$domain action=$action rule_type=$rule_type"
@@ -2087,7 +2518,8 @@ get_adblock_sources() {
 		fmt=$(uci -q get mihomo.$sid.format); [ -z "$fmt" ] && fmt="yaml"
 		[ $first -eq 0 ] && printf ','
 		first=0
-		printf '{"sid":"%s","name":"%s","url":"%s","behavior":"%s","format":"%s","enabled":"%s"}' "$sid" "$name" "$url" "$behavior" "$fmt" "$e"
+		printf '{"sid":%s,"name":%s,"url":%s,"behavior":%s,"format":%s,"enabled":%s}' \
+			"$(json_quote "$sid")" "$(json_quote "$name")" "$(json_quote "$url")" "$(json_quote "$behavior")" "$(json_quote "$fmt")" "$(json_quote "$e")"
 	done
 	echo "]"
 }
@@ -2100,8 +2532,12 @@ add_adblock_source() {
 		ssproxy-ad-*) ;;
 		*) name="ssproxy-ad-$name" ;;
 	esac
+	case "$name" in *[!A-Za-z0-9_-]*) echo "ERROR: invalid name" >&2; return 1 ;; esac
 	[ -z "$behavior" ] && behavior="domain"
 	[ -z "$fmt" ] && fmt="yaml"
+	case "$behavior" in domain|classical|ipcidr) ;; *) echo "ERROR: invalid behavior" >&2; return 1 ;; esac
+	case "$fmt" in yaml|text) ;; *) echo "ERROR: invalid format" >&2; return 1 ;; esac
+	valid_http_url "$url" || { echo "ERROR: URL must use http:// or https://" >&2; return 1; }
 	local sid
 	sid=$(uci add mihomo adblock_source)
 	uci -q set mihomo.$sid.name="$name"
@@ -2253,10 +2689,59 @@ get_core_log() {
 	fi
 }
 
+normalize_acl_identity() {
+	local value="$1"
+	case "$value" in
+		*:*\/128) printf '%s\n' "${value%/128}" ;;
+		*.*.*.*\/32) printf '%s\n' "${value%/32}" ;;
+		*) printf '%s\n' "$value" ;;
+	esac
+}
+
+data_link_is_intercepted() {
+	local sid="$1" device mode tun_enabled wanted acl
+	tun_enabled=$(uci -q get mihomo.config.tun_enabled)
+	[ "$tun_enabled" = "1" ] && return 0
+	mode=$(uci -q get mihomo.config.acl_mode); [ -n "$mode" ] || mode=all
+	[ "$mode" != "whitelist" ] && return 0
+	device=$(uci -q get mihomo.$sid.device_ip)
+	wanted=$(normalize_acl_identity "$device")
+	for acl in $(uci -q get mihomo.config.acl_ips); do
+		[ "$(normalize_acl_identity "$acl")" = "$wanted" ] && return 0
+	done
+	return 1
+}
+
+add_data_link_to_acl() {
+	local sid="$1" device wanted acl
+	uci -X show mihomo 2>/dev/null | grep -q "^mihomo\.$sid=data_link$" || {
+		echo "ERROR: data link not found" >&2
+		return 1
+	}
+	device=$(uci -q get mihomo.$sid.device_ip)
+	validate_acl_ip "$device" || {
+		echo "ERROR: data link has invalid device IP/CIDR" >&2
+		return 1
+	}
+	wanted=$(normalize_acl_identity "$device")
+	for acl in $(uci -q get mihomo.config.acl_ips); do
+		if [ "$(normalize_acl_identity "$acl")" = "$wanted" ]; then
+			echo '{"changed":0}'
+			return 0
+		fi
+	done
+	uci -q add_list mihomo.config.acl_ips="$device" || return 1
+	uci -q commit mihomo || return 1
+	printf '{"changed":1,"device":%s}\n' "$(json_quote "$device")"
+}
+
 get_chain_status() {
 	local run_config="/tmp/mihomo_run.yaml"
 	local controller=0 landing_total landing_enabled landing_valid link_total link_enabled link_valid runtime_landing=0 runtime_links=0
+	local acl_mode tun_enabled links
 	mihomo_curl -s -m 2 "http://127.0.0.1:${API_PORT}/version" >/dev/null 2>&1 && controller=1
+	acl_mode=$(uci -q get mihomo.config.acl_mode); [ -n "$acl_mode" ] || acl_mode=all
+	tun_enabled=$(uci -q get mihomo.config.tun_enabled); [ "$tun_enabled" = "1" ] || tun_enabled=0
 	landing_total=$(uci -X show mihomo 2>/dev/null | grep -c '=landing_node$')
 	landing_enabled=$(uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=landing_node$/\\1/p' | while read -r sid; do [ "$(uci -q get mihomo.$sid.enabled)" = "1" ] && echo 1; done | wc -l | tr -d ' ')
 	landing_valid=$(uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=landing_node$/\\1/p' | while read -r sid; do landing_node_valid "$sid" 1 && echo 1; done | wc -l | tr -d ' ')
@@ -2267,7 +2752,52 @@ get_chain_status() {
 		runtime_landing=$(grep -c 'name: "ssproxy-landing-' "$run_config" 2>/dev/null)
 		runtime_links=$(grep -c 'name: "ssproxy-chain-' "$run_config" 2>/dev/null)
 	fi
-	echo "{\\"controller\\":$controller,\\"run_config\\":$([ -f "$run_config" ] && echo 1 || echo 0),\\"landing_total\\":${landing_total:-0},\\"landing_enabled\\":${landing_enabled:-0},\\"landing_valid\\":${landing_valid:-0},\\"link_total\\":${link_total:-0},\\"link_enabled\\":${link_enabled:-0},\\"link_valid\\":${link_valid:-0},\\"runtime_landing\\":${runtime_landing:-0},\\"runtime_links\\":${runtime_links:-0}}"
+	links=$(uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=data_link$/\\1/p' | {
+		local first=1 seen_devices="" sid
+		while read -r sid; do
+			[ -n "$sid" ] || continue
+			local enabled device identity duplicate=0 runtime=0 intercepted=0 valid=0 code reason group
+			enabled=$(uci -q get mihomo.$sid.enabled); [ "$enabled" = "1" ] || enabled=0
+			device=$(uci -q get mihomo.$sid.device_ip)
+			identity=$(normalize_acl_identity "$device")
+			printf '%s\n' " $seen_devices " | grep -qF " $identity " && duplicate=1
+			group=$(data_link_group_name "$sid")
+			[ -f "$run_config" ] && grep -qF "name: \\"$group\\"" "$run_config" && runtime=1
+			data_link_is_intercepted "$sid" && intercepted=1
+			if [ "$enabled" = "0" ]; then
+				code="disabled"; reason="链路已停用"
+			elif ! landing_node_valid "$(uci -q get mihomo.$sid.landing_node)" 1; then
+				code="invalid_landing"; reason="落地节点无效或字段不完整"
+			elif ! effective_data_link_node "$sid" "$run_config" 1 >/dev/null; then
+				code="missing_front"; reason="前置节点不存在于当前运行配置"
+			elif [ "$duplicate" = "1" ]; then
+				code="duplicate"; reason="设备与另一条启用链路冲突"
+			elif ! data_link_valid "$sid" "$run_config" 1; then
+				code="invalid"; reason="链路配置校验失败"
+			else
+				valid=1
+				seen_devices="$seen_devices $identity"
+				if [ "$runtime" = "0" ]; then
+					code="not_applied"; reason="配置有效，但尚未应用到运行配置"
+				elif [ "$intercepted" = "0" ]; then
+					code="bypassed"; reason="设备不在受控 IP 列表，流量会绕过 Mihomo"
+				elif [ "$controller" = "0" ]; then
+					code="controller_offline"; reason="链路已注入，但控制器离线"
+				else
+					code="ready"; reason="链路已注入，设备流量会被接管"
+				fi
+			fi
+			[ "$first" -eq 0 ] && printf ','
+			first=0
+			printf '{"sid":%s,"device":%s,"enabled":%s,"valid":%s,"runtime":%s,"intercepted":%s,"code":%s,"reason":%s}' \
+				"$(json_quote "$sid")" "$(json_quote "$device")" "$enabled" "$valid" "$runtime" "$intercepted" \
+				"$(json_quote "$code")" "$(json_quote "$reason")"
+		done
+	})
+	printf '{"controller":%s,"run_config":%s,"acl_mode":%s,"tun_enabled":%s,"landing_total":%s,"landing_enabled":%s,"landing_valid":%s,"link_total":%s,"link_enabled":%s,"link_valid":%s,"runtime_landing":%s,"runtime_links":%s,"links":[%s]}\n' \
+		"$controller" "$([ -f "$run_config" ] && echo 1 || echo 0)" "$(json_quote "$acl_mode")" "$tun_enabled" \
+		"${landing_total:-0}" "${landing_enabled:-0}" "${landing_valid:-0}" "${link_total:-0}" "${link_enabled:-0}" \
+		"${link_valid:-0}" "${runtime_landing:-0}" "${runtime_links:-0}" "$links"
 }
 
 get_chain_log() {
@@ -2295,11 +2825,17 @@ mark_data_link_healthy() {
 update_data_link_health_from_connections() {
 	local raw="$1"
 	[ -n "$raw" ] || return 0
+	local tmpd
+	tmpd=$(mktemp -d) || return 1
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].policy' 2>/dev/null > "$tmpd/policy"
+	printf '%s' "$raw" | jsonfilter -e '$.connections[@].chains[0]' 2>/dev/null > "$tmpd/chain"
+	cat "$tmpd/policy" "$tmpd/chain" | sort -u > "$tmpd/groups"
 	uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=data_link$/\\1/p' | while read -r sid; do
 		local group
 		group=$(data_link_group_name "$sid")
-		printf '%s' "$raw" | grep -qF "$group" && mark_data_link_healthy "$sid"
+		grep -qxF "$group" "$tmpd/groups" && mark_data_link_healthy "$sid"
 	done
+	rm -rf "$tmpd"
 }
 
 resolve_data_link_sid() {
@@ -2323,6 +2859,7 @@ resolve_data_link_sid() {
 collect_data_link_traffic() {
 	local raw="$1" now last elapsed tmpd
 	[ -n "$raw" ] || return 0
+	update_data_link_health_from_connections "$raw"
 	now=$(date +%s)
 	last=$(cat "$data_link_last_poll_file" 2>/dev/null)
 	case "$last" in ''|*[!0-9]*) last=$((now - 5)) ;; esac
@@ -2340,39 +2877,63 @@ collect_data_link_traffic() {
 		mkdir -p "$(dirname "$data_link_persist_file")"
 		: > "$data_link_persist_file"
 	fi
+	: > "$tmpd/map"
+	uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=data_link$/\\1/p' | while read -r sid; do
+		[ "$(uci -q get mihomo.$sid.enabled)" = "1" ] || continue
+		local device group
+		device=$(uci -q get mihomo.$sid.device_ip)
+		group=$(data_link_group_name "$sid")
+		printf '%s|%s|%s\n' "$sid" "$device" "$group"
+	done > "$tmpd/map"
 	: > "$tmpd/state.new"
 	: > "$tmpd/delta"
-	awk '{print NR, $0}' "$tmpd/id" | while read -r n cid; do
-		[ -n "$cid" ] || continue
-		local ip policy chain up down sid previous prev_up=0 prev_down=0 delta_up delta_down
-		ip=$(sed -n "${n}p" "$tmpd/ip")
-		policy=$(sed -n "${n}p" "$tmpd/policy")
-		chain=$(sed -n "${n}p" "$tmpd/chain")
-		up=$(sed -n "${n}p" "$tmpd/up"); case "$up" in ''|*[!0-9]*) up=0 ;; esac
-		down=$(sed -n "${n}p" "$tmpd/down"); case "$down" in ''|*[!0-9]*) down=0 ;; esac
-		sid=$(resolve_data_link_sid "$ip" "$policy" "$chain")
-		[ -n "$sid" ] || continue
-		previous=$(awk -F'|' -v id="$cid" '$1==id { print $3 "|" $4; exit }' "$data_link_conn_state_file")
-		if [ -n "$previous" ]; then prev_up=${previous%%|*}; prev_down=${previous#*|}; fi
-		delta_up=$((up - prev_up)); [ "$delta_up" -lt 0 ] && delta_up=$up
-		delta_down=$((down - prev_down)); [ "$delta_down" -lt 0 ] && delta_down=$down
-		echo "$cid|$sid|$up|$down" >> "$tmpd/state.new"
-		echo "$sid|$delta_up|$delta_down" >> "$tmpd/delta"
-	done
+	awk -F'|' -v mapf="$tmpd/map" -v statef="$data_link_conn_state_file" \
+		-v idf="$tmpd/id" -v ipf="$tmpd/ip" -v policyf="$tmpd/policy" \
+		-v chainf="$tmpd/chain" -v upf="$tmpd/up" -v downf="$tmpd/down" \
+		-v statenew="$tmpd/state.new" -v deltaf="$tmpd/delta" '
+		FILENAME == mapf {
+			group_sid[$3]=$1
+			if ($2 != "" && $2 !~ /\//) device_sid[$2]=$1
+			next
+		}
+		FILENAME == statef { prev_up[$1]=$3+0; prev_down[$1]=$4+0; next }
+		FILENAME == idf { id[FNR]=$0; if (FNR > maxn) maxn=FNR; next }
+		FILENAME == ipf { ip[FNR]=$0; next }
+		FILENAME == policyf { policy[FNR]=$0; next }
+		FILENAME == chainf { chain[FNR]=$0; next }
+		FILENAME == upf { up[FNR]=$0+0; next }
+		FILENAME == downf { down[FNR]=$0+0; next }
+		END {
+			for (i=1; i<=maxn; i++) {
+				cid=id[i]; if (cid == "") continue
+				sid=group_sid[policy[i]]
+				if (sid == "") sid=group_sid[chain[i]]
+				if (sid == "") sid=device_sid[ip[i]]
+				if (sid == "") continue
+				du=up[i] - prev_up[cid]; if (!(cid in prev_up) || du < 0) du=up[i]
+				dd=down[i] - prev_down[cid]; if (!(cid in prev_down) || dd < 0) dd=down[i]
+				print cid "|" sid "|" up[i] "|" down[i] > statenew
+				print sid "|" du "|" dd > deltaf
+			}
+		}' "$tmpd/map" "$data_link_conn_state_file" "$tmpd/id" "$tmpd/ip" "$tmpd/policy" "$tmpd/chain" "$tmpd/up" "$tmpd/down"
 	mv "$tmpd/state.new" "$data_link_conn_state_file"
 	awk -F'|' '{ up[$1]+=$2; down[$1]+=$3 } END { for (sid in up) print sid "|" up[sid] "|" down[sid] }' "$tmpd/delta" > "$tmpd/aggregate"
-	: > "$tmpd/metrics.new"
-	uci -X show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=data_link$/\\1/p' | while read -r sid; do
-		local delta previous total_up=0 total_down=0 delta_up=0 delta_down=0 up_rate down_rate
-		delta=$(awk -F'|' -v sid="$sid" '$1==sid { print $2 "|" $3; exit }' "$tmpd/aggregate")
-		if [ -n "$delta" ]; then delta_up=${delta%%|*}; delta_down=${delta#*|}; fi
-		previous=$(awk -F'|' -v sid="$sid" '$1==sid { print $4 "|" $5; exit }' "$data_link_metrics_file")
-		if [ -z "$previous" ]; then previous=$(awk -F'|' -v sid="$sid" '$1==sid { print $2 "|" $3; exit }' "$data_link_persist_file"); fi
-		if [ -n "$previous" ]; then total_up=${previous%%|*}; total_down=${previous#*|}; fi
-		total_up=$((total_up + delta_up)); total_down=$((total_down + delta_down))
-		up_rate=$((delta_up / elapsed)); down_rate=$((delta_down / elapsed))
-		echo "$sid|$up_rate|$down_rate|$total_up|$total_down|$now" >> "$tmpd/metrics.new"
-	done
+	awk -F'|' -v mapf="$tmpd/map" -v metricsf="$data_link_metrics_file" \
+		-v persistf="$data_link_persist_file" -v aggregatef="$tmpd/aggregate" \
+		-v now="$now" -v elapsed="$elapsed" '
+		FILENAME == mapf { sid[$1]=1; next }
+		FILENAME == metricsf { total_up[$1]=$4+0; total_down[$1]=$5+0; current[$1]=1; next }
+		FILENAME == persistf {
+			if (!($1 in current)) { total_up[$1]=$2+0; total_down[$1]=$3+0 }
+			next
+		}
+		FILENAME == aggregatef { delta_up[$1]=$2+0; delta_down[$1]=$3+0; next }
+		END {
+			for (s in sid) {
+				tu=total_up[s] + delta_up[s]; td=total_down[s] + delta_down[s]
+				print s "|" int(delta_up[s]/elapsed) "|" int(delta_down[s]/elapsed) "|" tu "|" td "|" now
+			}
+		}' "$tmpd/map" "$data_link_metrics_file" "$data_link_persist_file" "$tmpd/aggregate" > "$tmpd/metrics.new"
 	mv "$tmpd/metrics.new" "$data_link_metrics_file"
 	local last_flush
 	last_flush=$(cat "$data_link_flush_file" 2>/dev/null); case "$last_flush" in ''|*[!0-9]*) last_flush=0 ;; esac
@@ -2391,7 +2952,7 @@ get_data_link_health() {
 		grep -qxF "$sid" "$data_link_health_file" 2>/dev/null || continue
 		[ $first -eq 0 ] && printf ','
 		first=0
-		printf '"%s"' "$sid"
+		json_quote "$sid"
 	done
 	echo "]"
 }
@@ -2412,7 +2973,8 @@ get_data_link_metrics() {
 		grep -qxF "$sid" "$data_link_health_file" 2>/dev/null && healthy=1
 		[ $first -eq 0 ] && printf ','
 		first=0
-		printf '{"sid":"%s","up_rate":%s,"down_rate":%s,"total_up":%s,"total_down":%s,"updated":%s,"healthy":%s}' "$sid" "${up_rate:-0}" "${down_rate:-0}" "${total_up:-0}" "${total_down:-0}" "${updated:-0}" "$healthy"
+		printf '{"sid":%s,"up_rate":%s,"down_rate":%s,"total_up":%s,"total_down":%s,"updated":%s,"healthy":%s}' \
+			"$(json_quote "$sid")" "${up_rate:-0}" "${down_rate:-0}" "${total_up:-0}" "${total_down:-0}" "${updated:-0}" "$healthy"
 	done
 	echo "]"
 }
@@ -2544,9 +3106,13 @@ emit_tproxy_rules() {
 	if [ "$acl_mode" = "whitelist" ]; then
 		if [ -n "$acl_v4" ]; then
 			echo "add rule inet mihomo prerouting ip saddr != { $acl_v4 } return"
+		else
+			echo "add rule inet mihomo prerouting ip saddr 0.0.0.0/0 return"
 		fi
 		if [ -n "$acl_v6" ]; then
 			echo "add rule inet mihomo prerouting ip6 saddr != { $acl_v6 } return"
+		else
+			echo "add rule inet mihomo prerouting ip6 saddr ::/0 return"
 		fi
 	fi
 
@@ -2584,14 +3150,26 @@ case "$1" in
 	check_core)
 		check_core
 		;;
+	check_controller)
+		check_controller
+		;;
+	validate_acl_ip)
+		validate_acl_ip "$2"
+		;;
+	wait_controller)
+		wait_controller "$2"
+		;;
 	download_core)
-		download_core "$2"
+		download_core "$2" "$3"
 		;;
 	update_geox)
 		update_geox "$2" "$3"
 		;;
 	update_subscription)
 		update_subscription "$2"
+		;;
+	update_subscriptions)
+		update_subscriptions
 		;;
 	clear_subscription)
 		clear_subscription
@@ -2634,6 +3212,9 @@ case "$1" in
 		;;
 	get_chain_status)
 		get_chain_status
+		;;
+	add_data_link_to_acl)
+		add_data_link_to_acl "$2"
 		;;
 	set_chain_front_node)
 		set_chain_front_node "$2"
@@ -2690,7 +3271,7 @@ case "$1" in
 		get_access_rules
 		;;
 	add_access_rule)
-		add_access_rule "$2" "$3" "$4" "$5" "$6"
+		add_access_rule "$2" "$3" "$4" "$5" "$6" "$7"
 		;;
 	del_access_rule)
 		del_access_rule "$2"
@@ -2717,7 +3298,7 @@ case "$1" in
 		set_adblock_enabled "$2"
 		;;
 	*)
-		echo "Usage: $0 {get_arch|get_lan_ip|get_lan_ip6|emit_tproxy_rules|check_core|download_core|update_geox|update_subscription|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_chain_status|set_chain_front_node|get_chain_log|get_data_link_health|get_data_link_metrics|reset_data_link_health|test_landing_node|test_data_link|get_connections|collect_connections|collect_loop|get_history|clear_access_log|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes|test_connectivity|traffic_loop|get_traffic|reset_traffic_domains|get_adblock_sources|add_adblock_source|del_adblock_source|toggle_adblock_source}"
+		echo "Usage: $0 {get_arch|get_lan_ip|get_lan_ip6|emit_tproxy_rules|check_core|check_controller|wait_controller|download_core|update_geox|update_subscription|update_subscriptions|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_chain_status|add_data_link_to_acl|set_chain_front_node|get_chain_log|get_data_link_health|get_data_link_metrics|reset_data_link_health|test_landing_node|test_data_link|get_connections|collect_connections|collect_loop|get_history|clear_access_log|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes|test_connectivity|traffic_loop|get_traffic|reset_traffic_domains|get_adblock_sources|add_adblock_source|del_adblock_source|toggle_adblock_source}"
 		exit 1
 		;;
 esac
@@ -3367,7 +3948,7 @@ return view.extend({
 						var cm = document.getElementById('rule_comment').value.trim();
 						if (!d) { ui.addNotification(null, E('p', _('请填写域名。')), 'danger'); return; }
 						var rt = document.getElementById('rule_type').value;
-						var args = ['add_access_rule', ip, d, ac, (ac === 'proxy' ? gp : ''), rt];
+						var args = ['add_access_rule', ip, d, ac, (ac === 'proxy' ? gp : ''), rt, cm];
 						return fs.exec('/usr/share/mihomo/helper.sh', args).then(function(res) {
 							if (res.code === 0) {
 								ui.addNotification(null, E('p', _('规则已保存（需重启核心后生效）。')), 'info');
@@ -3763,7 +4344,13 @@ return view.extend({
 		var perform_download = function(ev) {
 			ev.preventDefault();
 			var url_input = document.getElementById('core_download_url');
+			var sha256_input = document.getElementById('core_download_sha256');
 			var url = url_input ? url_input.value.trim() : '';
+			var sha256 = sha256_input ? sha256_input.value.trim().toLowerCase() : '';
+			if (url && !/^[0-9a-f]{64}$/.test(sha256)) {
+				ui.addNotification(null, E('p', _('自定义核心地址必须提供有效的 SHA256。')), 'danger');
+				return;
+			}
 			
 			var close_btn = E('button', {
 				'class': 'cbi-button cbi-button-neutral',
@@ -3783,6 +4370,7 @@ return view.extend({
 			var args = ['download_core'];
 			if (url) {
 				args.push(url);
+				args.push(sha256);
 			}
 
 			return fs.exec('/usr/share/mihomo/helper.sh', args).then(function(res) {
@@ -3809,6 +4397,17 @@ return view.extend({
 					'class': 'cbi-input-text',
 					'placeholder': '留空则默认使用 GitHub 官方源下载',
 					'style': 'width: 60%;'
+				})
+			]),
+			E('label', { 'class': 'cbi-value-title' }, _('SHA256（自定义地址必填）')),
+			E('div', { 'class': 'cbi-value-field' }, [
+				E('input', {
+					'id': 'core_download_sha256',
+					'type': 'text',
+					'class': 'cbi-input-text',
+					'autocomplete': 'off',
+					'placeholder': '64 位 SHA256',
+					'style': 'width: 60%; font-family: monospace;'
 				})
 			])
 		];
@@ -4065,7 +4664,7 @@ return view.extend({
 			}
 		}
 
-		var sub_url = uci.get('mihomo', 'config', 'subscription_url') || '';
+		var subscription_count = Number(schedule.subscription_count) || 0;
 
 		var run_delay_test = function() {
 			if (!valid_node_count) return;
@@ -4131,19 +4730,19 @@ return view.extend({
 			node_header_right.appendChild(node_clear_btn);
 			if (controller_up) node_header_right.appendChild(node_test_btn);
 		}
-		var node_list_header_children = [ E('h3', { 'style': 'margin-top: 0; margin-bottom: 0;' }, _('配置订阅节点列表')), node_header_right ];
+		var node_list_header_children = [ E('h3', { 'style': 'margin-top: 0; margin-bottom: 0;' }, _('全部订阅节点')), node_header_right ];
 		var node_list_header = E('div', { 'style': 'display: flex; align-items: center; justify-content: space-between;' }, node_list_header_children);
 
 		var node_list_schedule = null;
 		if (schedule.auto_update === '1') {
-			var sched_txt = _('自动更新：每 ') + schedule.interval + _(' 小时');
+			var sched_txt = _('订阅：') + subscription_count + _(' 个　|　自动更新：每 ') + schedule.interval + _(' 小时');
 			if (schedule.last_update && schedule.last_update !== '') {
 				sched_txt += _('　|　上次更新：') + new Date(parseInt(schedule.last_update, 10) * 1000).toLocaleString();
 			}
 			if (schedule.next_update && schedule.next_update !== '') {
 				sched_txt += _('　|　下次更新：') + new Date(parseInt(schedule.next_update, 10) * 1000).toLocaleString();
 			} else if (schedule.has_url !== '1') {
-				sched_txt += _('　|　未配置订阅链接');
+					sched_txt += _('　|　未配置启用的订阅');
 			}
 			node_list_schedule = E('div', {
 				'style': 'margin-top: 8px; font-size: 12px; color: #888;'
@@ -4166,10 +4765,10 @@ return view.extend({
 				'style': 'margin-top: 10px;',
 				'click': function(ev) {
 					ev.preventDefault();
-					ui.showModal(_('正在下载订阅配置'), [
-						E('p', {}, _('正在从订阅链接下载节点和规则配置... 请稍候。'))
+					ui.showModal(_('正在更新全部订阅'), [
+						E('p', {}, _('正在批量下载并合并所有启用的订阅...'))
 					]);
-					return fs.exec('/usr/share/mihomo/helper.sh', ['update_subscription', sub_url]).then(function(res) {
+					return fs.exec('/usr/share/mihomo/helper.sh', ['update_subscriptions']).then(function(res) {
 						ui.hideModal();
 						if (res.code === 0) {
 							ui.addNotification(null, E('p', _('订阅配置已成功更新！')), 'info');
@@ -4182,21 +4781,21 @@ return view.extend({
 						ui.addNotification(null, E('p', _('下载订阅失败：') + err.message), 'danger');
 					});
 				}
-			}, _('重新更新订阅'));
+			}, _('重新更新全部订阅'));
 			node_list_body = E('div', { 'style': 'padding: 20px; text-align: center; color: #ff4757; background: rgba(255, 71, 87, 0.05); border-radius: 6px; border: 1px dashed #ff4757; line-height: 1.6;' }, [
 				E('p', { 'style': 'font-weight: bold; margin: 0;' }, parse_error),
 				retry_update_btn
 			]);
-		} else if (sub_url) {
+		} else if (subscription_count > 0) {
 			var quick_update_btn = E('button', {
 				'class': 'cbi-button cbi-button-action',
 				'style': 'margin-top: 10px;',
 				'click': function(ev) {
 					ev.preventDefault();
-					ui.showModal(_('正在下载订阅配置'), [
-						E('p', {}, _('正在从订阅链接下载节点和规则配置... 请稍候。'))
+					ui.showModal(_('正在更新全部订阅'), [
+						E('p', {}, _('正在批量下载并合并所有启用的订阅...'))
 					]);
-					return fs.exec('/usr/share/mihomo/helper.sh', ['update_subscription', sub_url]).then(function(res) {
+					return fs.exec('/usr/share/mihomo/helper.sh', ['update_subscriptions']).then(function(res) {
 						ui.hideModal();
 						if (res.code === 0) {
 							ui.addNotification(null, E('p', _('订阅配置已成功更新！')), 'info');
@@ -4209,21 +4808,41 @@ return view.extend({
 						ui.addNotification(null, E('p', _('下载订阅失败：') + err.message), 'danger');
 					});
 				}
-			}, _('立即更新订阅'));
+			}, _('更新全部订阅'));
 			node_list_body = E('div', { 'style': 'padding: 20px; text-align: center; color: #ff9f43; background: rgba(255, 159, 67, 0.05); border-radius: 6px; border: 1px dashed #ff9f43;' }, [
-				E('p', { 'style': 'font-weight: bold; margin: 0;' }, _('⚠️ 已配置订阅链接，但本地尚未下载节点数据。')),
+				E('p', { 'style': 'font-weight: bold; margin: 0;' }, _('已配置订阅，但本地尚未生成合并节点数据。')),
 				quick_update_btn
 			]);
 		} else {
-			node_list_body = E('div', { 'style': 'padding: 15px; text-align: center; color: #999;' }, _('暂无可用节点信息，请先输入订阅链接并点击立即更新订阅。'));
+			node_list_body = E('div', { 'style': 'padding: 15px; text-align: center; color: #999;' }, _('暂无可用节点信息。'));
 		}
 
-		// 系统代理日志：逐行渲染，错误/致命行红色加粗，告警行橙色
+		// 系统代理日志：统一识别 Mihomo level= 与 OpenWrt syslog 级别。
+		var log_text = String(logs || '');
+		var log_level_filter = 'all';
+		function detectLogLevel(line) {
+			line = String(line || '');
+			var match = line.match(/\\blevel\\s*=\\s*["']?(debug|info|notice|warn|warning|err|error|fatal|panic)\\b/i);
+			if (!match) match = line.match(/\\b(?:daemon|user|kern|local[0-7])\\.(debug|info|notice|warn|warning|err|error|crit|alert|emerg)\\b/i);
+			var level = match ? match[1].toLowerCase() : '';
+			if (level === 'fatal' || level === 'panic' || level === 'crit' || level === 'alert' || level === 'emerg') return 'fatal';
+			if (level === 'error' || level === 'err') return 'error';
+			if (level === 'warning' || level === 'warn') return 'warning';
+			if (level === 'debug') return 'debug';
+			if (level === 'info' || level === 'notice') return 'info';
+			if (/\\b(FATAL|PANIC)\\b/i.test(line)) return 'fatal';
+			if (/\\b(ERROR|ERR)\\b/i.test(line)) return 'error';
+			if (/\\b(WARN|WARNING)\\b/i.test(line)) return 'warning';
+			if (/\\bDEBUG\\b/i.test(line)) return 'debug';
+			if (/\\bINFO\\b/i.test(line)) return 'info';
+			return 'other';
+		}
 		var logs_pre = document.createElement('pre');
 		logs_pre.setAttribute('style', 'width: 100%; height: 250px; overflow-y: auto; font-family: monospace; padding: 12px; border-radius: 6px; border: 1px solid rgba(0,0,0,0.12); background: rgba(0,0,0,0.02); resize: vertical; margin-bottom: 12px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;');
 		function renderLogs(text) {
+			log_text = String(text || '');
 			while (logs_pre.firstChild) { logs_pre.removeChild(logs_pre.firstChild); }
-			var lines = String(text || '').split('\\n');
+			var lines = log_text.split('\\n');
 			if (lines.length === 0 || (lines.length === 1 && lines[0] === '')) {
 				var empty = document.createElement('div');
 				empty.textContent = _('暂无日志记录。');
@@ -4231,25 +4850,53 @@ return view.extend({
 				logs_pre.appendChild(empty);
 				return;
 			}
+			var visible = 0;
 			for (var i = 0; i < lines.length; i++) {
 				var line = lines[i];
+				var level = detectLogLevel(line);
+				if (log_level_filter !== 'all' && level !== log_level_filter) continue;
 				var row = document.createElement('div');
 				row.textContent = line;
-				if (/\\b(FATAL|FAT|ERROR|ERR|PANIC)\\b|\\blevel=(fatal|error)\\b/i.test(line)) {
+				if (level === 'fatal' || level === 'error') {
 					row.style.color = '#e03131';
 					row.style.fontWeight = 'bold';
-				} else if (/\\b(WARN|WARNING)\\b|\\blevel=warning\\b/i.test(line)) {
+				} else if (level === 'warning') {
 					row.style.color = '#e8590c';
 				}
 				logs_pre.appendChild(row);
+				visible++;
+			}
+			if (visible === 0) {
+				var no_match = document.createElement('div');
+				no_match.textContent = _('暂无匹配该级别的日志。');
+				no_match.style.color = '#999';
+				logs_pre.appendChild(no_match);
 			}
 		}
 		renderLogs(logs);
+		var log_level_select = E('select', {
+			'id': 'system-log-level-filter',
+			'class': 'cbi-input-select',
+			'style': 'min-width: 128px; margin: 0;',
+			'change': function(ev) {
+				log_level_filter = ev.target.value;
+				renderLogs(log_text);
+			}
+		}, [
+			E('option', { 'value': 'all' }, _('全部级别')),
+			E('option', { 'value': 'debug' }, 'Debug'),
+			E('option', { 'value': 'info' }, 'Info'),
+			E('option', { 'value': 'warning' }, 'Warning'),
+			E('option', { 'value': 'error' }, 'Error'),
+			E('option', { 'value': 'fatal' }, 'Fatal'),
+			E('option', { 'value': 'other' }, _('其他'))
+		]);
 		var clear_logs_btn = E('button', {
 			'class': 'cbi-button cbi-button-neutral',
 			'style': 'margin: 0;',
 			'click': function(ev) {
 				ev.preventDefault();
+				log_text = '';
 				while (logs_pre.firstChild) { logs_pre.removeChild(logs_pre.firstChild); }
 			}
 		}, _('清空'));
@@ -4433,9 +5080,14 @@ return view.extend({
 
 			// Logs panel
 			E('div', { 'class': 'cbi-section' }, [
-				E('div', { 'style': 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;' }, [
+				E('div', { 'style': 'display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px;' }, [
 					E('h3', { 'style': 'margin: 0;' }, _('系统代理日志')),
-					E('div', { 'style': 'display: flex; gap: 8px;' }, [ download_logs_btn, clear_logs_btn ])
+					E('div', { 'style': 'display: flex; flex-wrap: wrap; align-items: center; gap: 8px;' }, [
+						E('label', { 'for': 'system-log-level-filter', 'style': 'margin: 0;' }, _('级别')),
+						log_level_select,
+						download_logs_btn,
+						clear_logs_btn
+					])
 				]),
 				logs_pre
 			]),
@@ -4643,6 +5295,10 @@ return view.extend({
 		var front_node = uci.get('mihomo', 'config', 'chain_front_node') || 'individual';
 		var link_health = {};
 		var link_metrics = {};
+		var link_status = {};
+		if (Array.isArray(status.links)) status.links.forEach(function(row) {
+			link_status[safe_section_id(row.sid)] = row;
+		});
 		if (Array.isArray(metric_rows)) metric_rows.forEach(function(row) {
 			var sid = safe_section_id(row.sid);
 			link_metrics[sid] = row;
@@ -4808,8 +5464,13 @@ return view.extend({
 			for (var i = 0; i < dots.length; i++) {
 				var sid = dots[i].getAttribute('data-section');
 				var healthy = !!link_health[sid];
-				dots[i].style.backgroundColor = healthy ? '#16845b' : '#d92d20';
-				dots[i].title = healthy ? _('链路已通讯') : _('尚未检测到成功通讯');
+				var state = link_status[sid] || {};
+				var color = '#868e96';
+				if (state.code === 'ready') color = healthy ? '#16845b' : '#1971c2';
+				else if (state.code === 'bypassed' || state.code === 'not_applied') color = '#e8590c';
+				else if (state.code && state.code !== 'disabled') color = '#d92d20';
+				dots[i].style.backgroundColor = color;
+				dots[i].title = state.reason || (healthy ? _('链路已通讯') : _('尚未检测到成功通讯'));
 			}
 			var speeds = document.querySelectorAll('.ssproxy-data-link-speed');
 			for (var j = 0; j < speeds.length; j++) {
@@ -4882,6 +5543,10 @@ return view.extend({
 			'change': function(ev) {
 				var selected = ev.target.value;
 				if (selected === front_node) return;
+				if (!confirm(_('切换前置节点将重启 Mihomo，现有连接可能短暂中断。是否继续？'))) {
+					ev.target.value = front_node;
+					return;
+				}
 				front_select.disabled = true;
 				return fs.exec('/usr/share/mihomo/helper.sh', ['set_chain_front_node', selected]).then(function(res) {
 					if (!res || res.code !== 0) throw new Error((res && (res.stderr || res.stdout)) || _('保存失败'));
@@ -4916,17 +5581,45 @@ return view.extend({
 		o = s.option(form.DummyValue, '_health', _('状态'));
 		o.cfgvalue = function(section_id) {
 			var sid = safe_section_id(section_id);
-			return link_health[sid] ? _('链路已通讯') : _('尚未检测到成功通讯');
+			var row = link_status[sid] || {};
+			return row.reason || (link_health[sid] ? _('链路已通讯') : _('尚未检测到成功通讯'));
 		};
 		o.textvalue = function(section_id) {
 			var sid = safe_section_id(section_id);
 			var healthy = !!link_health[sid];
-			return E('span', {
+			var row = link_status[sid] || {};
+			var code = row.code || 'unknown';
+			var color = '#868e96';
+			if (code === 'ready') color = healthy ? '#16845b' : '#1971c2';
+			else if (code === 'bypassed' || code === 'not_applied') color = '#e8590c';
+			else if (code !== 'disabled') color = '#d92d20';
+			var children = [E('span', {
 				'class': 'ssproxy-data-link-dot',
 				'data-section': sid,
-				'title': healthy ? _('链路已通讯') : _('尚未检测到成功通讯'),
-				'style': 'display:inline-block;width:11px;height:11px;border-radius:50%;background-color:' + (healthy ? '#16845b' : '#d92d20') + ';vertical-align:middle;'
-			});
+				'title': row.reason || (healthy ? _('链路已通讯') : _('尚未检测到成功通讯')),
+				'style': 'display:inline-block;flex:0 0 11px;width:11px;height:11px;border-radius:50%;background-color:' + color + ';'
+			}), E('span', { 'style': 'line-height:1.35;' }, row.reason || _('状态未知'))];
+			if (code === 'bypassed') {
+				children.push(E('button', {
+					'type': 'button',
+					'class': 'cbi-button cbi-button-action',
+					'style': 'margin:4px 0 0 19px;padding:2px 8px;',
+					'click': function(ev) {
+						ev.preventDefault(); ev.stopPropagation();
+						if (!confirm(_('将该设备加入受控 IP 列表并重启 Mihomo。是否继续？'))) return;
+						return fs.exec('/usr/share/mihomo/helper.sh', ['add_data_link_to_acl', section_id]).then(function(res) {
+							if (!res || res.code !== 0) throw new Error((res && (res.stderr || res.stdout)) || _('加入失败'));
+							return fs.exec('/etc/init.d/mihomo', ['restart']);
+						}).then(function(res) {
+							if (!res || res.code !== 0) throw new Error((res && (res.stderr || res.stdout)) || _('重启失败'));
+							location.reload();
+						}).catch(function(err) {
+							ui.addNotification(null, E('p', {}, _('加入受控 IP 失败：') + err.message), 'danger');
+						});
+					}
+				}, _('加入受控 IP')));
+			}
+			return E('span', { 'style': 'display:flex;flex-wrap:wrap;align-items:center;gap:8px;min-width:180px;' }, children);
 		};
 
 		o = s.option(form.DummyValue, '_speed', _('当前速率'));
@@ -4995,6 +5688,11 @@ return view.extend({
 		o.inputtitle = _('测试');
 		o.inputstyle = 'action';
 		o.onclick = function(section_id) {
+			var state = link_status[safe_section_id(section_id)] || {};
+			if (!state.runtime || state.code === 'bypassed') {
+				ui.addNotification(null, E('p', {}, state.reason || _('请先保存并应用链路配置。')), 'warning');
+				return;
+			}
 			return fs.exec('/usr/share/mihomo/helper.sh', ['test_data_link', section_id]).then(function(res) {
 				var result = parse_json(res, {});
 				if (res.code === 0 && typeof result.delay === 'number') {
@@ -5007,13 +5705,17 @@ return view.extend({
 			});
 		};
 
-		var state_color = status.controller ? '#16845b' : '#b54708';
+		var issue_count = Array.isArray(status.links) ? status.links.filter(function(row) {
+			return row && row.enabled && row.code !== 'ready';
+		}).length : 0;
+		var state_color = !status.controller || issue_count ? '#b54708' : '#16845b';
 		var state_text = status.controller ? _('控制器在线') : _('控制器离线');
 		var status_panel = E('div', { 'class': 'cbi-section', 'style': 'padding: 14px 16px; margin-bottom: 18px; border-left: 4px solid ' + state_color + ';' }, [
 			E('div', { 'style': 'display:flex; flex-wrap:wrap; align-items:center; gap:18px;' }, [
 				E('strong', { 'style': 'color:' + state_color + ';' }, state_text),
 				E('span', {}, _('落地节点') + ': ' + (status.runtime_landing || 0) + ' / ' + (status.landing_enabled || 0)),
 				E('span', {}, _('有效链路') + ': ' + (status.runtime_links || 0) + ' / ' + (status.link_enabled || 0)),
+				issue_count ? E('strong', { 'style': 'color:#b54708;' }, _('需处理链路') + ': ' + issue_count) : null,
 				E('button', { 'class': 'cbi-button cbi-button-neutral', 'click': function(ev) {
 					ev.preventDefault();
 					return fs.exec('/usr/share/mihomo/helper.sh', ['get_chain_log', '120']).then(function(res) {
@@ -5023,7 +5725,7 @@ return view.extend({
 						]);
 					});
 				} }, _('日志'))
-			])
+			].filter(function(item) { return item !== null; }))
 		]);
 
 		return m.render().then(function(form_node) {
@@ -5077,12 +5779,7 @@ return view.extend({
 		o.depends('config_mode', 'custom');
 		o.depends('config_mode', 'mixed');
 
-		o = s.option(form.Value, 'subscription_url', _('订阅链接'), _('用于下载节点配置的 Clash 兼容订阅链接。'));
-		o.rmempty = true;
-		o.depends('config_mode', 'subscription');
-		o.depends('config_mode', 'mixed');
-
-		// 订阅管理按钮，直接放在订阅链接下方
+		// 所有已保存且启用的订阅在一个事务中批量更新和合并。
 		o = s.option(form.DummyValue, '_update_btn', _('订阅管理'));
 		o.rawhtml = true;
 		o.depends('config_mode', 'subscription');
@@ -5092,30 +5789,16 @@ return view.extend({
 				'class': 'cbi-button cbi-button-action',
 				'click': function(ev) {
 					ev.preventDefault();
-					var url_input = document.getElementById('cbid.mihomo.' + section_id + '.subscription_url');
-					var url = url_input ? url_input.value.trim() : '';
-					if (!url) {
-						url = uci.get('mihomo', section_id, 'subscription_url') || '';
-					}
-					
-					if (!url) {
-						ui.addNotification(null, E('p', _('请先输入有效的订阅链接并点击保存！')), 'warning');
-						return;
-					}
-
-					// 将订阅链接缓存到 UCI，避免刷新或跳转后丢失
-					uci.set('mihomo', section_id, 'subscription_url', url).then(function() {
-						return uci.commit('mihomo');
-					}).catch(function() {});
-
-					ui.showModal(_('正在下载订阅配置'), [
-						E('p', {}, _('正在从订阅链接下载节点和规则配置... 请稍候。'))
+					ui.showModal(_('正在更新全部订阅'), [
+						E('p', {}, _('正在批量下载并合并所有启用的订阅...'))
 					]);
 
-					return fs.exec('/usr/share/mihomo/helper.sh', ['update_subscription', url]).then(function(res) {
+					return fs.exec('/usr/share/mihomo/helper.sh', ['update_subscriptions']).then(function(res) {
 						ui.hideModal();
 						if (res.code === 0) {
-							ui.addNotification(null, E('p', _('订阅配置已成功更新！')), 'info');
+							var result = {};
+							try { result = JSON.parse((res.stdout || '{}').trim()); } catch (e) {}
+							ui.addNotification(null, E('p', _('订阅更新完成：') + (result.available || 0) + _(' 个可用，') + (result.nodes || 0) + _(' 个节点。')), 'info');
 						} else {
 							ui.addNotification(null, E('p', _('更新配置失败：') + (res.stderr || res.stdout || '')), 'danger');
 						}
@@ -5124,12 +5807,12 @@ return view.extend({
 						ui.addNotification(null, E('p', _('下载订阅失败：') + err.message), 'danger');
 					});
 				}
-			}, _('立即更新订阅'));
+			}, _('更新全部订阅'));
 			
 			return E('div', {}, [update_btn]);
 		};
 
-		o = s.option(form.Flag, 'auto_update', _('定时更新订阅'), _('开启后，系统会每小时检查一次，并按下方设置的时间间隔自动重新下载订阅节点（需已配置订阅链接）。'));
+		o = s.option(form.Flag, 'auto_update', _('定时更新订阅'), _('开启后，系统会每小时检查一次，并按下方设置的时间间隔批量更新所有启用的订阅。'));
 	o.rmempty = false;
 	o.depends('config_mode', 'subscription');
 	o.depends('config_mode', 'mixed');
@@ -5184,6 +5867,42 @@ return view.extend({
 
 		o = s.option(form.DynamicList, 'acl_ips', _('受控 IP 列表'), _('填入需要走代理的设备 IPv4/IPv6 地址或 CIDR 网段（如 192.168.1.100、192.168.1.0/24 或 fd00::1）。非列表中的设备流量将直接旁路，不走代理；其 DNS 也不会被劫持。'));
 		o.depends('acl_mode', 'whitelist');
+
+		var subscriptions = m.section(form.GridSection, 'subscription', _('订阅列表'));
+		subscriptions.anonymous = true;
+		subscriptions.addremove = true;
+		subscriptions.sortable = true;
+		subscriptions.nodescriptions = true;
+		subscriptions.addbtntitle = _('添加订阅');
+		subscriptions.sectiontitle = function(section_id) {
+			return uci.get('mihomo', section_id, 'name') || section_id;
+		};
+
+		o = subscriptions.option(form.Flag, 'enabled', _('启用'));
+		o.default = '1';
+		o.rmempty = false;
+
+		o = subscriptions.option(form.Value, 'name', _('名称'));
+		o.rmempty = false;
+		o.placeholder = _('机场订阅');
+		o.validate = function(section_id, value) {
+			value = (value || '').trim();
+			if (!value) return _('请输入订阅名称');
+			var duplicate = false;
+			uci.sections('mihomo', 'subscription', function(sec) {
+				if (sec['.name'] !== section_id && (sec.name || '').trim() === value) duplicate = true;
+			});
+			return duplicate ? _('订阅名称不能重复') : true;
+		};
+
+		o = subscriptions.option(form.Value, 'url', _('订阅地址'));
+		o.modalonly = true;
+		o.rmempty = false;
+		o.placeholder = 'https://example.com/clash.yaml';
+		o.validate = function(section_id, value) {
+			value = (value || '').trim();
+			return /^https?:\\/\\/[^\\s"']+$/.test(value) ? true : _('请输入有效的 HTTP 或 HTTPS 订阅地址');
+		};
 
 		// Advanced Section
 		s = m.section(form.TypedSection, 'mihomo', _('高级设置'));
@@ -5348,6 +6067,66 @@ function parseLogs(result) {
 }
 
 return view.extend({
+	deviceFilterKey: function(row) {
+		return JSON.stringify([
+			String((row && row.device) || ''),
+			String((row && row.ip) || '')
+		]);
+	},
+
+	deviceFilterLabel: function(row) {
+		var device = String((row && row.device) || '');
+		var ip = String((row && row.ip) || '');
+		if (device && ip && device !== ip) return device + ' / ' + ip;
+		return device || ip || _('未识别设备');
+	},
+
+	outboundFilterValue: function(row) {
+		return String((row && (row.policy || row.rule)) || '');
+	},
+
+	outboundFilterKey: function(row) {
+		return JSON.stringify(this.outboundFilterValue(row));
+	},
+
+	updateFilterOptions: function() {
+		if (!this._deviceFilter || !this._outboundFilter) return;
+
+		for (var i = 0; i < this._logs.length; i++) {
+			var row = this._logs[i] || {};
+			var deviceKey = this.deviceFilterKey(row);
+			var outbound = this.outboundFilterValue(row);
+			var outboundKey = this.outboundFilterKey(row);
+			this._deviceOptions[deviceKey] = this.deviceFilterLabel(row);
+			this._outboundOptions[outboundKey] = outbound || _('未识别策略');
+		}
+
+		var selectedDevice = this._deviceFilter.value;
+		var selectedOutbound = this._outboundFilter.value;
+		var deviceOptions = [
+			E('option', { 'value': '' }, _('全部设备 / IP'))
+		];
+		var outboundOptions = [
+			E('option', { 'value': '' }, _('全部出站策略'))
+		];
+
+		Object.keys(this._deviceOptions).sort(function(a, b) {
+			return String(this._deviceOptions[a]).localeCompare(String(this._deviceOptions[b]));
+		}.bind(this)).forEach(function(key) {
+			deviceOptions.push(E('option', { 'value': key }, this._deviceOptions[key]));
+		}.bind(this));
+		Object.keys(this._outboundOptions).sort(function(a, b) {
+			return String(this._outboundOptions[a]).localeCompare(String(this._outboundOptions[b]));
+		}.bind(this)).forEach(function(key) {
+			outboundOptions.push(E('option', { 'value': key }, this._outboundOptions[key]));
+		}.bind(this));
+
+		dom.content(this._deviceFilter, deviceOptions);
+		dom.content(this._outboundFilter, outboundOptions);
+		this._deviceFilter.value = selectedDevice;
+		this._outboundFilter.value = selectedOutbound;
+	},
+
 	load: function() {
 		return fs.exec('/usr/share/mihomo/helper.sh', ['get_history', '300']).then(function(result) {
 			try { return { logs: parseLogs(result), error: '' }; }
@@ -5370,16 +6149,24 @@ return view.extend({
 			return;
 		}
 
-		if (!this._logs.length) {
+		var selectedDevice = this._deviceFilter ? this._deviceFilter.value : '';
+		var selectedOutbound = this._outboundFilter ? this._outboundFilter.value : '';
+		var filteredLogs = this._logs.filter(function(row) {
+			if (selectedDevice && this.deviceFilterKey(row) !== selectedDevice) return false;
+			if (selectedOutbound && this.outboundFilterKey(row) !== selectedOutbound) return false;
+			return true;
+		}.bind(this));
+
+		if (!filteredLogs.length) {
 			body.appendChild(E('tr', {}, E('td', {
 				'colspan': 5,
 				'style': 'padding:24px;text-align:center;color:#777;'
-			}, _('暂无网络访问日志'))));
+			}, this._logs.length ? _('没有符合筛选条件的访问日志') : _('暂无网络访问日志'))));
 			return;
 		}
 
-		for (var i = 0; i < this._logs.length; i++) {
-			var row = this._logs[i] || {};
+		for (var i = 0; i < filteredLogs.length; i++) {
+			var row = filteredLogs[i] || {};
 			var device = row.device || row.ip || '-';
 			var deviceCell = row.device && row.ip ? E('div', {}, [
 				E('div', {}, row.device),
@@ -5403,6 +6190,7 @@ return view.extend({
 		return fs.exec('/usr/share/mihomo/helper.sh', ['get_history', '300']).then(function(result) {
 			self._logs = parseLogs(result);
 			self._error = '';
+			self.updateFilterOptions();
 			self.renderRows();
 		}).catch(function(error) {
 			self._error = error.message || String(error);
@@ -5419,6 +6207,11 @@ return view.extend({
 				throw new Error((result && (result.stderr || result.stdout)) || _('清空失败'));
 			self._logs = [];
 			self._error = '';
+			self._deviceOptions = {};
+			self._outboundOptions = {};
+			if (self._deviceFilter) self._deviceFilter.value = '';
+			if (self._outboundFilter) self._outboundFilter.value = '';
+			self.updateFilterOptions();
 			self.renderRows();
 			ui.addNotification(null, E('p', {}, _('网络访问日志已清空')), 'info');
 		}).catch(function(error) {
@@ -5433,6 +6226,8 @@ return view.extend({
 		if (this._timer) clearInterval(this._timer);
 		this._logs = data.logs || [];
 		this._error = data.error || '';
+		this._deviceOptions = {};
+		this._outboundOptions = {};
 
 		var clearButton = E('button', {
 			'type': 'button',
@@ -5444,12 +6239,32 @@ return view.extend({
 		}, _('清空'));
 
 		this._body = E('tbody');
+		this._deviceFilter = E('select', {
+			'id': 'accesslog-device-filter',
+			'class': 'cbi-input-select',
+			'change': function() { self.renderRows(); }
+		});
+		this._outboundFilter = E('select', {
+			'id': 'accesslog-outbound-filter',
+			'class': 'cbi-input-select',
+			'change': function() { self.renderRows(); }
+		});
 		var viewNode = E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, _('网络访问日志')),
 			E('div', { 'class': 'cbi-section' }, [
 				E('div', { 'style': 'display:flex;align-items:center;margin-bottom:12px;' }, [
 					E('h3', { 'style': 'margin:0;' }, _('访问记录')),
 					E('div', { 'style': 'margin-left:auto;' }, clearButton)
+				]),
+				E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-bottom:12px;' }, [
+					E('label', { 'style': 'display:flex;flex-direction:column;gap:4px;min-width:220px;' }, [
+						E('span', { 'style': 'font-size:12px;color:#666;' }, _('设备 / IP')),
+						this._deviceFilter
+					]),
+					E('label', { 'style': 'display:flex;flex-direction:column;gap:4px;min-width:220px;' }, [
+						E('span', { 'style': 'font-size:12px;color:#666;' }, _('出站策略')),
+						this._outboundFilter
+					])
 				]),
 				E('div', { 'style': 'overflow-x:auto;max-height:560px;overflow-y:auto;border:1px solid #ddd;' },
 					E('table', { 'class': 'table', 'style': 'margin:0;min-width:760px;' }, [
@@ -5465,6 +6280,7 @@ return view.extend({
 			])
 		]);
 
+		this.updateFilterOptions();
 		this.renderRows();
 		this._timer = setInterval(function() { self.refreshLogs(); }, 5000);
 		return viewNode;
@@ -5474,6 +6290,10 @@ return view.extend({
 		if (this._timer) clearInterval(this._timer);
 		this._timer = null;
 		this._body = null;
+		this._deviceFilter = null;
+		this._outboundFilter = null;
+		this._deviceOptions = null;
+		this._outboundOptions = null;
 	}
 });
 """
@@ -5540,14 +6360,21 @@ def create_source_tree(src_dir):
             os.chmod(full_path, 0o755)
     print("Source tree created successfully.")
 
+@contextlib.contextmanager
+def _reproducible_tar_writer(output_filename):
+    """Open a deterministic gzip/tar writer and close every layer on failure."""
+    with open(output_filename, "wb") as raw:
+        with gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=1700000000) as gz:
+            with tarfile.open(fileobj=gz, mode="w") as tar:
+                yield tar
+
+
 def make_tar_gz(source_dir, output_filename, is_control=False):
     """Generates a reproducible tar.gz archive with root:root ownership and correct modes, including directories and using './' prefix."""
     print(f"Archiving '{source_dir}' -> '{output_filename}'...")
     # Pin the gzip header (fixed mtime, no embedded filename) so two builds of
     # the same inputs produce byte-identical archives.
-    _raw = open(output_filename, "wb")
-    _gz = gzip.GzipFile(filename="", fileobj=_raw, mode="wb", mtime=1700000000)
-    with tarfile.open(fileobj=_gz, mode="w") as tar:
+    with _reproducible_tar_writer(output_filename) as tar:
         all_entries = []
         for root, dirs, files in os.walk(source_dir):
             for d in dirs:
@@ -5590,15 +6417,11 @@ def make_tar_gz(source_dir, output_filename, is_control=False):
                         
                 with open(full_path, "rb") as f:
                     tar.addfile(tarinfo, f)
-    _gz.close()
-    _raw.close()
 
 def write_tar_gz_outer_archive(archive_path, file_list):
     """Writes the final .ipk as a gzipped tarball containing the three components."""
     print(f"Creating IPK archive (tar.gz format) '{archive_path}'...")
-    _raw = open(archive_path, "wb")
-    _gz = gzip.GzipFile(filename="", fileobj=_raw, mode="wb", mtime=1700000000)
-    with tarfile.open(fileobj=_gz, mode="w") as tar:
+    with _reproducible_tar_writer(archive_path) as tar:
         for name, data in file_list:
             arcname = "./" + name
             tarinfo = tarfile.TarInfo(name=arcname)
@@ -5611,8 +6434,6 @@ def write_tar_gz_outer_archive(archive_path, file_list):
             tarinfo.mode = 0o644
             tarinfo.type = tarfile.REGTYPE
             tar.addfile(tarinfo, io.BytesIO(data))
-    _gz.close()
-    _raw.close()
 
 def increment_version(script_path=None):
     """Increments the PKG_VERSION in the script file dynamically and updates memory variables.

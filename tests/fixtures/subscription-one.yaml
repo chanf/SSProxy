@@ -1,0 +1,14 @@
+proxies:
+  - name: "Matrix A"
+    type: ss
+    server: 192.0.2.11
+    port: 443
+    cipher: aes-128-gcm
+    password: "matrix-a"
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies:
+      - "Matrix A"
+rules:
+  - MATCH,PROXY

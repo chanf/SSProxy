@@ -107,6 +107,12 @@ def test_add_access_rule_requires_domain(run, uci_env):
     assert "domain required" in res.stderr
 
 
+def test_add_access_rule_rejects_yaml_delimiters(run, uci_env):
+    res = run("add_access_rule", "", "bad,domain", "block", "", "suffix", env=uci_env())
+    assert res.returncode == 1
+    assert "invalid domain" in res.stderr
+
+
 def test_del_access_rule(run, uci_env):
     env = uci_env()
     res = run("del_access_rule", "cfg0001", env=env)

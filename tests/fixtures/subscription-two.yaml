@@ -1,0 +1,20 @@
+proxies:
+  - name: "Matrix B"
+    type: ss
+    server: 192.0.2.12
+    port: 443
+    cipher: aes-128-gcm
+    password: "matrix-b"
+  - name: "Matrix A"
+    type: ss
+    server: 192.0.2.99
+    port: 443
+    cipher: aes-128-gcm
+    password: "duplicate"
+proxy-groups:
+  - name: "SECONDARY"
+    type: select
+    proxies:
+      - "Matrix B"
+rules:
+  - MATCH,SECONDARY

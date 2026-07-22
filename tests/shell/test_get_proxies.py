@@ -104,3 +104,15 @@ def test_json_is_valid_for_all_paths(run, uci_env, tmp_path):
         path.write_text(body)
         # Must not raise:
         json.loads(_run(run, uci_env, path).stdout)
+
+
+def test_special_characters_in_node_fields_remain_valid_json(run, uci_env, tmp_path):
+    p = tmp_path / "quoted.yaml"
+    p.write_text(
+        "proxies:\n"
+        "  - name: 'A\"B\\\\C'\n"
+        "    type: ss\n"
+        "    server: 'host\"name\\\\1'\n"
+    )
+    nodes = json.loads(_run(run, uci_env, p).stdout)
+    assert nodes == [{"name": 'A"B\\C', "type": "ss", "server": 'host"name\\1'}]
