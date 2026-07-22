@@ -10,7 +10,7 @@ import tarfile
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-ssproxy"
-PKG_VERSION = "1.0.0-199"
+PKG_VERSION = "1.0.0-200"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -268,6 +268,10 @@ apply_network() {
 			disable_tproxy
 			return 1
 		fi
+	elif [ -f /etc/mihomo/.dnsmasq_state ]; then
+		# whitelist 按源 DNAT（src_dns=1）或未开 DNS 劫持时，绝不能保留全局 dnsmasq 劫持：
+		# 否则非白名单设备会从 dnsmasq 拿到 mihomo fake-ip，又被 whitelist 旁路直连 → 断网。
+		disable_dns_hijack "$dns_port"
 	fi
 	logger -t mihomo "Mihomo network interception applied after controller became ready"
 }
