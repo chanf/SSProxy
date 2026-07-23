@@ -10,7 +10,7 @@ import tarfile
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-ssproxy"
-PKG_VERSION = "1.0.0-207"
+PKG_VERSION = "1.0.0-212"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -774,7 +774,17 @@ download_subscription_file() {
 collect_proxy_node_names() {
 	local cfg="$1"
 	awk '
-		function clean(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); gsub(/^["'\''']|["'\''']$/, "", s); return s }
+		function clean(s, first, last, sq, dq) {
+			sq=sprintf("%c", 39); dq=sprintf("%c", 34)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+			while (length(s) >= 2) {
+				first=substr(s,1,1); last=substr(s,length(s),1)
+				if ((first == dq && last == dq) || (first == sq && last == sq)) s=substr(s,2,length(s)-2)
+				else break
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+			}
+			return s
+		}
 		/^proxies:[[:space:]]*(\\[\\])?[[:space:]]*$/ { inb=1; next }
 		inb && /^[^[:space:]]/ { exit }
 		inb && /^[[:space:]]*-[[:space:]]*name:[[:space:]]*/ {
@@ -789,7 +799,17 @@ collect_proxy_node_names() {
 extract_unique_proxy_entries() {
 	local cfg="$1" names="$2" output="$3"
 	awk -v names="$names" '
-		function clean(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); gsub(/^["'\''']|["'\''']$/, "", s); return s }
+		function clean(s, first, last, sq, dq) {
+			sq=sprintf("%c", 39); dq=sprintf("%c", 34)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+			while (length(s) >= 2) {
+				first=substr(s,1,1); last=substr(s,length(s),1)
+				if ((first == dq && last == dq) || (first == sq && last == sq)) s=substr(s,2,length(s)-2)
+				else break
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+			}
+			return s
+		}
 		function entry_name(line, s) {
 			s=line
 			sub(/^[[:space:]]*-[[:space:]]*/, "", s)
@@ -878,6 +898,7 @@ merge_subscription_configs() {
 		extract_unique_proxy_entries "$cfg" "$names" "$body"
 		append_yaml_list_body "$output" "proxies" "$body"
 	done
+	normalize_yaml_list_indent "$output" "proxies"
 	inject_aggregate_into_selectors "$output" "$group"
 	body="$tmpd/group"
 	{
@@ -1206,6 +1227,59 @@ align_list_body_indent() {
 	[ "$indent" -gt 2 ] || return 0
 	local extra=$((indent - 2))
 	awk -v count="$extra" 'BEGIN { pad=""; for (i=0; i<count; i++) pad=pad " " } { print pad $0 }' "$body" > "${body}.tmp" && mv "${body}.tmp" "$body"
+}
+
+# Normalize a top-level YAML list block so every sibling item uses the same
+# indentation as the first item. This repairs merged subscriptions where one
+# provider emits 6-space list items and another emits 4-space items; mixing those
+# in one proxies/proxy-groups block makes Mihomo fail YAML parsing.
+normalize_yaml_list_indent() {
+	local cfg="$1" key="$2"
+	[ -f "$cfg" ] || return 0
+	awk -v key="$key:" '
+		function pad(n, s) { s=""; while (n-- > 0) s=s " "; return s }
+		function indent(s) { match(s, /^[[:space:]]*/); return RLENGTH }
+		function shift(line, delta, n, body) {
+			if (delta == 0) return line
+			n = indent(line); body = substr(line, n + 1)
+			if (delta > 0) return pad(delta) line
+			n += delta
+			return (n > 0 ? pad(n) : "") body
+		}
+		$0 == key { inb=1; target=-1; delta=0; print; next }
+		inb && /^[^[:space:]]/ { inb=0; print; next }
+		inb && /^[[:space:]]*-/ && (target < 0 || indent($0) <= target) {
+			n=indent($0)
+			if (target < 0) target=n
+			delta=target-n
+			print shift($0, delta)
+			next
+		}
+		inb && /^[[:space:]]/ { print shift($0, delta); next }
+		{ print }
+	' "$cfg" > "${cfg}.tmp" && mv "${cfg}.tmp" "$cfg"
+}
+
+normalize_proxy_group_refs() {
+	local cfg="$1"
+	[ -f "$cfg" ] || return 0
+	awk '
+		function trim_line_value(line, prefix, value, suffix, sq) {
+			sq=sprintf("%c", 39)
+			if (match(line, /^([[:space:]]*-[[:space:]]*")/)) {
+				prefix=substr(line, RSTART, RLENGTH)
+				value=substr(line, RLENGTH + 1)
+				if (match(value, /"[[:space:]]*$/)) {
+					suffix=substr(value, RSTART)
+					value=substr(value, 1, RSTART - 1)
+					if (substr(value, 1, 1) == sq && substr(value, length(value), 1) == sq)
+						return prefix substr(value, 2, length(value) - 2) suffix
+				}
+			}
+			return line
+		}
+		{ print trim_line_value($0) }
+	' "$cfg" > "${cfg}.tmp" && mv "${cfg}.tmp" "$cfg"
 }
 
 safe_section_id() {
@@ -1847,12 +1921,16 @@ EOF
 	# them is invalid YAML ("did not find expected '-' indicator") and the core
 	# fatal-exits on startup. Re-indent every rule item uniformly to 2 spaces.
 	normalize_rules "$run_config"
+	normalize_yaml_list_indent "$run_config" "proxies"
+	normalize_proxy_group_refs "$run_config"
 
 	# Mixed mode: overlay the user's custom config on top of the subscription base.
 	if [ "$config_mode" = "mixed" ]; then
 		apply_custom_overlay "$run_config" "$custom_config"
 		# Re-normalize rules since the overlay may have added more rule items.
 		normalize_rules "$run_config"
+		normalize_yaml_list_indent "$run_config" "proxies"
+		normalize_proxy_group_refs "$run_config"
 	fi
 
 	# Inject user-managed landing proxies before generating fixed two-hop links.
