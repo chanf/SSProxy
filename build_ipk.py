@@ -10,7 +10,7 @@ import tarfile
 
 # Define configuration for the OpenClash replacement
 PKG_NAME = "luci-app-ssproxy"
-PKG_VERSION = "1.0.0-200"
+PKG_VERSION = "1.0.0-207"
 PKG_ARCH = "all"
 IPK_FILENAME = f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH}.ipk"
 
@@ -733,7 +733,7 @@ restore_subscription_url() {
 }
 
 download_subscription_file() {
-	local url="$1" output="$2" scheme authority host realip resolve_arg="" resolve_port=443
+	local url="$1" output="$2" scheme authority host realip resolve_port=443
 	valid_http_url "$url" || return 1
 	scheme="${url%%://*}"
 	authority="${url#*://}"; authority="${authority%%/*}"; authority="${authority##*@}"
@@ -744,17 +744,30 @@ download_subscription_file() {
 		*) host="$authority" ;;
 	esac
 	case "$resolve_port" in ''|*[!0-9]*) resolve_port=443 ;; esac
+	local tmpout="${output}.download"
+	rm -f "$tmpout"
 	if [ -n "$host" ]; then
+		local iplist="" ns ip
 		for ns in 223.5.5.5 119.29.29.29 1.1.1.1; do
-			realip=$(nslookup "$host" "$ns" 2>/dev/null | awk '/^Address:[[:space:]]/ {last=$NF} END {print last}')
-			case "$realip" in *[!0-9.]*|"") realip="" ;; *.*.*.*) break ;; *) realip="" ;; esac
-			[ -n "$realip" ] && break
+			for ip in $(nslookup "$host" "$ns" 2>/dev/null | awk '/^Name:/ {answer=1} answer && /^Address:[[:space:]]/ {print $NF}'); do
+				case "$ip" in *[!0-9.]*|"") continue ;; *.*.*.*) ;; *) continue ;; esac
+				case " $iplist " in *" $ip "*) ;; *) iplist="$iplist $ip" ;; esac
+			done
 		done
-		[ -n "$realip" ] && resolve_arg="--resolve ${host}:${resolve_port}:${realip}"
+		for realip in $iplist; do
+			if curl -fsSL --connect-timeout 8 -m 60 -A "ClashMeta" --resolve "${host}:${resolve_port}:${realip}" -o "$tmpout" "$url"; then
+				if grep -q '^proxies:' "$tmpout" 2>/dev/null && ! grep -q -E '<html>|<!DOCTYPE html>' "$tmpout" 2>/dev/null; then
+					mv "$tmpout" "$output"
+					return 0
+				fi
+			fi
+			rm -f "$tmpout"
+		done
 	fi
-	curl -fsSL -A "ClashMeta" $resolve_arg -o "$output" "$url" || return 1
-	grep -q '^proxies:' "$output" 2>/dev/null || return 1
-	grep -q -E '<html>|<!DOCTYPE html>' "$output" 2>/dev/null && return 1
+	curl -fsSL --connect-timeout 8 -m 60 -A "ClashMeta" -o "$tmpout" "$url" || { rm -f "$tmpout"; return 1; }
+	grep -q '^proxies:' "$tmpout" 2>/dev/null || { rm -f "$tmpout"; return 1; }
+	grep -q -E '<html>|<!DOCTYPE html>' "$tmpout" 2>/dev/null && { rm -f "$tmpout"; return 1; }
+	mv "$tmpout" "$output"
 	return 0
 }
 
@@ -955,6 +968,48 @@ clear_subscription() {
 	echo '{"success":true,"msg":"已清空所有订阅节点缓存"}'
 }
 
+factory_reset() {
+	logger -t mihomo "Factory reset requested"
+	/etc/init.d/mihomo stop >/dev/null 2>&1
+	/etc/init.d/mihomo disable >/dev/null 2>&1
+
+	rm -rf /etc/mihomo
+	mkdir -p /etc/mihomo
+	rm -f /tmp/mihomo_run.yaml /tmp/mihomo_core.log /tmp/mihomo_op.state /tmp/mihomo_history.json
+	rm -f /tmp/mihomo_traffic_state /tmp/mihomo_connections.raw
+
+	cat > /etc/config/mihomo <<'EOF'
+config mihomo 'config'
+	option enabled '0'
+	option core_path '/usr/bin/mihomo'
+	option config_path '/etc/mihomo/config.yaml'
+	option config_mode 'subscription'
+	option custom_config_path '/etc/mihomo/custom.yaml'
+	option work_dir '/etc/mihomo'
+	option mix_port '7890'
+	option tproxy_port '7893'
+	option dns_port '1053'
+	option dns_hijack '1'
+	option tun_enabled '0'
+	option subscription_url ''
+	option test_url ''
+	option chain_front_node 'individual'
+	option auto_update '0'
+	option update_interval '24'
+	option last_update ''
+	option secret ''
+	option geo_auto_update '1'
+	option geo_update_interval '24'
+	option geoip_mirror_url 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat'
+	option geosite_mirror_url 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat'
+	option adblock_enabled '0'
+EOF
+	chmod 600 /etc/config/mihomo
+	uci -q commit mihomo
+	logger -t mihomo "Factory reset completed"
+	echo '{"success":true,"msg":"已恢复到初始状态"}'
+}
+
 # Background loop driven by the procd service instance. Polls every 10 minutes;
 # the real download cadence is enforced by auto_update_now based on the configured
 # interval. Self-contained: does not rely on the system cron daemon.
@@ -1114,6 +1169,25 @@ json_quote() {
 	local value
 	value=$(printf '%s' "$1" | tr '\r\n' '  ' | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
 	printf '"%s"' "$value"
+}
+
+get_core_process_info() {
+	local core_path pid hz boot_epoch now start_ticks start_epoch uptime
+	core_path=$(uci -q get mihomo.config.core_path || echo /usr/bin/mihomo)
+	for pid in $(pidof mihomo 2>/dev/null); do
+		[ -r "/proc/$pid/stat" ] || continue
+		tr '\\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q -- " -f /tmp/mihomo_run.yaml" || continue
+		tr '\\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q -- "$core_path" || continue
+		start_ticks=$(awk '{ print $22 }' "/proc/$pid/stat" 2>/dev/null)
+		hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+		now=$(date +%s)
+		boot_epoch=$(awk -v n="$now" '{ printf "%d", n - $1 }' /proc/uptime 2>/dev/null)
+		case "$start_ticks:$hz:$boot_epoch" in *[!0-9:]*|:*|*:) start_epoch=0 ;; *) start_epoch=$((boot_epoch + start_ticks / hz)) ;; esac
+		[ "$start_epoch" -gt 0 ] 2>/dev/null && uptime=$((now - start_epoch)) || uptime=0
+		printf '%s %s %s\n' "$pid" "$start_epoch" "$uptime"
+		return 0
+	done
+	return 1
 }
 
 # Match generated list items to the indentation already used by a subscription.
@@ -1370,12 +1444,54 @@ emit_adblock_rule_providers_yaml() {
 	done
 }
 
-# Emit RULE-SET,<name>,REJECT lines for every enabled adblock_source.
+# Return 0 when a generated rule-provider block already contains $name.
+config_has_rule_provider() {
+	local f="$1" name="$2"
+	awk -v n="$name" '
+		/^rule-providers:[[:space:]]*/ { inrp=1; next }
+		inrp && /^[A-Za-z0-9_@.\-]+:/ { inrp=0 }
+		inrp && $0 == "  " n ":" { found=1 }
+		END { exit(found ? 0 : 1) }
+	' "$f"
+}
+
+# Merge generated rule-provider entries into a config. Handles both normal block
+# form and empty inline YAML ("rule-providers: {}" / "[]") from subscriptions.
+insert_rule_providers_yaml() {
+	local f="$1" body="$2"
+	if grep -q '^rule-providers:' "$f"; then
+		awk -v body="$body" '
+			function emit_body() { while ((getline l < body) > 0) print l; close(body) }
+			/^rule-providers:[[:space:]]*(\\{\\}|\\[\\])[[:space:]]*(#.*)?$/ && !done {
+				print "rule-providers:"; emit_body(); done=1; next
+			}
+			/^rule-providers:[[:space:]]*(#.*)?$/ && !done {
+				print; emit_body(); done=1; next
+			}
+			{ print }
+		' "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
+	else
+		{ echo "rule-providers:"; cat "$body"; } >> "$f"
+	fi
+}
+
+# Emit RULE-SET,<name>,REJECT lines for every enabled adblock_source that can
+# also emit a matching provider. Keep this validation in sync with providers so
+# a malformed UCI entry cannot create a dangling RULE-SET reference.
 emit_adblock_rules_yaml() {
+	local provider_config="$1"
 	uci show mihomo 2>/dev/null | sed -n 's/^mihomo\.\(.*\)=adblock_source$/\\1/p' | while read -r sid; do
-		local e name
+		local e name url behavior fmt
 		e=$(uci -q get mihomo.$sid.enabled); [ "$e" = "1" ] || continue
-		name=$(uci -q get mihomo.$sid.name); [ -n "$name" ] || continue
+		name=$(uci -q get mihomo.$sid.name); url=$(uci -q get mihomo.$sid.url)
+		[ -n "$name" ] && [ -n "$url" ] || continue
+		case "$name" in *[!A-Za-z0-9_-]*) continue ;; esac
+		behavior=$(uci -q get mihomo.$sid.behavior || echo domain)
+		fmt=$(uci -q get mihomo.$sid.format || echo yaml)
+		case "$behavior" in domain|classical|ipcidr) ;; *) continue ;; esac
+		case "$fmt" in yaml|text) ;; *) continue ;; esac
+		valid_http_url "$url" || continue
+		[ -n "$provider_config" ] && ! config_has_rule_provider "$provider_config" "$name" && continue
 		echo "  - 'RULE-SET,$name,REJECT'"
 	done
 }
@@ -1688,20 +1804,13 @@ EOF
 				case "$line" in
 					"  "*:)
 						cur_name=${line#  }; cur_name=${cur_name%:}
-						if grep -qE "^  ${cur_name}:" "$run_config"; then skip=1; else skip=0; fi
+						if config_has_rule_provider "$run_config" "$cur_name"; then skip=1; else skip=0; fi
 						;;
 				esac
 				[ "$skip" = "0" ] && echo "$line" >> "$ad_dedup"
 			done < "$ad_provs"
 			if [ -s "$ad_dedup" ]; then
-				if grep -q '^rule-providers:' "$run_config"; then
-					awk -v body="$ad_dedup" '
-						/^rule-providers:[[:space:]]*$/ { print; while ((getline l < body) > 0) print l; next }
-						{ print }
-					' "$run_config" > "${run_config}.tmp" && mv "${run_config}.tmp" "$run_config"
-				else
-					{ echo "rule-providers:"; cat "$ad_dedup"; } >> "$run_config"
-				fi
+				insert_rule_providers_yaml "$run_config" "$ad_dedup"
 			fi
 			rm -f "$ad_dedup"
 		fi
@@ -1716,7 +1825,7 @@ EOF
 	emit_access_rules_yaml "$src_config" >> "$rules_file"
 	# Adblock REJECT rules go AFTER access rules so user whitelist (direct)
 	# entries always win over blanket ad blocking (prevents false positives).
-	emit_adblock_rules_yaml >> "$rules_file"
+	emit_adblock_rules_yaml "$run_config" >> "$rules_file"
 	if [ -s "$rules_file" ]; then
 		if grep -q '^rules:' "$run_config"; then
 			local tmpf="${run_config}.rules2"
@@ -2657,7 +2766,14 @@ import_rules() {
 get_op_state() {
 	local statef="/tmp/mihomo_op.state"
 	local op="" since=0 now elapsed ctrl=0 nftexists=0 state result=""
+	local core_info core_pid=0 core_start=0 core_uptime=0
 	now=$(date +%s)
+	core_info=$(get_core_process_info 2>/dev/null)
+	if [ -n "$core_info" ]; then
+		read -r core_pid core_start core_uptime <<EOF
+$core_info
+EOF
+	fi
 	if [ -f "$statef" ]; then
 		op=$(awk '{print $1}' "$statef" 2>/dev/null)
 		since=$(awk '{print $2}' "$statef" 2>/dev/null)
@@ -2679,7 +2795,7 @@ get_op_state() {
 	else
 		state="idle"; [ "$ctrl" = "1" ] && result="running" || result="stopped"
 	fi
-	echo "{\\"state\\":\\"$state\\",\\"op\\":\\"$op\\",\\"elapsed\\":$elapsed,\\"running\\":$ctrl,\\"result\\":\\"$result\\"}"
+	echo "{\\"state\\":\\"$state\\",\\"op\\":\\"$op\\",\\"elapsed\\":$elapsed,\\"running\\":$ctrl,\\"result\\":\\"$result\\",\\"core_pid\\":$core_pid,\\"core_start_time\\":$core_start,\\"core_uptime\\":$core_uptime}"
 }
 get_core_log() {
 	# Tail the core's real stdout/stderr (captured by init.d). Falls back to syslog
@@ -3178,6 +3294,9 @@ case "$1" in
 	clear_subscription)
 		clear_subscription
 		;;
+	factory_reset)
+		factory_reset
+		;;
 	save_subscription_url)
 		save_subscription_url "$2"
 		;;
@@ -3302,7 +3421,7 @@ case "$1" in
 		set_adblock_enabled "$2"
 		;;
 	*)
-		echo "Usage: $0 {get_arch|get_lan_ip|get_lan_ip6|emit_tproxy_rules|check_core|check_controller|wait_controller|download_core|update_geox|update_subscription|update_subscriptions|clear_subscription|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_chain_status|add_data_link_to_acl|set_chain_front_node|get_chain_log|get_data_link_health|get_data_link_metrics|reset_data_link_health|test_landing_node|test_data_link|get_connections|collect_connections|collect_loop|get_history|clear_access_log|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes|test_connectivity|traffic_loop|get_traffic|reset_traffic_domains|get_adblock_sources|add_adblock_source|del_adblock_source|toggle_adblock_source}"
+		echo "Usage: $0 {get_arch|get_lan_ip|get_lan_ip6|emit_tproxy_rules|check_core|check_controller|wait_controller|download_core|update_geox|update_subscription|update_subscriptions|clear_subscription|factory_reset|save_subscription_url|restore_subscription_url|auto_update_now|auto_update_loop|get_schedule|prepare_config|get_proxies|get_proxy_groups|select_node|get_chain_status|add_data_link_to_acl|set_chain_front_node|get_chain_log|get_data_link_health|get_data_link_metrics|reset_data_link_health|test_landing_node|test_data_link|get_connections|collect_connections|collect_loop|get_history|clear_access_log|get_access_rules|get_op_state|get_core_log|add_access_rule|del_access_rule|clear_access_rules|import_rules|test_node_delay|test_all_nodes|test_connectivity|traffic_loop|get_traffic|reset_traffic_domains|get_adblock_sources|add_adblock_source|del_adblock_source|toggle_adblock_source}"
 		exit 1
 		;;
 esac
@@ -4136,15 +4255,17 @@ return view.extend({
 		}
 
 		var card = 'background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 15px; margin-bottom: 20px; border: 1px solid rgba(0,0,0,0.06);';
+		var ad_master_attrs = { 'id': 'ad_master', 'type': 'checkbox', 'change': function(ev) {
+			toggle_master(ev.target.checked ? '1' : '0');
+		} };
+		if (ad_enabled) ad_master_attrs.checked = 'checked';
 
 		var master_form = E('div', { 'class': 'cbi-section', 'style': card }, [
 			E('h3', { 'style': 'margin-top: 0; margin-bottom: 12px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 8px;' }, _('广告过滤总开关')),
 			E('div', { 'class': 'cbi-value' }, [
 				E('label', { 'class': 'cbi-value-title' }, _('启用广告过滤')),
 				E('div', { 'class': 'cbi-value-field' }, [
-					E('input', { 'id': 'ad_master', 'type': 'checkbox', 'checked': ad_enabled, 'change': function(ev) {
-						toggle_master(ev.target.checked ? '1' : '0');
-					} }),
+					E('input', ad_master_attrs),
 					E('span', { 'style': 'margin-left: 8px; color: #666; font-size: 13px;' }, _('开启后，已启用规则源将通过规则层 REJECT + DNS 层 nameserver-policy 双重拦截广告域名。'))
 				])
 			]),
@@ -4152,7 +4273,15 @@ return view.extend({
 				E('div', { 'class': 'cbi-value-field' }, [
 					btn(_('应用并重启核心'), 'cbi-button-apply', function(ev) {
 						ev.preventDefault();
-						return fs.exec('/etc/init.d/mihomo', ['restart']).then(function() {
+						var master = document.getElementById('ad_master');
+						var val = master && master.checked ? '1' : '0';
+						return fs.exec('/usr/share/mihomo/helper.sh', ['set_adblock_enabled', val]).then(function(res) {
+							if (res.code !== 0) {
+								notify('保存失败：' + (res.stderr || res.stdout || ''), 'danger');
+								return Promise.reject(new Error(res.stderr || res.stdout || 'save failed'));
+							}
+							return fs.exec('/etc/init.d/mihomo', ['restart']);
+						}).then(function() {
 							notify('核心已重启，广告过滤配置已生效。');
 							setTimeout(function() { location.reload(); }, 1500);
 						}).catch(function(err) { notify('重启失败：' + err.message, 'danger'); });
@@ -4343,6 +4472,29 @@ return view.extend({
 		var status_cell = E('td', {}, status_badge);
 		if (!controller_up && is_running) {
 			status_cell.appendChild(E('span', { 'style': 'margin-left: 10px; color: #e03131; font-size: 12px;' }, _('核心进程在运行但控制器未就绪，请查看下方「系统代理日志」中的红色错误行排查配置。')));
+		}
+		var core_pid = Number(op_state.core_pid) || 0;
+		var core_start_time = Number(op_state.core_start_time) || 0;
+		var core_uptime = Number(op_state.core_uptime) || 0;
+		function formatCoreUptime(seconds) {
+			seconds = Math.max(0, Number(seconds) || 0);
+			var days = Math.floor(seconds / 86400);
+			var hours = Math.floor((seconds % 86400) / 3600);
+			var minutes = Math.floor((seconds % 3600) / 60);
+			var secs = Math.floor(seconds % 60);
+			var text = hours + _('小时') + minutes + _('分') + secs + _('秒');
+			return days > 0 ? days + _('天') + text : text;
+		}
+		function formatCoreStartTime(epoch) {
+			if (!epoch) return _('未知');
+			var d = new Date(epoch * 1000);
+			var pad = function(n) { return n < 10 ? '0' + n : String(n); };
+			return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' +
+				pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+		}
+		if (core_start_time > 0) {
+			status_cell.appendChild(E('div', { 'style': 'margin-top: 6px; color: #666; font-size: 12px;' },
+				_('启动时间：') + formatCoreStartTime(core_start_time) + '　' + _('已运行：') + formatCoreUptime(core_uptime)));
 		}
 
 		var perform_download = function(ev) {
@@ -4939,8 +5091,26 @@ return view.extend({
 			}
 		}, _('下载日志'));
 
+		var service_running = !!(is_running || controller_up || core_pid);
 		var opBusy = (op_state.state === 'in_progress');
 		var opPollCount = 0;
+		function updateServiceButtons() {
+			var start_btn = document.getElementById('btn_start');
+			var stop_btn = document.getElementById('btn_stop');
+			var restart_btn = document.getElementById('btn_restart');
+			if (start_btn) {
+				start_btn.disabled = opBusy || service_running;
+				start_btn.style.opacity = start_btn.disabled ? '0.5' : '1';
+			}
+			if (stop_btn) {
+				stop_btn.disabled = opBusy || !service_running;
+				stop_btn.style.opacity = stop_btn.disabled ? '0.5' : '1';
+			}
+			if (restart_btn) {
+				restart_btn.disabled = opBusy;
+				restart_btn.style.opacity = restart_btn.disabled ? '0.5' : '1';
+			}
+		}
 		function setOpBusy(busy, label) {
 			opBusy = busy;
 			var ids = ['btn_start', 'btn_stop', 'btn_restart'];
@@ -4950,6 +5120,7 @@ return view.extend({
 			}
 			var st = document.getElementById('op_status');
 			if (st) { st.textContent = label || ''; }
+			if (!busy) updateServiceButtons();
 		}
 		function pollOpState() {
 			opPollCount++;
@@ -4979,6 +5150,7 @@ return view.extend({
 			});
 		}
 		if (opBusy) { setOpBusy(true, _('操作进行中…')); setTimeout(pollOpState, 1000); }
+		setTimeout(updateServiceButtons, 0);
 		// Connectivity test panel: one-click reachability of key sites through the proxy.
 		var conn_sites = ['百度', 'Google', 'YouTube', 'Facebook', 'TikTok'];
 		var conn_cells = {};
@@ -5984,6 +6156,37 @@ return view.extend({
 					});
 				}
 			}, _('立即更新 Geo'));
+		};
+
+		s = m.section(form.TypedSection, 'mihomo', _('恢复初始化'));
+		s.anonymous = true;
+
+		o = s.option(form.DummyValue, '_factory_reset', _('恢复初始化'), _('停止并禁用服务，清空订阅、访问规则、广告过滤、链式代理、运行配置、缓存和统计数据，恢复到插件刚安装后的默认配置。已下载的 Mihomo 核心二进制会保留。'));
+		o.rawhtml = true;
+		o.cfgvalue = function(section_id) {
+			return E('button', {
+				'class': 'cbi-button cbi-button-reset',
+				'click': function(ev) {
+					ev.preventDefault();
+					if (!confirm(_('确定要恢复初始化吗？所有运行设置、订阅、规则、链式代理和统计数据都会被清空，此操作不可撤销。'))) return;
+					if (!confirm(_('请再次确认：恢复后服务会停止并禁用，需要重新配置后再启动。'))) return;
+					ui.showModal(_('正在恢复初始化'), [
+						E('p', {}, _('正在停止服务并清理所有运行设置...'))
+					]);
+					return fs.exec('/usr/share/mihomo/helper.sh', ['factory_reset']).then(function(res) {
+						ui.hideModal();
+						if (res.code === 0) {
+							ui.addNotification(null, E('p', _('已恢复到插件初始状态。')), 'info');
+							setTimeout(function() { location.reload(); }, 1200);
+						} else {
+							ui.addNotification(null, E('p', _('恢复失败：') + (res.stderr || res.stdout || '')), 'danger');
+						}
+					}).catch(function(err) {
+						ui.hideModal();
+						ui.addNotification(null, E('p', _('通信错误：') + err.message), 'danger');
+					});
+				}
+			}, _('恢复初始化'));
 		};
 
 		return m.render().then(function(node) {
